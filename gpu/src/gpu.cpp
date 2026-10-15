@@ -103,6 +103,7 @@ bool VulkanGpu::Init(std::string* error) {
     dci.ppEnabledExtensionNames = needs.extensions.data();
     if ((r = vkCreateDevice(gpu, &dci, nullptr, &device)) != VK_SUCCESS) return fail("vkCreateDevice", r);
     if (!needs.core13) UseDynamicRenderingExtension();
+    local_read = needs.local_read;
     // Device functions stay the loader's (volkLoadInstance): they dispatch by
     // handle, so the window's device and this one can live side by side. volk
     // keeps one global table; loading a device into it would point the other
@@ -167,6 +168,9 @@ bool VulkanGpu::InitShared(VkInstance shared_instance, VkPhysicalDevice shared_g
     vkGetPhysicalDeviceFeatures(shared_gpu, &supported);
     logic_op = supported.logicOp == VK_TRUE && !NoLogicOp();
     bc = supported.textureCompressionBC == VK_TRUE;     // (the Display enables it too)
+    DeviceRequirements needs;                           // ...as the Display made the device
+    DeviceRequirementsFor(shared_gpu, false, &needs);
+    local_read = needs.local_read;
     describe_ = describe;
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;

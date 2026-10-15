@@ -41,6 +41,28 @@ void AddOnce(std::vector<const char*>* list, const char* name) {
     list->push_back(name);
 }
 
+/* VK_KHR_dynamic_rendering_local_read into `out`, where the device has it
+   and UseLocalRead wants it. */
+void AddLocalRead(VkPhysicalDevice gpu, const std::vector<VkExtensionProperties>& available, DeviceRequirements* out) {
+    out->local_read = false;
+    if (!HasExtension(available, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME) ||
+        !UseLocalRead(HasExtension(available, "VK_KHR_portability_subset")))
+        return;
+    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR supported{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+    VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    features.pNext = &supported;
+    vkGetPhysicalDeviceFeatures2(gpu, &features);
+    if (!supported.dynamicRenderingLocalRead) return;
+    out->extensions.push_back(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
+    out->local_read_features = VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+    out->local_read_features.dynamicRenderingLocalRead = VK_TRUE;
+    out->local_read_features.pNext = out->chain;
+    out->chain = &out->local_read_features;
+    out->local_read = true;
+}
+
 }  // namespace
 
 const char* MoltenVkPath() {
@@ -124,6 +146,7 @@ bool DeviceRequirementsFor(VkPhysicalDevice gpu, bool swapchain, DeviceRequireme
         out->v13.synchronization2 = VK_TRUE;
         out->chain = &out->v13;
         out->core13 = true;
+        AddLocalRead(gpu, available, out);
         return true;
     }
     if (!HasExtension(available, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)) return false;
@@ -140,7 +163,14 @@ bool DeviceRequirementsFor(VkPhysicalDevice gpu, bool swapchain, DeviceRequireme
     out->dynamic.dynamicRendering = VK_TRUE;
     out->chain = &out->dynamic;
     out->core13 = false;
+    AddLocalRead(gpu, available, out);
     return true;
+}
+
+bool UseLocalRead(bool portability) {
+    const char* v = std::getenv("PS2GPU_LOCAL_READ");
+    if (v && *v) return *v != '0';
+    return portability;
 }
 
 void UseDynamicRenderingExtension() {

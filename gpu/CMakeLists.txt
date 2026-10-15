@@ -121,6 +121,14 @@ add_custom_command(OUTPUT ${out}
     DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${PS2GPU_GLSLANG_DEP}
     COMMENT "glslang gs.frag (blending in the shader)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
+# ...and from the target itself, where the pixel is (VK_KHR_dynamic_rendering_local_read).
+set(out ${PS2GPU_SHADER_DIR}/gs_frag_blend_local.h)
+add_custom_command(OUTPUT ${out}
+    COMMAND ${PS2GPU_GLSLANG} -V --target-env ${PS2GPU_SPIRV_ENV} -DSHADER_BLEND -DLOCAL_READ
+            --vn spirv_gs_frag_blend_local -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${PS2GPU_GLSLANG_DEP}
+    COMMENT "glslang gs.frag (blending in the shader, the target read where it is)")
+list(APPEND PS2GPU_SHADER_HEADERS ${out})
 add_custom_target(ps2gpu_shaders DEPENDS ${PS2GPU_SHADER_HEADERS})
 
 add_library(ps2gpu STATIC

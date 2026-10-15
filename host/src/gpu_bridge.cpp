@@ -1729,7 +1729,9 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                          static_cast<unsigned long long>(frame), static_cast<unsigned long long>(s.serial),
                          static_cast<unsigned long long>(s.write_backs), static_cast<unsigned long long>(s.reloads),
                          static_cast<unsigned long long>(s.decodes), s.owned.size(), s.textures.size());
-        if (platform::kMobile) {
+        // PS2HOST_PERF=1: a tablet's report on any machine.
+        static const bool perf_report = platform::kMobile || std::getenv("PS2HOST_PERF") != nullptr;
+        if (perf_report) {
             // Every five seconds: frames a second, where the time went (the
             // run's so far) and the GPU's work - burnout3.log's report.
             using Clock = std::chrono::steady_clock;
@@ -1739,11 +1741,12 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
             if (seconds >= 5.0) {
                 const Vu& vu1 = Vu1();
                 static u64 last_pairs = 0, last_compiled = 0;
-                std::fprintf(stderr, "[perf] frame %llu: %.1f frames a second; %s\n[perf]   %s\n[perf]   %s\n"
+                std::fprintf(stderr, "[perf] frame %llu: %.1f frames a second; %s\n[perf]   %s\n[perf]   %s\n%s\n"
                              "[perf]   VU1: %.1f M instruction pairs a second, %.0f%% compiled; %llu stale\n",
                              static_cast<unsigned long long>(frame), double(frame - last_frame) / seconds,
                              ProfileSummary().c_str(), ps2gpu::GpuProfileReport().c_str(),
-                             ps2gpu::RendererCounters().c_str(), double(vu1.pairs() - last_pairs) / seconds / 1e6,
+                             ps2gpu::RendererCounters().c_str(), ps2gpu::RendererBreakdown("[perf]     ").c_str(),
+                             double(vu1.pairs() - last_pairs) / seconds / 1e6,
                              vu1.pairs() > last_pairs ? 100.0 * double(vu1.compiled_pairs() - last_compiled) /
                                                             double(vu1.pairs() - last_pairs) : 0.0,
                              static_cast<unsigned long long>(vu1.compiled_stale()));
@@ -1757,7 +1760,8 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
             std::fprintf(stderr, "[gpu] frame %llu: %s\n", static_cast<unsigned long long>(frame),
                          ps2gpu::GpuProfileReport().c_str());
         if (frame % 100 == 0 && std::getenv("PS2HOST_GPU_COUNT")) {
-            std::fprintf(stderr, "[gpu]   last 100 frames: %s\n", ps2gpu::RendererCounters().c_str());
+            std::fprintf(stderr, "[gpu]   last 100 frames: %s\n%s\n", ps2gpu::RendererCounters().c_str(),
+                         ps2gpu::RendererBreakdown("[gpu]     ").c_str());
             std::vector<std::pair<u64, std::string>> kinds;
             for (const auto& [k, n] : g_decode_kinds) kinds.emplace_back(n, k);
             std::sort(kinds.rbegin(), kinds.rend());

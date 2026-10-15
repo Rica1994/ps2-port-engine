@@ -5,6 +5,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <random>
+#include <string>
+#include <vector>
 
 #include "ps2gpu/gs_renderer.h"
 
@@ -410,9 +414,144 @@ void Fogged(ps2gpu::GsRenderer& renderer) {
           "fog F 0x80: (128 * C + 127 * FOGCOL) >> 8, as the software GS");
 }
 
+/* Blending in the shader reads the target: from a copy of it, or in place
+   (VK_KHR_dynamic_rendering_local_read) - and in place, a tile-based GPU (an
+   iPad's, through MoltenVK) reads what memory held when the pass began or
+   since its last barrier, which PS2GPU_LOCAL_READ_EMULATE reproduces on any
+   GPU. The same random draws - blends the blender cannot do, partly masked
+   channels, alpha tests, PABE, targets sampling themselves, another target
+   between, work ending passes - through each, compared pixel for pixel. A
+   barrier left out where a batch reads what its pass drew shows here. */
+void LocalReadMatchesCopies() {
+    struct Setup {
+        const char* name;
+        const char* local_read;
+        const char* emulate;
+    };
+    const Setup setups[] = {{"copies", "0", "0"}, {"local read, emulated as a tile-based GPU", "0", "1"},
+                            {"local read", "1", "0"}};
+    std::vector<std::unique_ptr<ps2gpu::Gpu>> gpus;
+    std::vector<std::unique_ptr<ps2gpu::GsRenderer>> renderers;
+    std::vector<const char*> names;
+    for (const Setup& setup : setups) {
+        setenv("PS2GPU_LOCAL_READ", setup.local_read, 1);
+        setenv("PS2GPU_LOCAL_READ_EMULATE", setup.emulate, 1);
+        std::string error;
+        auto gpu = ps2gpu::CreateGpu(&error);
+        if (!gpu) continue;
+        auto renderer = ps2gpu::CreateGsRenderer(*gpu, &error);
+        if (!renderer) {
+            std::printf("FAIL: renderer (%s): %s\n", setup.name, error.c_str());
+            ++g_failures;
+            continue;
+        }
+        gpus.push_back(std::move(gpu));
+        renderers.push_back(std::move(renderer));
+        names.push_back(setup.name);
+    }
+    unsetenv("PS2GPU_LOCAL_READ");
+    unsetenv("PS2GPU_LOCAL_READ_EMULATE");
+    if (renderers.size() < 2) return;
+    // A texture to draw with, and to upload again between draws (work that
+    // ends a pass, touching nothing it draws).
+    std::vector<std::uint32_t> texels(16 * 16);
+    for (std::uint32_t i = 0; i < texels.size(); ++i)
+        texels[i] = Rgba(std::uint8_t(i * 7), std::uint8_t(i * 13), std::uint8_t(i * 29), std::uint8_t(0x20 + (i & 0x7F)));
+    for (auto& r : renderers) r->UploadTexture(0x1234, texels.data(), 16, 16);
+    std::mt19937 random(20261016);
+    auto pick = [&](int n) { return int(random() % std::uint32_t(n)); };
+    for (int op = 0; op < 1500; ++op) {
+        ps2gpu::GsDrawState s = Target(0xA0);
+        const int which = pick(10);
+        if (which == 0) {                           // another target: a pass ends
+            s = Target(0xA1);
+        } else if (which == 1) {                    // a 16-bit view (blends in the shader)
+            s = Target(0xA2);
+            s.psm = 0x02;
+        }
+        // Blending: the blender's, or one it cannot do (the shader's).
+        const int blend = pick(8);
+        if (blend > 0) {
+            s.blend = true;
+            s.a = ps2gpu::BlendColour::Source;
+            s.b = ps2gpu::BlendColour::Dest;
+            s.d = ps2gpu::BlendColour::Dest;
+            switch (blend) {
+                case 1: s.c = ps2gpu::BlendAlpha::Source; break;
+                case 2: case 3: s.c = ps2gpu::BlendAlpha::Dest; break;             // Ad: in the shader
+                case 4: s.c = ps2gpu::BlendAlpha::Fix; s.fix = 0x80 + 1 + pick(0x7F); break;   // over 1: shader
+                case 5: s.c = ps2gpu::BlendAlpha::Fix; s.fix = pick(0x81); s.b = ps2gpu::BlendColour::Zero; break;
+                case 6: s.c = ps2gpu::BlendAlpha::Fix; s.fix = 0xC0; s.a = ps2gpu::BlendColour::Dest;
+                        s.b = ps2gpu::BlendColour::Source; s.d = ps2gpu::BlendColour::Zero; break;
+                default: s.c = ps2gpu::BlendAlpha::Source; s.pabe = true; break;
+            }
+        }
+        const int mask = pick(10);
+        if (mask == 0) s.fbmsk = 0x0F0F0F0Fu;       // partly masked: the shader merges without logicOp
+        else if (mask == 1) s.fbmsk = 0xFF000000u;
+        if (pick(6) == 0) {                         // an alpha test whose failures still write
+            s.alpha_test = true;
+            s.atst = 5;
+            s.aref = 0x60;
+            s.afail = pick(2) ? 1 : 3;
+        }
+        s.sprite_prim = pick(2) == 0;
+        if (pick(5) == 0) {                         // textured
+            s.textured = true;
+            s.texture = 0x1234;
+            s.tfx = ps2gpu::TextureFunction(pick(4));
+            s.wms = s.wmt = 0;
+        } else if (pick(25) == 0 && s.fbp == 0xA0) { // its own target as the texture: a copy first
+            s.textured = true;
+            s.texture_target = true;
+            s.tex_fbp = 0xA0;
+            s.tex_fbw = 1;
+            s.tw = s.th = 64;
+            s.tfx = ps2gpu::TextureFunction::Modulate;
+        }
+        // Small rectangles here and there - most beside the ones before, some
+        // over them - or one over everything.
+        float x0 = float(pick(60)), y0 = float(pick(60));
+        float x1 = x0 + 1 + float(pick(12)), y1 = y0 + 1 + float(pick(12));
+        if (pick(20) == 0) {
+            x0 = y0 = 0;
+            x1 = y1 = 64;
+        }
+        const std::uint32_t colour = Rgba(std::uint8_t(pick(256)), std::uint8_t(pick(256)), std::uint8_t(pick(256)),
+                                          std::uint8_t(pick(256)));
+        for (auto& r : renderers) Rect(*r, s, x0, y0, x1, y1, colour);
+        if (pick(40) == 0)                          // work between draws
+            for (auto& r : renderers) r->UploadTexture(0x1235, texels.data(), 16, 16);
+        if (pick(300) == 0)                         // a read-back: everything submitted, waited for
+            for (auto& r : renderers) Pixel(*r, 0xA0, 1, 1);
+    }
+    const std::uint32_t targets[3][2] = {{0xA0, 0}, {0xA1, 0}, {0xA2, 0x02}};
+    for (const auto& [fbp, psm] : targets) {
+        std::vector<std::uint32_t> reference, pixels;
+        std::uint32_t w = 0, h = 0;
+        renderers[0]->ReadTarget(fbp, 1, psm, &reference, &w, &h);
+        for (std::size_t i = 1; i < renderers.size(); ++i) {
+            renderers[i]->ReadTarget(fbp, 1, psm, &pixels, &w, &h);
+            std::size_t differ = 0, first = 0;
+            for (std::size_t p = 0; p < pixels.size() && p < reference.size(); ++p)
+                if (pixels[p] != reference[p] && !differ++) first = p;
+            char what[200];
+            std::snprintf(what, sizeof what, "%s draws target %X as the copies do (%zu pixels differ, first at %zu,%zu)",
+                          names[i], unsigned(fbp), differ, first % 64, first / 64);
+            Check(differ == 0 && pixels.size() == reference.size() && !pixels.empty(), what);
+        }
+    }
+    std::printf("local read checked against copies: %zu ways (%s", renderers.size(), names[0]);
+    for (std::size_t i = 1; i < names.size(); ++i) std::printf(", %s", names[i]);
+    std::printf(")\n");
+}
+
 }  // namespace
 
 int main() {
+    // The renderers that read their targets in place, against the copies,
+    // first - each with a device of its own.
+    LocalReadMatchesCopies();
     std::string error;
     auto gpu = ps2gpu::CreateGpu(&error);
     if (!gpu) {

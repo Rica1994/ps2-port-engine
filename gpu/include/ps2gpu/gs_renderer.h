@@ -304,6 +304,11 @@ std::string SubmitStats();
 /* What went into the command buffers since the last call: barriers, layout
    transitions, compute dispatches, draws, rendering passes, feedback copies. */
 std::string RendererCounters();
+/* Since the last call, lines each starting with `prefix`: what ended the
+   rendering passes (another target, a copy of the target, the DATE setup,
+   other work - by kind, and how much of that work touched nothing the pass
+   used), why batches read their target in the shader, and the passes' area. */
+std::string RendererBreakdown(const char* prefix);
 /* The GPU's time on the frames' command buffers, in all (nanoseconds; 0
    where the GPU keeps no time). */
 std::uint64_t GpuBusyNanoseconds();

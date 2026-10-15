@@ -28,9 +28,20 @@ struct DeviceRequirements {
     std::vector<const char*> extensions;
     VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamic{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
+    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR local_read_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
     void* chain = nullptr;
     bool core13 = false;
+    /* VK_KHR_dynamic_rendering_local_read, used (UseLocalRead): blending in
+       the shader reads the target it draws into, no copy of it. */
+    bool local_read = false;
 };
+/* Whether the renderer reads its targets in place (VK_KHR_dynamic_rendering_
+   local_read) on a device that has it: by default on a portability
+   implementation (MoltenVK - Apple's tile-based GPUs, where a copy of the
+   target ends the rendering pass); PS2GPU_LOCAL_READ=1 anywhere (testing
+   it on a PC's GPU or lavapipe), =0 nowhere. */
+bool UseLocalRead(bool portability);
 bool DeviceRequirementsFor(VkPhysicalDevice gpu, bool swapchain, DeviceRequirements* out);
 void UseDynamicRenderingExtension();        // after creating a device with !core13
 
@@ -80,10 +91,11 @@ public:
     template <typename F>
     void Record(F&& record);
     /* The same, leaving a rendering pass a previous call left open: for draws
-       that continue it (end_pass says how to end one). */
+       that continue it (end_pass says how to end one; `submit`: the work is
+       handed to the GPU, rather than other work recorded after it). */
     template <typename F>
     void RecordInPass(F&& record);
-    std::function<void(VkCommandBuffer)> end_pass;
+    std::function<void(VkCommandBuffer, bool submit)> end_pass;
     /* Runs what has been recorded and waits for it, and for everything
        Flush handed over before; then what was waiting for that (AfterSubmit:
        freeing staging buffers, say) runs. */
@@ -97,12 +109,24 @@ public:
     bool recording() const { return open_; }
     /* PS2HOST_GPU_PROFILE: the GPU's time since the last mark (or the command
        buffer's start) counted as `kind` - a timestamp as the work before it
-       ends. */
+       ends. Work of one kind in a row is one run, one timestamp where the
+       kind changes (the item that changes it is counted with the run before):
+       a race's thousands of draws a picture took the pool's timestamps before
+       its swizzles and copies were reached. On Apple's GPUs MoltenVK takes
+       each timestamp at the end of the Metal pass it falls in (and adds a
+       small pass for it): there the time is by pass, not by draw. */
     void Mark(VkCommandBuffer c, int kind) {
-        if (!profile_ || marks_[current_].size() >= kMarks) return;
+        if (!profile_ || kind == run_kind_) return;
+        Stamp(c, run_kind_);
+        run_kind_ = kind;
+    }
+    /* A timestamp closing the work since the last one, counted as `kind`. */
+    void Stamp(VkCommandBuffer c, int kind) {
+        std::vector<int>& marks = marks_[current_];
+        if (marks.size() >= kMarks) return;
         vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profile_,
-                            std::uint32_t(current_) * kMarks + std::uint32_t(marks_[current_].size()));
-        marks_[current_].push_back(kind);
+                            std::uint32_t(current_) * kMarks + std::uint32_t(marks.size()));
+        marks.push_back(kind);
     }
     /* Counts command buffers begun: what was set in one is not in the next. */
     std::uint64_t recording_id() const { return recordings_; }
@@ -127,6 +151,7 @@ public:
     VkFence fences[kSlots] = {};
     bool dual_source = false;       /* dualSrcBlend: the GS's blending */
     bool logic_op = false;          /* logicOp: FBMSK's partly masked channels */
+    bool local_read = false;        /* VK_KHR_dynamic_rendering_local_read (DeviceRequirements) */
     bool bc = false;                /* textureCompressionBC: texture packs' DDS uploaded as they are */
     bool owns_device = true;
 
@@ -139,9 +164,12 @@ private:
     double timestamp_ns_ = 0;               // a tick, in nanoseconds
     bool stamped_[kSlots] = {};
     void MakeTimestamps();
-    static constexpr std::uint32_t kMarks = 8192;
+    // Timestamps a slot: three slots within MoltenVK's 4,096 (a MTLCounterSampleBuffer
+    // holds 32 KB; 8,192 a slot failed to make the pool on an iPad).
+    static constexpr std::uint32_t kMarks = 1360;
     VkQueryPool profile_ = VK_NULL_HANDLE;
     std::vector<int> marks_[kSlots];
+    int run_kind_ = 0;                      // the kind of the work since the last timestamp (Mark)
     std::vector<std::function<void()>> after_submit_;
     int current_ = 0;
     bool in_flight_[kSlots] = {};
@@ -167,7 +195,8 @@ void VulkanGpu::RecordInPass(F&& record) {
         if (profile_) {
             vkCmdResetQueryPool(cmd, profile_, std::uint32_t(current_) * kMarks, kMarks);
             marks_[current_].clear();
-            Mark(cmd, kProfOther);
+            Stamp(cmd, kProfOther);         // where the first run starts
+            run_kind_ = kProfOther;
         }
     }
     record(cmd);
@@ -176,7 +205,7 @@ void VulkanGpu::RecordInPass(F&& record) {
 template <typename F>
 void VulkanGpu::Record(F&& record) {
     RecordInPass([&](VkCommandBuffer c) {
-        if (end_pass) end_pass(c);
+        if (end_pass) end_pass(c, false);
         record(c);
     });
 }
@@ -218,8 +247,8 @@ inline bool VulkanGpu::Retire(int slot, const char* why) {
 
 inline bool VulkanGpu::Flush() {
     if (!open_) return true;
-    if (end_pass) end_pass(cmd);
-    Mark(cmd, kProfOther);
+    if (end_pass) end_pass(cmd, true);
+    if (profile_) Stamp(cmd, run_kind_);    // the last run
     open_ = false;
     if (timestamps_) {
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps_, 2 * std::uint32_t(current_) + 1);

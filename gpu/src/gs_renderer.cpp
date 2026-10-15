@@ -27,6 +27,7 @@
 #include "gs_frag.h"
 #include "gs_frag_single.h"
 #include "gs_frag_blend.h"
+#include "gs_frag_blend_local.h"
 #include "gs_vert.h"
 #include "date_frag.h"
 #include "date_vert.h"
@@ -83,6 +84,7 @@ struct Image {
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     VkDescriptorSet sampled = VK_NULL_HANDLE;   /* a target read by the DATE setup pass */
     VkDescriptorSet storage = VK_NULL_HANDLE;   /* a target as the swizzle's storage image */
+    VkDescriptorSet input = VK_NULL_HANDLE;     /* a target read where it is drawn (local read) */
     VkImageView depth_view = VK_NULL_HANDLE;    /* a depth buffer's depth alone, to sample */
     VkDescriptorSet depth_sampled = VK_NULL_HANDLE;     /* ...for the swizzle */
 };
@@ -105,6 +107,44 @@ struct Texture {
 
 // What the frames' command buffers hold (RendererCounters, PS2HOST_GPU_LOG).
 std::uint64_t g_barriers = 0, g_transitions = 0, g_dispatches = 0, g_draws = 0, g_passes = 0, g_feedback = 0;
+
+/* Why the open rendering pass ended (RendererCounters): on a tile-based GPU
+   (an iPad's) each end stores the target and its depth buffer to memory and
+   the next pass loads them back - the cost the counts below size. */
+enum PassBreak : int {
+    kBreakTarget,       // the next batch draws into another target
+    kBreakDepth,        // ...with another depth buffer
+    kBreakFeedback,     // it samples its own target: a copy first
+    kBreakBlend,        // it reads the destination in the shader (ShaderBlend): a copy first
+    kBreakDate,         // the destination alpha test's setup pass
+    kBreakSource,       // a target it samples needs a layout transition first
+    kBreakWork,         // other work recorded: by kind, kWork*
+    kBreakSubmit,       // handed to the GPU (a frame's Kick), or waited for
+    kBreaks
+};
+/* The work that ended a pass (kBreakWork). */
+enum WorkKind : int {
+    kWorkOther, kWorkDecode, kWorkClut, kWorkClutRows, kWorkMemoryWrite, kWorkMemoryPatch, kWorkToMemory,
+    kWorkFromMemory, kWorkDepthToMemory, kWorkDepthFromMemory, kWorkUpload, kWorkNewImage, kWorkReadback, kWorks
+};
+std::uint64_t g_aux_passes = 0;     // passes of the DATE setup and of depth loaded from memory
+const char* const kBreakNames[kBreaks] = {"target", "depth", "feedback", "blend", "DATE", "source", "work", "submit"};
+const char* const kWorkNames[kWorks] = {"other",      "decode",        "CLUT",     "CLUT rows", "memory write",
+                                        "memory patch", "to memory",   "from memory", "depth to memory",
+                                        "depth from memory", "upload", "new image", "read-back"};
+/* Why a batch read its target in the shader (ShaderBlendWhy), and so took a
+   copy of it before it drew. */
+enum BlendWhy : int { kBlendNone, kBlendMerge, kBlend16, kBlendDestAlpha, kBlendFix, kBlendWhys };
+std::uint64_t g_breaks[kBreaks] = {}, g_work_breaks[kWorks] = {};
+// Of the passes work ended, those it could have gone before: it neither
+// touches the pass's target or depth buffer nor writes what its draws read.
+std::uint64_t g_work_hoistable[kWorks] = {};
+std::uint64_t g_blend_copies[kBlendWhys] = {};     // copies for the destination, by why
+std::uint64_t g_batches = 0, g_blend_batches = 0, g_date_batches = 0;
+// Local read: batches that read their target in place, and the barriers
+// before those that read what their pass had drawn (each a Metal pass's end).
+std::uint64_t g_local_reads = 0, g_local_barriers = 0;
+std::uint64_t g_pass_pixels = 0;                   // the render areas of the passes begun, in all
 
 void Transition(VkCommandBuffer cmd, Image& t, VkImageLayout to, VkAccessFlags dst_access,
                 VkPipelineStageFlags dst_stage) {
@@ -195,16 +235,16 @@ bool Is16Bit(std::uint32_t psm) { return psm == 0x02 || psm == 0x0A || psm == 0x
    view: written whole, the iPad's race came out in the wrong colours). */
 bool g_masks_in_shader = false;
 
-bool ShaderBlend(const GsDrawState& s) {
-    if (g_masks_in_shader && PartlyMasked(KeptBits(s.fbmsk, s.psm))) return true;
-    if (!s.blend) return false;
+BlendWhy ShaderBlendWhy(const GsDrawState& s) {
+    if (g_masks_in_shader && PartlyMasked(KeptBits(s.fbmsk, s.psm))) return kBlendMerge;
+    if (!s.blend) return kBlendNone;
     // Into a 16-bit target: the blend's result cut to five bits a channel,
     // as the GS stores it (the blender would keep eight: the next blend over
     // it would read more than the GS has - Burnout 3's picture copied into
     // its 16-bit display buffer, blended over the last, came out 9 brighter
     // in the dark).
-    if (Is16Bit(s.psm)) return true;
-    if (s.a == s.b) return false;
+    if (Is16Bit(s.psm)) return kBlend16;
+    if (s.a == s.b) return kBlendNone;
     // The destination's alpha as the factor (C = Ad): over 128 on the GS,
     // over 255 as the blender reads a byte (DST_ALPHA) - at half its strength.
     // In the shader for a small target (Burnout 3's sky: its 64x32 gradient
@@ -215,9 +255,11 @@ bool ShaderBlend(const GsDrawState& s) {
     // fresh copy of the picture - 60 frames a second at 3x became 47. There
     // the frame's alpha is small (under 16) while the scene is drawn: half
     // strength of almost nothing.
-    if (s.c == BlendAlpha::Dest) return s.fbw <= 2 || s.sprite_prim;
-    return s.c == BlendAlpha::Fix && s.fix > 0x80;
+    if (s.c == BlendAlpha::Dest) return s.fbw <= 2 || s.sprite_prim ? kBlendDestAlpha : kBlendNone;
+    return s.c == BlendAlpha::Fix && s.fix > 0x80 ? kBlendFix : kBlendNone;
 }
+
+bool ShaderBlend(const GsDrawState& s) { return ShaderBlendWhy(s) != kBlendNone; }
 constexpr std::uint32_t kShaderBlend = 1u << 15;
 
 /* The pipeline a state needs: blending and its operands, and the write mask
@@ -381,7 +423,15 @@ private:
     /* The destination alpha test's setup pass: stencil 1 where the target's
        alpha bit equals DATM. */
     bool MakeDatePipeline();
-    void DateSetup(VkCommandBuffer cmd, Image& target, Image& depth, std::uint32_t datm);
+    void DateSetup(VkCommandBuffer cmd, Image& target, Image& depth, std::uint32_t datm, bool own_depth);
+    /* Tile-based GPUs (an iPad's): a pass loads and stores only what is
+       used after it - not the depth of a target's own depth buffer (draws
+       with it test nothing), nor stencil but from the DATE setup to its
+       batch. Each pass's end stores the attachments and the next one loads
+       them: a race picture ends ~550, and a target's own depth buffer is
+       most of them. PS2GPU_TILE_HINTS=0: everything loaded and stored. */
+    bool tile_hints_ = true;
+    Image* stencil_live_ = nullptr;     // the depth buffer whose stencil the DATE setup just set
     /* A target's descriptor for sampling it. */
     VkDescriptorSet SampledSet(Image& image);
     /* Copies of the target being drawn, when it is also the texture: one a
@@ -461,11 +511,55 @@ private:
     std::uint32_t ScaleOf(std::uint32_t width) const { return width <= 320 ? 1u : scale_; }
     Image* open_target_ = nullptr;
     Image* open_depth_ = nullptr;
-    void EndPass(VkCommandBuffer cmd) {
+    /* What the open pass's draws read (textures, targets sampled, copies;
+       the CLUT), for the accounting of what ended it (PassBreak). */
+    std::vector<const Image*> pass_reads_;
+    bool pass_reads_clut_ = false;
+    void PassReads(const Image* image) {
+        if (image && (pass_reads_.empty() || pass_reads_.back() != image)) pass_reads_.push_back(image);
+    }
+    /* The work about to be recorded outside a pass (Work): what it is, and
+       whether it had to come after the open pass. */
+    WorkKind work_ = kWorkOther;
+    bool work_conflicts_ = true;
+    /* Before recording work: its kind; the images it reads or writes, and
+       of those the ones it writes; whether it writes the CLUT. */
+    void Work(WorkKind kind, std::initializer_list<const Image*> touched = {},
+              std::initializer_list<const Image*> written = {}, bool writes_clut = false) {
+        work_ = kind;
+        bool conflicts = writes_clut && pass_reads_clut_;
+        for (const Image* image : touched) conflicts = conflicts || image == open_target_ || image == open_depth_;
+        for (const Image* image : written)
+            conflicts = conflicts || std::find(pass_reads_.begin(), pass_reads_.end(), image) != pass_reads_.end();
+        work_conflicts_ = conflicts || kind == kWorkReadback || kind == kWorkOther;
+    }
+    void EndPass(VkCommandBuffer cmd, int why) {
+        // Work() describes the one recording that follows it.
+        const WorkKind work = work_;
+        const bool conflicts = work_conflicts_;
+        work_ = kWorkOther;
+        work_conflicts_ = true;
         if (!open_target_) return;
+        ++g_breaks[why];
+        if (why == kBreakWork) {
+            ++g_work_breaks[work];
+            if (!conflicts) ++g_work_hoistable[work];
+        }
+        if (Tracing())
+            std::fprintf(stderr, "[pass] %s: %u batches, ended by %s%s%s%s\n", pass_label_, pass_batches_,
+                         kBreakNames[why], why == kBreakWork ? " - " : "", why == kBreakWork ? kWorkNames[work] : "",
+                         why == kBreakWork && !conflicts ? " (could go before the pass)" : "");
         vkCmdEndRendering(cmd);
         open_target_ = open_depth_ = nullptr;
+        pass_reads_.clear();
+        pass_reads_clut_ = false;
     }
+    /* PS2GPU_PASS_TRACE=N: each pass of the N-th frame (Kick) on stderr -
+       what it drew into, how many batches, and what ended it. */
+    long long trace_frame_ = -1;
+    bool Tracing() const { return trace_frame_ >= 0 && std::uint64_t(trace_frame_) == frame_; }
+    std::uint32_t pass_batches_ = 0;
+    char pass_label_[96] = {};
     VkPipeline date_pipeline_ = VK_NULL_HANDLE;
     VkDescriptorSet SetFor(Texture& texture, int sampler);
     bool Buffer(VkDeviceSize bytes, VkBufferUsageFlags usage, VkBuffer* buffer, VkDeviceMemory* memory, void** mapped);
@@ -473,6 +567,38 @@ private:
     VulkanGpu& g_;
     VkShaderModule vert_ = VK_NULL_HANDLE, frag_ = VK_NULL_HANDLE, frag_blend_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout set_layout_ = VK_NULL_HANDLE;
+    /* LOCAL READ (VulkanGpu::local_read): blending in the shader reads the
+       target it draws into as an input attachment, where the pixel is - no
+       copy of the target, and the rendering pass goes on. A batch reads what
+       memory held when the pass began (or since its last barrier) on a
+       tile-based GPU - MoltenVK reads the attachment's texture, which the
+       pass's own drawing reaches only when it stores it - so what the pass
+       has drawn is kept as a rectangle (GS pixels), and a batch reading
+       inside it puts a barrier first: MoltenVK ends and begins the Metal
+       pass there, any other GPU waits for the writes. The copy took a pass
+       break for every such batch; this, only for those that read what was
+       just drawn. */
+    VkDescriptorSetLayout input_set_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSet InputSet(Image& image);
+    /* The layout a target is drawn in: RENDERING_LOCAL_READ with local read
+       (its pixels read as an input attachment in the pass). */
+    VkImageLayout TargetLayout() const {
+        return g_.local_read ? VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
+    /* PS2GPU_LOCAL_READ_EMULATE=1: local read's decisions, read as a tile-
+       based GPU reads - from a copy of the target taken as each pass begins
+       (a barrier ends the pass instead), with the copy path's shader. A
+       barrier the bookkeeping below leaves out reads stale pixels here, on
+       any GPU: the pictures differ from the copy path's (renderer_tests,
+       the scripted runs). */
+    bool emulate_tbdr_ = false;
+    bool InPlaceReads() const { return g_.local_read || emulate_tbdr_; }
+    std::map<std::pair<std::uint32_t, std::uint32_t>, Image> snapshots_;   // (emulation) by size
+    bool pass_drawn_any_ = false;
+    int pass_x0_ = 0, pass_y0_ = 0, pass_x1_ = 0, pass_y1_ = 0;      // drawn since the last barrier (inclusive)
+    // The batch being gathered: the pixels its primitives cover (local read: all batches).
+    bool batch_any_ = false;
+    int batch_x0_ = 0, batch_y0_ = 0, batch_x1_ = 0, batch_y1_ = 0;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     bool keep_colour_ = false;      /* ReloadKeepsColour */
     VkSampler samplers_[8] = {};    /* bilinear << 2 | clamp_s << 1 | clamp_t */
@@ -809,30 +935,43 @@ bool VulkanGsRenderer::Init(std::string* error) {
     vert_ = module(spirv_gs_vert, sizeof spirv_gs_vert);
     frag_ = g_.dual_source ? module(spirv_gs_frag, sizeof spirv_gs_frag)
                            : module(spirv_gs_frag_single, sizeof spirv_gs_frag_single);
-    frag_blend_ = module(spirv_gs_frag_blend, sizeof spirv_gs_frag_blend);
+    // The destination read in place (local read), or from a copy of the target.
+    frag_blend_ = g_.local_read ? module(spirv_gs_frag_blend_local, sizeof spirv_gs_frag_blend_local)
+                                : module(spirv_gs_frag_blend, sizeof spirv_gs_frag_blend);
     g_masks_in_shader = !g_.logic_op;
     if (!vert_ || !frag_ || !frag_blend_) {
         if (error) *error = "the GS shaders did not load";
         return false;
     }
+    std::fprintf(stderr, "[gpu] the destination read in the shader: %s\n",
+                 g_.local_read ? "in place (VK_KHR_dynamic_rendering_local_read)" : "from a copy of the target");
     VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                                          VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dli.bindingCount = 1;
     dli.pBindings = &binding;
     vkCreateDescriptorSetLayout(g_.device, &dli, nullptr, &set_layout_);
+    if (g_.local_read) {
+        VkDescriptorSetLayoutBinding input{0, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                           nullptr};
+        VkDescriptorSetLayoutCreateInfo ili{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        ili.bindingCount = 1;
+        ili.pBindings = &input;
+        vkCreateDescriptorSetLayout(g_.device, &ili, nullptr, &input_set_layout_);
+    }
     VkDescriptorSetLayoutBinding clut_binding{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT,
                                               nullptr};
     VkDescriptorSetLayoutCreateInfo cli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     cli.bindingCount = 1;
     cli.pBindings = &clut_binding;
     vkCreateDescriptorSetLayout(g_.device, &cli, nullptr, &clut_set_layout_);
-    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192},
-                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}};
+    VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192},
+                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
+                                     {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1024}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpi.maxSets = 8192 + 4;
-    dpi.poolSizeCount = 2;
+    dpi.maxSets = 8192 + 4 + (g_.local_read ? 1024 : 0);
+    dpi.poolSizeCount = g_.local_read ? 3 : 2;
     dpi.pPoolSizes = sizes;
     vkCreateDescriptorPool(g_.device, &dpi, nullptr, &pool_);
     for (int i = 0; i < 8; ++i) {
@@ -849,8 +988,10 @@ bool VulkanGsRenderer::Init(std::string* error) {
                                    {VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset, sizeof(FragmentParams)}};
     VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     // Set 2: the target's copy that blending in the shader reads (a texture's
-    // layout, so a target's sampled set binds there too).
-    const VkDescriptorSetLayout set_layouts[3] = {set_layout_, clut_set_layout_, set_layout_};
+    // layout, so a target's sampled set binds there too) - or the target
+    // itself as an input attachment (local read).
+    const VkDescriptorSetLayout set_layouts[3] = {set_layout_, clut_set_layout_,
+                                                  g_.local_read ? input_set_layout_ : set_layout_};
     lci.setLayoutCount = 3;
     lci.pSetLayouts = set_layouts;
     lci.pushConstantRangeCount = 2;
@@ -866,7 +1007,12 @@ bool VulkanGsRenderer::Init(std::string* error) {
         return false;
     }
     Fill(blank_, &white);
-    g_.end_pass = [this](VkCommandBuffer cmd) { EndPass(cmd); };
+    g_.end_pass = [this](VkCommandBuffer cmd, bool submit) { EndPass(cmd, submit ? kBreakSubmit : kBreakWork); };
+    if (const char* trace = std::getenv("PS2GPU_PASS_TRACE")) trace_frame_ = std::atoll(trace);
+    if (const char* hints = std::getenv("PS2GPU_TILE_HINTS")) tile_hints_ = hints[0] != '0';
+    if (const char* emulate = std::getenv("PS2GPU_LOCAL_READ_EMULATE"))
+        emulate_tbdr_ = emulate[0] && emulate[0] != '0' && !g_.local_read;
+    if (emulate_tbdr_) std::fprintf(stderr, "[gpu] local read emulated as a tile-based GPU reads (a copy at each pass)\n");
     return InitMemory(error);
 }
 
@@ -1181,11 +1327,17 @@ void VulkanGsRenderer::DepthIn(VkCommandBuffer cmd, const SwizzleParams& params,
     z.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     z.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     z.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingAttachmentInfo stencil = z;
+    if (tile_hints_) {                              // (stencil matters only from a DATE setup to its batch)
+        stencil.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        stencil.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    }
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea = {{0, 0}, {d.pw(), d.ph()}};
     ri.layerCount = 1;
     ri.pDepthAttachment = &z;
-    ri.pStencilAttachment = &z;
+    ri.pStencilAttachment = &stencil;
+    ++g_aux_passes;
     vkCmdBeginRendering(cmd, &ri);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, depth_load_pipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, depth_load_layout_, 0, 1, &swizzle_set_, 0,
@@ -1243,6 +1395,7 @@ void VulkanGsRenderer::MemoryWrite(std::uint32_t begin, std::uint32_t end, const
     void* mapped = Staging(size, &buffer, &offset);
     if (!mapped) return;
     std::memcpy(mapped, bytes, std::size_t(size));
+    Work(kWorkMemoryWrite);
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         const VkBufferCopy copy{offset, VkDeviceSize(begin) * 256, size};
@@ -1255,6 +1408,7 @@ void VulkanGsRenderer::MemoryWrite(std::uint32_t begin, std::uint32_t end, const
 void VulkanGsRenderer::MemoryPatch(const std::uint32_t* words, std::size_t count) {
     if (!count || !patch_pipeline_) return;
     Flush();
+    Work(kWorkMemoryPatch);
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, patch_pipeline_);
@@ -1283,6 +1437,7 @@ void VulkanGsRenderer::MemoryRead(std::uint32_t begin, std::uint32_t end, std::u
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* mapped = nullptr;
     if (!Buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped)) return;
+    Work(kWorkReadback);
     g_.Run([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         const VkBufferCopy copy{VkDeviceSize(begin) * 256, 0, size};
@@ -1307,6 +1462,7 @@ bool VulkanGsRenderer::TargetToMemory(std::uint32_t fbp, std::uint32_t fbw, std:
     if (first_row >= rows) return true;
     rows -= first_row;
     if (!cols) return true;
+    Work(kWorkToMemory, {&t});
     g_.Record([&](VkCommandBuffer cmd) {
         SwizzleImage(cmd, SwizzleParams{fbp * 32, fbw, psm, cols, rows, t.pw(), 1, 0, first_row, t.scale}, t);
         MemoryBarrier(cmd);
@@ -1327,6 +1483,7 @@ void VulkanGsRenderer::TargetFromMemory(std::uint32_t fbp, std::uint32_t fbw, st
     Image* t = TargetFor(state);
     SwizzleParams params{fbp * 32, fbw, psm, t->width, t->height, t->pw(), 0, 0, 0, t->scale};
     params.keep_colour = existed && keep_colour_ && t->scale > 1;
+    Work(kWorkFromMemory, {t}, {t});
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         SwizzleImage(cmd, params, *t);
@@ -1346,6 +1503,7 @@ bool VulkanGsRenderer::DepthToMemory(std::uint32_t zbp, std::uint32_t width, std
     if (first_row >= rows) return true;
     rows -= first_row;
     if (!cols) return true;
+    Work(kWorkDepthToMemory, {&d});
     g_.Record([&](VkCommandBuffer cmd) {
         DepthOut(cmd, SwizzleParams{zbp * 32, fbw, zpsm, cols, rows, d.pw(), 1, 1, first_row, d.scale}, d);
         MemoryBarrier(cmd);
@@ -1370,6 +1528,7 @@ void VulkanGsRenderer::TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw
     rows = std::min(rows, t->height - first_row);
     SwizzleParams params{fbp * 32, fbw, psm, t->width, rows, t->pw(), 0, 0, first_row, t->scale};
     params.keep_colour = keep_colour_ && t->scale > 1;
+    Work(kWorkFromMemory, {t}, {t});
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         SwizzleImage(cmd, params, *t);
@@ -1387,6 +1546,7 @@ void VulkanGsRenderer::DepthRowsFromMemory(std::uint32_t zbp, std::uint32_t widt
     Image* d = DepthFor(zbp, width, height);
     if (first_row >= d->height) return;
     rows = std::min(rows, d->height - first_row);
+    Work(kWorkDepthFromMemory, {d}, {d});
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         DepthIn(cmd, SwizzleParams{zbp * 32, fbw, zpsm, d->width, rows, d->pw(), 0, 1, first_row, d->scale}, *d);
@@ -1398,6 +1558,7 @@ void VulkanGsRenderer::DepthFromMemory(std::uint32_t zbp, std::uint32_t width, s
                                        std::uint32_t fbw, std::uint32_t zpsm) {
     Flush();
     Image* d = DepthFor(zbp, width, height);
+    Work(kWorkDepthFromMemory, {d}, {d});
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         DepthIn(cmd, SwizzleParams{zbp * 32, fbw, zpsm, d->width, d->height, d->pw(), 0, 1, 0, d->scale}, *d);
@@ -1423,6 +1584,7 @@ void VulkanGsRenderer::SetScale(std::uint32_t scale) {
     feedback_ = nullptr;
     auto drop = [&](Image& image) {
         if (image.sampled) vkFreeDescriptorSets(g_.device, pool_, 1, &image.sampled);
+        if (image.input) vkFreeDescriptorSets(g_.device, pool_, 1, &image.input);
         if (image.storage) vkFreeDescriptorSets(g_.device, storage_pool_, 1, &image.storage);
         if (image.depth_sampled) vkFreeDescriptorSets(g_.device, pool_, 1, &image.depth_sampled);
         DestroyImage(image);
@@ -1430,9 +1592,11 @@ void VulkanGsRenderer::SetScale(std::uint32_t scale) {
     for (auto& [key, t] : targets_) drop(t);
     for (auto& [key, d] : depths_) drop(d);
     for (auto& [size, copy] : feedbacks_) drop(copy);
+    for (auto& [size, copy] : snapshots_) drop(copy);
     targets_.clear();
     depths_.clear();
     feedbacks_.clear();
+    snapshots_.clear();
     scale_ = scale;
 }
 
@@ -1601,7 +1765,8 @@ VkDescriptorSet VulkanGsRenderer::SampledSet(Image& image) {
     return image.sampled;
 }
 
-void VulkanGsRenderer::DateSetup(VkCommandBuffer cmd, Image& target, Image& depth, std::uint32_t datm) {
+void VulkanGsRenderer::DateSetup(VkCommandBuffer cmd, Image& target, Image& depth, std::uint32_t datm,
+                                 bool own_depth) {
     if (!SampledSet(target)) return;
     Transition(cmd, target, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
@@ -1613,21 +1778,30 @@ void VulkanGsRenderer::DateSetup(VkCommandBuffer cmd, Image& target, Image& dept
     z.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     z.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     z.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    if (tile_hints_ && own_depth) {             // its depth: never tested, never kept
+        z.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        z.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    }
     VkRenderingAttachmentInfo stencil = z;
     stencil.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;   // 0 everywhere first
+    stencil.storeOp = VK_ATTACHMENT_STORE_OP_STORE; // ...for the batch's pass
     stencil.clearValue.depthStencil = {0.0f, 0};
+    // (No larger than the depth buffer: a ZBP's is 512 rows at most.)
+    const std::uint32_t w = std::min(target.pw(), depth.pw()), h = std::min(target.ph(), depth.ph());
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-    ri.renderArea = {{0, 0}, {target.pw(), target.ph()}};
+    ri.renderArea = {{0, 0}, {w, h}};
     ri.layerCount = 1;
     ri.pDepthAttachment = &z;
     ri.pStencilAttachment = &stencil;
+    ++g_aux_passes;
     vkCmdBeginRendering(cmd, &ri);
+    stencil_live_ = &depth;
     drawn_ = DrawState{};           // its own pipeline, sets, viewport and scissor
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, date_pipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &target.sampled, 0, nullptr);
     VkViewport vp{0, 0, float(target.pw()), float(target.ph()), 0, 1};
     vkCmdSetViewport(cmd, 0, 1, &vp);
-    VkRect2D all{{0, 0}, {target.pw(), target.ph()}};
+    VkRect2D all{{0, 0}, {w, h}};
     vkCmdSetScissor(cmd, 0, 1, &all);
     FragmentParams params{};
     params.textured = datm;                         // the setup shader's first word is DATM
@@ -1635,6 +1809,23 @@ void VulkanGsRenderer::DateSetup(VkCommandBuffer cmd, Image& target, Image& dept
     vkCmdDraw(cmd, 3, 1, 0, 0);
     g_.Mark(cmd, kProfDate);
     vkCmdEndRendering(cmd);
+}
+
+VkDescriptorSet VulkanGsRenderer::InputSet(Image& image) {
+    if (image.input) return image.input;
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = pool_;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &input_set_layout_;
+    if (vkAllocateDescriptorSets(g_.device, &ai, &image.input) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkDescriptorImageInfo info{VK_NULL_HANDLE, image.view, VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = image.input;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
+    write.pImageInfo = &info;
+    vkUpdateDescriptorSets(g_.device, 1, &write, 0, nullptr);
+    return image.input;
 }
 
 VkDescriptorSet VulkanGsRenderer::SetFor(Texture& texture, int sampler) {
@@ -1663,6 +1854,7 @@ void VulkanGsRenderer::Fill(Texture& texture, const std::uint32_t* pixels) {
     void* mapped = Staging(bytes, &buffer, &offset);
     if (!mapped) return;
     std::memcpy(mapped, pixels, bytes);
+    Work(kWorkUpload, {&t}, {&t});
     g_.Record([&](VkCommandBuffer cmd) {
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1733,6 +1925,7 @@ bool VulkanGsRenderer::UploadReplacement(std::uint64_t id, std::uint32_t format,
     std::memcpy(mapped, data, std::size_t(at));
     for (VkBufferImageCopy& copy : copies) copy.bufferOffset += offset;
     Image& t = texture.image;
+    Work(kWorkUpload, {&t}, {&t});
     g_.Record([&](VkCommandBuffer cmd) {
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1815,6 +2008,7 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
     if (!texture) return;
     texture->replacement = 0;
     Image& t = texture->image;
+    Work(kWorkDecode, {&t}, {&t}, d.clut != nullptr);
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         if (d.clut) vkCmdUpdateBuffer(cmd, clut_, 0, 1024, d.clut);
@@ -1858,6 +2052,7 @@ void VulkanGsRenderer::ClutFromMemory(const GsClutLoad& load) {
     DecodeParams params{load.cbp, 1, load.cpsm, load.eight ? 256u : 16u, 1, 0, 0, 0, 0, 0, 0,
                         load.texa_lo, load.ta1, load.csa};
     params.mode = 1;
+    Work(kWorkClut, {}, {}, true);
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         drawn_ = DrawState{};
@@ -1875,6 +2070,7 @@ void VulkanGsRenderer::ClutRows(const std::uint32_t* clut, std::uint32_t rows) {
     rows &= 0xFFFF;
     if (!rows) return;
     Flush();                        // what is pending samples through the old rows
+    Work(kWorkClutRows, {}, {}, true);
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         for (std::uint32_t r = 0; r < 16;) {
@@ -1910,6 +2106,7 @@ void VulkanGsRenderer::UploadTarget(std::uint32_t fbp, std::uint32_t fbw, std::u
     for (std::uint32_t y = 0; y < h; ++y)
         std::memcpy(static_cast<std::uint8_t*>(mapped) + std::size_t(y) * w * 4, pixels + std::size_t(y) * width,
                     std::size_t(w) * 4);
+    Work(kWorkUpload, {t}, {t});
     g_.Record([&](VkCommandBuffer cmd) {
         Transition(cmd, *t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1956,9 +2153,11 @@ Image* VulkanGsRenderer::TargetFor(const GsDrawState& state) {
     if (t.image) return &t;
     MakeImage(t, state.width, state.height,
               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT,
+                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                  (g_.local_read ? VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT : 0),
               VK_FORMAT_R8G8B8A8_UNORM, ScaleOf(state.width));
     // Local memory starts as zeros.
+    Work(kWorkNewImage);
     g_.Record([&](VkCommandBuffer cmd) {
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -1978,6 +2177,7 @@ Image* VulkanGsRenderer::DepthFor(std::uint32_t key, std::uint32_t width, std::u
                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
               kDepthFormat, ScaleOf(width));
     // Local memory starts as zeros: the farthest Z.
+    Work(kWorkNewImage);
     g_.Record([&](VkCommandBuffer cmd) {
         Transition(cmd, d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -2000,6 +2200,7 @@ void VulkanGsRenderer::UploadDepth(std::uint32_t zbp, std::uint32_t width, std::
     if (!mapped) return;
     float* out = static_cast<float*>(mapped);
     for (std::size_t i = 0; i < std::size_t(width) * height; ++i) out[i] = float(double(z[i]) / 4294967296.0);
+    Work(kWorkUpload, {d}, {d});
     g_.Record([&](VkCommandBuffer cmd) {
         Transition(cmd, *d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -2031,6 +2232,20 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
     const bool two_pass = state.alpha_test && state.atst != 1 && count >= 3 &&
                           (((state.afail == 1 || state.afail == 2) && depth_written) || state.afail == 3);
     int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    if (InPlaceReads() && !(feedback || shader_blend || two_pass) && count >= 3) {
+        // What it covers, for what the pass has drawn (Flush's barriers).
+        float fx0 = v[0].x, fy0 = v[0].y, fx1 = v[0].x, fy1 = v[0].y;
+        for (std::size_t i = 1; i < count; ++i) {
+            fx0 = std::min(fx0, v[i].x);
+            fy0 = std::min(fy0, v[i].y);
+            fx1 = std::max(fx1, v[i].x);
+            fy1 = std::max(fy1, v[i].y);
+        }
+        x0 = int(std::floor(fx0));
+        y0 = int(std::floor(fy0));
+        x1 = int(std::ceil(fx1)) - 1;
+        y1 = int(std::ceil(fy1)) - 1;
+    }
     if (feedback || shader_blend || two_pass) {
         float fx0 = 1e30f, fy0 = 1e30f, fx1 = -1e30f, fy1 = -1e30f;
         float u0 = 1e30f, v0 = 1e30f, u1 = -1e30f, v1 = -1e30f;
@@ -2083,6 +2298,20 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
         if (shader_blend) Reads(x0, y0, x1, y1);
     }
     state_ = state;
+    if (InPlaceReads() && count >= 3) {
+        if (!batch_any_) {
+            batch_x0_ = x0;
+            batch_y0_ = y0;
+            batch_x1_ = x1;
+            batch_y1_ = y1;
+            batch_any_ = true;
+        } else {
+            batch_x0_ = std::min(batch_x0_, x0);
+            batch_y0_ = std::min(batch_y0_, y0);
+            batch_x1_ = std::max(batch_x1_, x1);
+            batch_y1_ = std::max(batch_y1_, y1);
+        }
+    }
     if (feedback || shader_blend || two_pass) {
         if (!drawn_any_) {
             drawn_x0_ = x0;
@@ -2278,6 +2507,10 @@ void VulkanGsRenderer::Flush() {
     const bool read_all = read_all_ || !read_any_;
     const int read_x0 = read_x0_, read_y0 = read_y0_, read_x1 = read_x1_, read_y1 = read_y1_;
     read_any_ = read_all_ = false;
+    // ...and what it covers (local read).
+    const bool batch_any = batch_any_;
+    const int bx0 = batch_x0_, by0 = batch_y0_, bx1 = batch_x1_, by1 = batch_y1_;
+    batch_any_ = false;
     if (pending_.empty()) return;
     const VkDeviceSize bytes = pending_.size() * sizeof(PackedVertex);
     VkBuffer vertex_buffer = VK_NULL_HANDLE;
@@ -2314,7 +2547,11 @@ void VulkanGsRenderer::Flush() {
     // Render to texture: the target itself, or a copy when it is also drawn into.
     Image* source = nullptr;
     bool copy_first = false;
-    const bool shader_blend = ShaderBlend(state_);
+    const BlendWhy blend_why = ShaderBlendWhy(state_);
+    const bool shader_blend = blend_why != kBlendNone;
+    ++g_batches;
+    if (shader_blend) ++g_blend_batches;
+    if (state_.date) ++g_date_batches;
     if (state_.textured && state_.texture_target) {
         auto found = targets_.find(Key{state_.tex_fbp, state_.tex_fbw, state_.tex_target_psm});
         if (found != targets_.end()) {
@@ -2332,9 +2569,21 @@ void VulkanGsRenderer::Flush() {
             }
         }
     }
-    // Blending in the shader reads the target as the batch began: the copy.
+    // Blending in the shader reads the target as the batch began: the copy -
+    // or, with local read, the target itself where the pixel is.
     VkDescriptorSet destination_set = VK_NULL_HANDLE;
-    if (shader_blend) {
+    const bool texture_copy = copy_first;       // (the copy is for the texture: a feedback)
+    const bool in_place = shader_blend && InPlaceReads();
+    Image* snapshot = nullptr;                  // (emulation: the copy taken as the pass began)
+    if (InPlaceReads() && emulate_tbdr_) {
+        snapshot = &snapshots_[{t->width, t->height}];
+        if (!snapshot->image)
+            MakeImage(*snapshot, t->width, t->height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                      VK_FORMAT_R8G8B8A8_UNORM, t->scale);
+    }
+    if (in_place) {
+        destination_set = emulate_tbdr_ ? SampledSet(*snapshot) : InputSet(*t);
+    } else if (shader_blend) {
         if (!copy_first) {
             Image& copy = feedbacks_[{t->width, t->height}];
             if (!copy.image)
@@ -2419,12 +2668,32 @@ void VulkanGsRenderer::Flush() {
         g_.RecordInPass([&](VkCommandBuffer cmd) {
             // Barriers and copies cannot go inside a rendering pass: a batch
             // needing one, or drawing elsewhere, ends the open pass first.
-            const bool outside = state_.date || copy_first ||
-                                 (source && source->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            if (outside || open_target_ != t || open_depth_ != depth) EndPass(cmd);
-            if (state_.date) DateSetup(cmd, *t, *depth, state_.datm);
+            int why = -1;                   // what ends the open pass, if anything (PassBreak)
+            if (state_.date) why = kBreakDate;
+            else if (copy_first) why = texture_copy ? kBreakFeedback : kBreakBlend;
+            else if (source && source->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) why = kBreakSource;
+            else if (open_target_ != t) why = kBreakTarget;
+            else if (open_depth_ != depth) why = kBreakDepth;
+            if (why >= 0) EndPass(cmd, why);
+            // Local read: a batch reading what the open pass drew since its last
+            // barrier needs one first (MoltenVK: the Metal pass stored and begun
+            // again). Emulated, the pass ends and the next takes a fresh copy.
+            bool barrier = false;
+            if (in_place && open_target_) {
+                const bool reads_drawn = !batch_any || (pass_drawn_any_ && bx1 >= pass_x0_ && bx0 <= pass_x1_ &&
+                                                        by1 >= pass_y0_ && by0 <= pass_y1_);
+                if (reads_drawn) {
+                    ++g_local_barriers;
+                    if (Tracing())
+                        std::fprintf(stderr, "[pass] %s: a barrier before batch %u\n", pass_label_, pass_batches_ + 1);
+                    if (emulate_tbdr_) EndPass(cmd, kBreakBlend);
+                    else barrier = true;
+                }
+            }
+            if (state_.date) DateSetup(cmd, *t, *depth, state_.datm, !state_.depth);
             if (copy_first) {
                 ++g_feedback;
+                if (!texture_copy) ++g_blend_copies[blend_why];
                 Transition(cmd, *t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
                            VK_PIPELINE_STAGE_TRANSFER_BIT);
                 Transition(cmd, *feedback_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -2454,12 +2723,41 @@ void VulkanGsRenderer::Flush() {
                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
             }
             if (!open_target_) {
-            Transition(cmd, *t, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
-                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+            if (snapshot) {
+                // Emulated local read: what memory holds as the pass begins.
+                Transition(cmd, *t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT);
+                Transition(cmd, *snapshot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT);
+                VkImageCopy whole{};
+                whole.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                whole.dstSubresource = whole.srcSubresource;
+                whole.extent = {t->pw(), t->ph(), 1};
+                vkCmdCopyImage(cmd, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, snapshot->image,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &whole);
+                Transition(cmd, *snapshot, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+            }
+            if (g_.local_read && t->layout == TargetLayout()) {
+                // The last pass's drawing into it, for this one's reads in place
+                // (no transition to carry it).
+                VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                b.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                ++g_barriers;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                     0, 1, &b, 0, nullptr, 0, nullptr);
+            }
+            Transition(cmd, *t, TargetLayout(),
+                       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                           (g_.local_read ? VK_ACCESS_INPUT_ATTACHMENT_READ_BIT : 0),
+                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                           (g_.local_read ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : 0));
             VkRenderingAttachmentInfo colour{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             colour.imageView = t->view;
-            colour.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            colour.imageLayout = TargetLayout();
             colour.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             colour.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             Transition(cmd, *depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -2470,18 +2768,75 @@ void VulkanGsRenderer::Flush() {
             z.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             z.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             z.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            VkRenderingAttachmentInfo stencil = z;
+            if (tile_hints_) {
+                // A target's own depth buffer: its depth never tested. Stencil:
+                // only what the DATE setup just set, for this batch's draws.
+                if (!state_.depth) {
+                    z.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                    z.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                }
+                stencil.loadOp = stencil_live_ == depth ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                stencil.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            }
+            stencil_live_ = nullptr;
             VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
             ri.renderArea = {{0, 0}, {t->pw(), std::min(t->ph(), depth->ph())}};
             ri.layerCount = 1;
             ri.colorAttachmentCount = 1;
             ri.pColorAttachments = &colour;
             ri.pDepthAttachment = &z;
-            ri.pStencilAttachment = &z;
+            ri.pStencilAttachment = &stencil;
             ++g_passes;
+            g_pass_pixels += std::uint64_t(ri.renderArea.extent.width) * ri.renderArea.extent.height;
             vkCmdBeginRendering(cmd, &ri);
             open_target_ = t;
             open_depth_ = depth;
+            pass_batches_ = 0;
+            pass_drawn_any_ = false;
+            if (Tracing())
+                std::snprintf(pass_label_, sizeof pass_label_, "%X/%u/%02X %ux%u, Z %s%X", unsigned(state_.fbp),
+                              unsigned(state_.fbw), unsigned(state_.psm), unsigned(ri.renderArea.extent.width),
+                              unsigned(ri.renderArea.extent.height), state_.depth ? "" : "own ",
+                              unsigned(state_.depth ? state_.zbp : state_.fbp));
             }
+            if (barrier) {
+                VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                b.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+                ++g_barriers;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 1, &b, 0,
+                                     nullptr, 0, nullptr);
+                pass_drawn_any_ = false;
+            }
+            ++pass_batches_;
+            if (in_place) ++g_local_reads;
+            // What the pass has drawn since its last barrier (local read).
+            if (InPlaceReads()) {
+                if (!batch_any) {           // (not known: all of it)
+                    pass_x0_ = pass_y0_ = 0;
+                    pass_x1_ = pass_y1_ = 1 << 20;
+                    pass_drawn_any_ = true;
+                } else if (!pass_drawn_any_) {
+                    pass_x0_ = bx0;
+                    pass_y0_ = by0;
+                    pass_x1_ = bx1;
+                    pass_y1_ = by1;
+                    pass_drawn_any_ = true;
+                } else {
+                    pass_x0_ = std::min(pass_x0_, bx0);
+                    pass_y0_ = std::min(pass_y0_, by0);
+                    pass_x1_ = std::max(pass_x1_, bx1);
+                    pass_y1_ = std::max(pass_y1_, by1);
+                }
+            }
+            // What its draws read, for what may go before the pass (EndPass's accounting).
+            if (source) PassReads(copy_first ? feedback_ : source);
+            else if (state_.textured) PassReads(&texture->image);
+            if (shader_blend && feedback_ && !in_place) PassReads(feedback_);
+            if (snapshot) PassReads(snapshot);
+            pass_reads_clut_ = pass_reads_clut_ || (source && state_.tex_format == 4);
             // ZTST: NEVER, ALWAYS, GEQUAL, GREATER - the larger Z is nearer.
             static const VkCompareOp kCompare[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS,
                                                     VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
@@ -2579,6 +2934,7 @@ bool VulkanGsRenderer::ReadDepth(std::uint32_t zbp, std::uint32_t width, std::ui
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* mapped = nullptr;
     if (!Buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped)) return false;
+    Work(kWorkReadback);
     g_.Run([&](VkCommandBuffer cmd) {
         Transition(cmd, d, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -2609,6 +2965,7 @@ bool VulkanGsRenderer::ReadImage(Image& t, std::vector<std::uint32_t>* pixels) {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* mapped = nullptr;
     if (!Buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped)) return false;
+    Work(kWorkReadback);
     g_.Run([&](VkCommandBuffer cmd) {
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -2647,6 +3004,7 @@ bool VulkanGsRenderer::ReadTargetFull(std::uint32_t fbp, std::uint32_t fbw, std:
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* mapped = nullptr;
     if (!Buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped)) return false;
+    Work(kWorkReadback);
     g_.Run([&](VkCommandBuffer cmd) {
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -2677,6 +3035,7 @@ bool VulkanGsRenderer::ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uin
     VkDeviceMemory memory = VK_NULL_HANDLE;
     void* mapped = nullptr;
     if (!Buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped)) return false;
+    Work(kWorkReadback);
     g_.Run([&](VkCommandBuffer cmd) {
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -2714,6 +3073,7 @@ VulkanGsRenderer::~VulkanGsRenderer() {
         for (Texture& texture : list) DestroyImage(texture.image);
     DestroyImage(blank_.image);
     for (auto& [size, copy] : feedbacks_) DestroyImage(copy);
+    for (auto& [size, copy] : snapshots_) DestroyImage(copy);
     for (VkDeviceMemory block : image_blocks_) vkFreeMemory(g_.device, block, nullptr);     // (ImageMemory's)
     image_blocks_.clear();
     image_pieces_.clear();
@@ -2746,6 +3106,7 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (swizzle_) vkDestroyShaderModule(g_.device, swizzle_, nullptr);
     if (decode_pipeline_) vkDestroyPipeline(g_.device, decode_pipeline_, nullptr);
     if (decode_) vkDestroyShaderModule(g_.device, decode_, nullptr);
+    if (input_set_layout_) vkDestroyDescriptorSetLayout(g_.device, input_set_layout_, nullptr);
     for (auto [buffer, memory] : {std::pair{gsmem_, gsmem_memory_}, std::pair{linear_, linear_memory_},
                                   std::pair{clut_, clut_memory_}}) {
         if (buffer) vkDestroyBuffer(g_.device, buffer, nullptr);
@@ -2784,6 +3145,57 @@ std::string RendererCounters() {
                   (unsigned long long)(now[4] - last[4]), (unsigned long long)(now[5] - last[5]));
     for (int i = 0; i < 6; ++i) last[i] = now[i];
     return text;
+}
+
+std::string RendererBreakdown(const char* prefix) {
+    // Since the last call: what ended the passes, the work that did (and how
+    // much of it could have gone before them), why batches read their
+    // target, and how much the passes covered.
+    static std::uint64_t last_breaks[kBreaks] = {}, last_work[kWorks] = {}, last_hoist[kWorks] = {},
+                         last_blend[kBlendWhys] = {}, last_more[7] = {};
+    auto delta = [](std::uint64_t now_value, std::uint64_t* then) {
+        const std::uint64_t d = now_value - *then;
+        *then = now_value;
+        return (unsigned long long)d;
+    };
+    char text[200];
+    std::string out = prefix;
+    out += "passes ended by:";
+    for (int i = 0; i < kBreaks; ++i) {
+        const unsigned long long d = delta(g_breaks[i], &last_breaks[i]);
+        if (!d) continue;
+        std::snprintf(text, sizeof text, " %s %llu", kBreakNames[i], d);
+        out += text;
+    }
+    out += "\n";
+    out += prefix;
+    out += "work that ended a pass (of it, could have gone before):";
+    for (int i = 0; i < kWorks; ++i) {
+        const unsigned long long d = delta(g_work_breaks[i], &last_work[i]);
+        const unsigned long long h = delta(g_work_hoistable[i], &last_hoist[i]);
+        if (!d) continue;
+        std::snprintf(text, sizeof text, " %s %llu (%llu)", kWorkNames[i], d, h);
+        out += text;
+    }
+    static const char* const kBlendNames[kBlendWhys] = {"", "FBMSK merge", "16-bit", "Ad", "FIX>0x80"};
+    out += "\n";
+    out += prefix;
+    out += "destination copies by why:";
+    for (int i = 1; i < kBlendWhys; ++i) {
+        std::snprintf(text, sizeof text, " %s %llu", kBlendNames[i], delta(g_blend_copies[i], &last_blend[i]));
+        out += text;
+    }
+    std::snprintf(text, sizeof text, "; batches %llu (%llu shader blend, %llu DATE); %llu setup/depth passes; %.1f MP of passes",
+                  delta(g_batches, &last_more[0]), delta(g_blend_batches, &last_more[1]),
+                  delta(g_date_batches, &last_more[2]), delta(g_aux_passes, &last_more[3]),
+                  double(delta(g_pass_pixels, &last_more[4])) / 1e6);
+    out += text;
+    const unsigned long long local = delta(g_local_reads, &last_more[5]), barriers = delta(g_local_barriers, &last_more[6]);
+    if (local) {
+        std::snprintf(text, sizeof text, "; read in place %llu, %llu of them after a barrier", local, barriers);
+        out += text;
+    }
+    return out;
 }
 
 std::string SubmitStats() {

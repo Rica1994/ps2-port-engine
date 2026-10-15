@@ -10,7 +10,17 @@
 // fixed-point target clamps to 1).
 #ifdef SHADER_BLEND
 #define SINGLE_OUTPUT
+#ifdef LOCAL_READ
+// With LOCAL_READ (VK_KHR_dynamic_rendering_local_read): the target itself,
+// read where the pixel is - no copy, and the rendering pass goes on. The
+// renderer puts a barrier before a batch reading pixels the pass has drawn
+// since the last one (gs_renderer.cpp's Flush).
+layout(input_attachment_index = 0, set = 2, binding = 0) uniform subpassInput destination;
+#define DESTINATION() subpassLoad(destination)
+#else
 layout(set = 2, binding = 0) uniform sampler2D destination;
+#define DESTINATION() texelFetch(destination, ivec2(gl_FragCoord.xy), 0)
+#endif
 #endif
 
 layout(location = 0) in vec4 shade;
@@ -292,7 +302,7 @@ void main() {
 
 #ifdef SHADER_BLEND
     // Cv = ((A - B) * C >> 7) + D, clamped (COLCLAMP), as the software GS.
-    vec4 dst = round(texelFetch(destination, ivec2(gl_FragCoord.xy), 0) * 255.0);
+    vec4 dst = round(DESTINATION() * 255.0);
     uint ops = p.blend_ops & 255u;
     vec3 op_a = (ops & 3u) == 0u ? c.rgb : (ops & 3u) == 1u ? dst.rgb : vec3(0.0);
     vec3 op_b = ((ops >> 2) & 3u) == 0u ? c.rgb : ((ops >> 2) & 3u) == 1u ? dst.rgb : vec3(0.0);
