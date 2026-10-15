@@ -16,6 +16,23 @@ namespace {
 
 int g_failures = 0;
 
+/* The environment the renderer reads its paths from, set and cleared
+   (Windows has neither setenv nor unsetenv). */
+void SetEnv(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+void UnsetEnv(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
 void Check(bool ok, const char* what) {
     if (!ok) {
         std::printf("FAIL: %s\n", what);
@@ -461,10 +478,10 @@ void PathsAgree() {
     std::vector<std::unique_ptr<ps2gpu::GsRenderer>> renderers;
     std::vector<const char*> names;
     for (const Setup& setup : setups) {
-        setenv("PS2GPU_LOCAL_READ", setup.local_read, 1);
-        setenv("PS2GPU_LOCAL_READ_EMULATE", setup.emulate, 1);
-        setenv("PS2GPU_DEFER_PASSES", setup.defer, 1);
-        setenv("PS2GPU_TILE_HINTS", setup.hints, 1);
+        SetEnv("PS2GPU_LOCAL_READ", setup.local_read);
+        SetEnv("PS2GPU_LOCAL_READ_EMULATE", setup.emulate);
+        SetEnv("PS2GPU_DEFER_PASSES", setup.defer);
+        SetEnv("PS2GPU_TILE_HINTS", setup.hints);
         std::string error;
         auto gpu = ps2gpu::CreateGpu(&error);
         if (!gpu) continue;
@@ -479,7 +496,7 @@ void PathsAgree() {
         names.push_back(setup.name);
     }
     for (const char* name : {"PS2GPU_LOCAL_READ", "PS2GPU_LOCAL_READ_EMULATE", "PS2GPU_DEFER_PASSES", "PS2GPU_TILE_HINTS"})
-        unsetenv(name);
+        UnsetEnv(name);
     if (renderers.size() < 2) return;
     // Two contents for a texture the draws sample, uploaded in turn (work a
     // pass sampling it must come before), and one they never sample.

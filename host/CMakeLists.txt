@@ -311,7 +311,13 @@ function(ps2_ios_app target title version game_dir)
         XCODE_ATTRIBUTE_ENABLE_BITCODE "NO"
         XCODE_EMBED_FRAMEWORKS "${framework}"
         XCODE_EMBED_FRAMEWORKS_CODE_SIGN_ON_COPY ON
-        XCODE_EMBED_FRAMEWORKS_REMOVE_HEADERS_ON_COPY ON)
+        XCODE_EMBED_FRAMEWORKS_REMOVE_HEADERS_ON_COPY ON
+        # Run from Xcode as from the home screen: Xcode's own Metal API
+        # validation and frame capture layers otherwise sit under every
+        # Metal call MoltenVK makes - thousands a picture, on the thread
+        # that draws (what a run from Xcode measured was partly theirs).
+        XCODE_SCHEME_ENABLE_GPU_API_VALIDATION OFF
+        XCODE_SCHEME_ENABLE_GPU_FRAME_CAPTURE_MODE "Disabled")
     if(EXISTS ${game_dir}/port/ios_icon.png)
         set(catalog ${CMAKE_CURRENT_BINARY_DIR}/${target}_Assets.xcassets)
         file(MAKE_DIRECTORY ${catalog}/AppIcon.appiconset)
