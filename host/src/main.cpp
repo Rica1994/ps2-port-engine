@@ -195,6 +195,27 @@ std::vector<std::string> PlayArguments(const char* self) {
     if (stem.empty()) stem = "port";
     LogToFile(here, stem + ".log");
     std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
+    // PS2HOST_SCRIPT="<arguments>" (set in an Xcode scheme's environment, say):
+    // a scripted run - a port/runs/*.args, --virtual-time and its presses - on
+    // the player's own disc and settings, with no memory card (the runs were
+    // recorded with none) and no VU programs recorded: a tablet's benchmark,
+    // its numbers in the log as ever.
+    if (const char* script = std::getenv("PS2HOST_SCRIPT"); script && *script) {
+        std::vector<std::string> args = {self ? self : "port", "--disc", disc, "--window", "--gpu", "--audio",
+                                         "--timeout", "315360000", "--frame-times", "300"};
+        std::string word;
+        for (const char* c = script;; ++c) {
+            if (*c && !std::isspace(static_cast<unsigned char>(*c))) {
+                word += *c;
+                continue;
+            }
+            if (!word.empty()) args.push_back(word);
+            word.clear();
+            if (!*c) break;
+        }
+        std::fprintf(stderr, "[port] scripted run: %s\n", script);
+        return args;
+    }
     return {self ? self : "port", "--disc", disc, "--memcard", (here / "memcard").string(), "--window", "--gpu",
             "--audio", "--timeout", "315360000",     // ten years
             "--frame-times", platform::kMobile ? "300" : "0",   // a tablet's log: pictures a second

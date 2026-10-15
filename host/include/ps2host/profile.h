@@ -8,6 +8,7 @@
 #ifndef PS2HOST_PROFILE_H
 #define PS2HOST_PROFILE_H
 
+#include <cstdint>
 #include <string>
 
 namespace ps2host {
@@ -27,6 +28,9 @@ private:
 
 /* "GS drawing 61.2%, ..." of the run's wall time so far. */
 std::string ProfileSummary();
+/* Each section's time since the last call, in milliseconds a frame of
+   `frames` - the tablet's [perf] report, interval by interval. */
+std::string ProfileInterval(std::uint64_t frames);
 
 /* --sample: a sampling profiler on the calling thread (the EE's, which runs
    the translated code, the host's devices and the GPU bridge): a thousand

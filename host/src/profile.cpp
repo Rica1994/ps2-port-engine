@@ -117,6 +117,25 @@ Timed::~Timed() {
     t.since = now;
 }
 
+std::string ProfileInterval(std::uint64_t frames) {
+    // Since the last call: each section's time in milliseconds a frame.
+    static std::uint64_t last[int(Section::Count)] = {};
+    const double seconds_per_tick = Elapsed(g_start, Clock::now()) /
+                                    double(std::max<std::uint64_t>(1, Ticks() - g_start_ticks));
+    std::string out = "ms a frame:";
+    char text[64];
+    for (int i = 0; i < int(Section::Count); ++i) {
+        const std::uint64_t ticks = SectionTicks(i);
+        const std::uint64_t d = ticks - last[i];
+        last[i] = ticks;
+        if (!d) continue;
+        std::snprintf(text, sizeof text, " %s %.2f;", kSectionNames[i],
+                      1000.0 * double(d) * seconds_per_tick / double(std::max<std::uint64_t>(1, frames)));
+        out += text;
+    }
+    return out;
+}
+
 std::string ProfileSummary() {
     const char* const* kNames = kSectionNames;
     const double total = Elapsed(g_start, Clock::now());
