@@ -39,11 +39,16 @@ struct DeviceRequirements {
        on Apple's GPUs - tile-based ones on an iPad. */
     bool portability = false;
 };
+/* Whether the renderer takes the ways of a tile-based GPU - its targets
+   read in place (local read), attachments loaded and stored only as used
+   (tile hints), passes deferred: by default on a portability implementation
+   (MoltenVK - Apple's tile-based GPUs); PS2GPU_TILE=1 anywhere (the iPad's
+   ways on a PC's GPU or lavapipe, for the scripted runs), =0 nowhere (an
+   iPad's run as before them). Each way's own variable overrides it. */
+bool TileWays(bool portability);
 /* Whether the renderer reads its targets in place (VK_KHR_dynamic_rendering_
-   local_read) on a device that has it: by default on a portability
-   implementation (MoltenVK - Apple's tile-based GPUs, where a copy of the
-   target ends the rendering pass); PS2GPU_LOCAL_READ=1 anywhere (testing
-   it on a PC's GPU or lavapipe), =0 nowhere. */
+   local_read) on a device that has it: TileWays, or PS2GPU_LOCAL_READ=1
+   anywhere (testing it on a PC's GPU or lavapipe), =0 nowhere. */
 bool UseLocalRead(bool portability);
 bool DeviceRequirementsFor(VkPhysicalDevice gpu, bool swapchain, DeviceRequirements* out);
 void UseDynamicRenderingExtension();        // after creating a device with !core13

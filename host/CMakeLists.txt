@@ -317,7 +317,12 @@ function(ps2_ios_app target title version game_dir)
         # Metal call MoltenVK makes - thousands a picture, on the thread
         # that draws (what a run from Xcode measured was partly theirs).
         XCODE_SCHEME_ENABLE_GPU_API_VALIDATION OFF
-        XCODE_SCHEME_ENABLE_GPU_FRAME_CAPTURE_MODE "Disabled")
+        XCODE_SCHEME_ENABLE_GPU_FRAME_CAPTURE_MODE "Disabled"
+        # Run as Release, as the scheme was set by hand before: CMake writes
+        # the scheme again at every configure (Debug and its debugger
+        # otherwise; the debugger it cannot leave out - Run > Info > Debug
+        # executable, by hand).
+        XCODE_SCHEME_LAUNCH_CONFIGURATION "Release")
     if(EXISTS ${game_dir}/port/ios_icon.png)
         set(catalog ${CMAKE_CURRENT_BINARY_DIR}/${target}_Assets.xcassets)
         file(MAKE_DIRECTORY ${catalog}/AppIcon.appiconset)

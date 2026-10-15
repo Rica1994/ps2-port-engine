@@ -477,6 +477,14 @@ void PathsAgree() {
     std::vector<std::unique_ptr<ps2gpu::Gpu>> gpus;
     std::vector<std::unique_ptr<ps2gpu::GsRenderer>> renderers;
     std::vector<const char*> names;
+    // The variables as the run had them, back after (the other tests' renderer).
+    static const char* const kWays[] = {"PS2GPU_LOCAL_READ", "PS2GPU_LOCAL_READ_EMULATE", "PS2GPU_DEFER_PASSES",
+                                        "PS2GPU_TILE_HINTS"};
+    std::vector<std::pair<bool, std::string>> before;
+    for (const char* name : kWays) {
+        const char* value = std::getenv(name);
+        before.emplace_back(value != nullptr, value ? value : "");
+    }
     for (const Setup& setup : setups) {
         SetEnv("PS2GPU_LOCAL_READ", setup.local_read);
         SetEnv("PS2GPU_LOCAL_READ_EMULATE", setup.emulate);
@@ -495,8 +503,10 @@ void PathsAgree() {
         renderers.push_back(std::move(renderer));
         names.push_back(setup.name);
     }
-    for (const char* name : {"PS2GPU_LOCAL_READ", "PS2GPU_LOCAL_READ_EMULATE", "PS2GPU_DEFER_PASSES", "PS2GPU_TILE_HINTS"})
-        UnsetEnv(name);
+    for (std::size_t i = 0; i < before.size(); ++i) {
+        if (before[i].first) SetEnv(kWays[i], before[i].second.c_str());
+        else UnsetEnv(kWays[i]);
+    }
     if (renderers.size() < 2) return;
     // Two contents for a texture the draws sample, uploaded in turn (work a
     // pass sampling it must come before), and one they never sample.

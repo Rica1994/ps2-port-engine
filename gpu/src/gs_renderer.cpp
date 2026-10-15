@@ -1063,13 +1063,16 @@ bool VulkanGsRenderer::Init(std::string* error) {
     g_.end_pass = [this](VkCommandBuffer cmd, bool submit) { EndPass(cmd, submit ? kBreakSubmit : kBreakWork); };
     if (const char* trace = std::getenv("PS2GPU_PASS_TRACE")) trace_frame_ = std::atoll(trace);
     // The ways for a tile-based GPU: MoltenVK's defaults (an iPad's, a Mac's);
-    // anywhere by their variables - the pictures are the same either way.
-    tile_hints_ = defer_passes_ = g_.portability;
+    // anywhere by their variables (PS2GPU_TILE, all of them) - the pictures
+    // are the same either way.
+    tile_hints_ = defer_passes_ = TileWays(g_.portability);
     if (const char* hints = std::getenv("PS2GPU_TILE_HINTS")) tile_hints_ = hints[0] != '0';
     if (const char* emulate = std::getenv("PS2GPU_LOCAL_READ_EMULATE"))
         emulate_tbdr_ = emulate[0] && emulate[0] != '0' && !g_.local_read;
     if (emulate_tbdr_) std::fprintf(stderr, "[gpu] local read emulated as a tile-based GPU reads (a copy at each pass)\n");
     if (const char* defer = std::getenv("PS2GPU_DEFER_PASSES")) defer_passes_ = defer[0] != '0';
+    std::fprintf(stderr, "[gpu] tile-based GPU ways: local read %s, tile hints %s, deferred passes %s\n",
+                 g_.local_read ? "on" : "off", tile_hints_ ? "on" : "off", defer_passes_ ? "on" : "off");
     return InitMemory(error);
 }
 

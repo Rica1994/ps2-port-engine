@@ -170,10 +170,16 @@ bool DeviceRequirementsFor(VkPhysicalDevice gpu, bool swapchain, DeviceRequireme
     return true;
 }
 
+bool TileWays(bool portability) {
+    const char* v = std::getenv("PS2GPU_TILE");
+    if (v && *v) return *v != '0';
+    return portability;
+}
+
 bool UseLocalRead(bool portability) {
     const char* v = std::getenv("PS2GPU_LOCAL_READ");
     if (v && *v) return *v != '0';
-    return portability;
+    return TileWays(portability);
 }
 
 void UseDynamicRenderingExtension() {
