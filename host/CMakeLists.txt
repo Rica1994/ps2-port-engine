@@ -244,7 +244,7 @@ END
             target_link_options(${target} PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
         endif()
         if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-            ps2_ios_app(${target} "${game_title}" "${game_version}")
+            ps2_ios_app(${target} "${game_title}" "${game_version}" "${game_dir}")
         endif()
     endif()
     if(MSVC)
@@ -270,7 +270,8 @@ endfunction()
 #                       (engine/tools/ios_setup.sh fetches it)
 # The app carries MoltenVK (Vulkan on Metal) in Frameworks/ and nothing of the
 # game: the player copies their disc image into the app's folder in Files.
-function(ps2_ios_app target title version)
+# Its icon: the game's port/ios_icon.png (1024 x 1024, opaque), if it has one.
+function(ps2_ios_app target title version game_dir)
     set(PS2_IOS_BUNDLE_ID "com.example.${target}" CACHE STRING "The iPad app's bundle identifier")
     set(PS2_IOS_TEAM "" CACHE STRING "The Apple development team that signs the app")
     set(PS2_MOLTENVK "" CACHE PATH "MoltenVK's dynamic MoltenVK.xcframework (or .framework) for iOS")
@@ -308,6 +309,18 @@ function(ps2_ios_app target title version)
         XCODE_EMBED_FRAMEWORKS "${framework}"
         XCODE_EMBED_FRAMEWORKS_CODE_SIGN_ON_COPY ON
         XCODE_EMBED_FRAMEWORKS_REMOVE_HEADERS_ON_COPY ON)
+    if(EXISTS ${game_dir}/port/ios_icon.png)
+        set(catalog ${CMAKE_CURRENT_BINARY_DIR}/${target}_Assets.xcassets)
+        file(MAKE_DIRECTORY ${catalog}/AppIcon.appiconset)
+        configure_file(${game_dir}/port/ios_icon.png ${catalog}/AppIcon.appiconset/icon.png COPYONLY)
+        file(WRITE ${catalog}/Contents.json "{\"info\":{\"author\":\"xcode\",\"version\":1}}\n")
+        file(WRITE ${catalog}/AppIcon.appiconset/Contents.json
+             "{\"images\":[{\"filename\":\"icon.png\",\"idiom\":\"universal\",\"platform\":\"ios\",\"size\":\"1024x1024\"}],\"info\":{\"author\":\"xcode\",\"version\":1}}\n")
+        target_sources(${target} PRIVATE ${catalog})
+        set_source_files_properties(${catalog} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+        set_target_properties(${target} PROPERTIES RESOURCE ${catalog}
+                              XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon")
+    endif()
     # MoltenVK is dlopen'ed (gpu/src/vulkan_setup.cpp), not linked: volk's
     # function pointers bear Vulkan's names, as MoltenVK's functions do.
     # Apple's frameworks that SDL3 needs on iOS (its CMake links most).
