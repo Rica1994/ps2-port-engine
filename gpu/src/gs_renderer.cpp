@@ -431,8 +431,9 @@ private:
        with it test nothing), nor stencil but from the DATE setup to its
        batch. Each pass's end stores the attachments and the next one loads
        them: a race picture ends ~550, and a target's own depth buffer is
-       most of them. PS2GPU_TILE_HINTS=0: everything loaded and stored. */
-    bool tile_hints_ = true;
+       most of them. On by default with MoltenVK (Init); PS2GPU_TILE_HINTS=1
+       or 0 anywhere. */
+    bool tile_hints_ = false;
     Image* stencil_live_ = nullptr;     // the depth buffer whose stencil the DATE setup just set
     /* A target's descriptor for sampling it. */
     VkDescriptorSet SampledSet(Image& image);
@@ -541,7 +542,8 @@ private:
         for (const Image* image : written) conflicts = conflicts || read_by_pass(image);
         work_conflicts_ = conflicts || kind == kWorkReadback || kind == kWorkOther;
     }
-    /* DEFERRED PASSES (PS2GPU_DEFER_PASSES=0 turns them off): a pass's draws
+    /* DEFERRED PASSES (by default with MoltenVK; PS2GPU_DEFER_PASSES=1 or 0
+       anywhere): a pass's draws
        go into a secondary command buffer, and the pass - its begin, the
        draws, its end - into the frame's only when it ends. Work recorded
        meanwhile that does not conflict with it (Work) goes into the frame's
@@ -549,7 +551,7 @@ private:
        store and reload of the target). A target the next batch samples is
        made ready the same way. The pass's area is what its batches' scissors
        cover (MoltenVK sizes the Metal pass by it). */
-    bool defer_passes_ = true;
+    bool defer_passes_ = false;
     VkCommandBuffer pass_cmd_ = VK_NULL_HANDLE;             // the open pass's draws
     VkRenderingAttachmentInfo pass_colour_{}, pass_depth_{}, pass_stencil_{};
     std::int32_t pass_area_[4] = {};                        // x0, y0, x1, y1 (image pixels, exclusive end)
@@ -1060,6 +1062,9 @@ bool VulkanGsRenderer::Init(std::string* error) {
     Fill(blank_, &white);
     g_.end_pass = [this](VkCommandBuffer cmd, bool submit) { EndPass(cmd, submit ? kBreakSubmit : kBreakWork); };
     if (const char* trace = std::getenv("PS2GPU_PASS_TRACE")) trace_frame_ = std::atoll(trace);
+    // The ways for a tile-based GPU: MoltenVK's defaults (an iPad's, a Mac's);
+    // anywhere by their variables - the pictures are the same either way.
+    tile_hints_ = defer_passes_ = g_.portability;
     if (const char* hints = std::getenv("PS2GPU_TILE_HINTS")) tile_hints_ = hints[0] != '0';
     if (const char* emulate = std::getenv("PS2GPU_LOCAL_READ_EMULATE"))
         emulate_tbdr_ = emulate[0] && emulate[0] != '0' && !g_.local_read;

@@ -137,7 +137,8 @@ bool DeviceRequirementsFor(VkPhysicalDevice gpu, bool swapchain, DeviceRequireme
         out->extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     }
     // A portability implementation's devices name its subset (the spec's rule).
-    if (HasExtension(available, "VK_KHR_portability_subset")) out->extensions.push_back("VK_KHR_portability_subset");
+    out->portability = HasExtension(available, "VK_KHR_portability_subset");
+    if (out->portability) out->extensions.push_back("VK_KHR_portability_subset");
     // PS2GPU_VULKAN12=1: as a Vulkan 1.2 device would be (the extension's path, tested anywhere).
     static const bool as_12 = std::getenv("PS2GPU_VULKAN12") != nullptr;
     if (p.apiVersion >= VK_API_VERSION_1_3 && !as_12) {

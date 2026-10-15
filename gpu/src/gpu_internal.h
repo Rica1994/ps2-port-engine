@@ -35,6 +35,9 @@ struct DeviceRequirements {
     /* VK_KHR_dynamic_rendering_local_read, used (UseLocalRead): blending in
        the shader reads the target it draws into, no copy of it. */
     bool local_read = false;
+    /* A portability implementation (VK_KHR_portability_subset): MoltenVK,
+       on Apple's GPUs - tile-based ones on an iPad. */
+    bool portability = false;
 };
 /* Whether the renderer reads its targets in place (VK_KHR_dynamic_rendering_
    local_read) on a device that has it: by default on a portability
@@ -152,6 +155,9 @@ public:
     bool dual_source = false;       /* dualSrcBlend: the GS's blending */
     bool logic_op = false;          /* logicOp: FBMSK's partly masked channels */
     bool local_read = false;        /* VK_KHR_dynamic_rendering_local_read (DeviceRequirements) */
+    /* MoltenVK (DeviceRequirements::portability): the renderer's ways for a
+       tile-based GPU are its defaults there (gs_renderer.cpp). */
+    bool portability = false;
     bool bc = false;                /* textureCompressionBC: texture packs' DDS uploaded as they are */
     bool owns_device = true;
 
