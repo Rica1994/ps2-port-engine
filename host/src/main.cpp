@@ -193,14 +193,23 @@ std::vector<std::string> PlayArguments(const char* self) {
     if (disc != ps2host::Setting("disc")) ps2host::SetSetting("disc", disc);
     std::string stem = std::filesystem::path(self ? self : "port").stem().string();
     if (stem.empty()) stem = "port";
-    LogToFile(here, stem + ".log");
-    std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
     // PS2HOST_SCRIPT="<arguments>" (set in an Xcode scheme's environment, say):
     // a scripted run - a port/runs/*.args, --virtual-time and its presses - on
     // the player's own disc and settings, with no memory card (the runs were
     // recorded with none) and no VU programs recorded: a tablet's benchmark,
-    // its numbers in the log as ever.
-    if (const char* script = std::getenv("PS2HOST_SCRIPT"); script && *script) {
+    // its numbers in a log of its own (burnout3-20261016-093000.log), so that
+    // runs one after another can be compared.
+    const char* script = std::getenv("PS2HOST_SCRIPT");
+    std::string log = stem + ".log";
+    if (script && *script) {
+        char when[32] = "scripted";
+        std::tm t{};
+        if (platform::LocalTime(std::time(nullptr), &t)) std::strftime(when, sizeof when, "%Y%m%d-%H%M%S", &t);
+        log = stem + "-" + when + ".log";
+    }
+    LogToFile(here, log);
+    std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
+    if (script && *script) {
         std::vector<std::string> args = {self ? self : "port", "--disc", disc, "--window", "--gpu", "--audio",
                                          "--timeout", "315360000", "--frame-times", "300"};
         std::string word;
