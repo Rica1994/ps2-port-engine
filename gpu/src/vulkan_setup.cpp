@@ -144,6 +144,8 @@ bool DeviceRequirementsFor(VkPhysicalDevice gpu, bool swapchain, DeviceRequireme
         out->v13 = VkPhysicalDeviceVulkan13Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         out->v13.dynamicRendering = VK_TRUE;
         out->v13.synchronization2 = VK_TRUE;
+        // (Required of every 1.3 device; SPIR-V 1.6's discard takes it.)
+        out->v13.shaderDemoteToHelperInvocation = VK_TRUE;
         out->chain = &out->v13;
         out->core13 = true;
         AddLocalRead(gpu, available, out);

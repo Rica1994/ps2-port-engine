@@ -414,28 +414,57 @@ void Fogged(ps2gpu::GsRenderer& renderer) {
           "fog F 0x80: (128 * C + 127 * FOGCOL) >> 8, as the software GS");
 }
 
-/* Blending in the shader reads the target: from a copy of it, or in place
-   (VK_KHR_dynamic_rendering_local_read) - and in place, a tile-based GPU (an
-   iPad's, through MoltenVK) reads what memory held when the pass began or
-   since its last barrier, which PS2GPU_LOCAL_READ_EMULATE reproduces on any
-   GPU. The same random draws - blends the blender cannot do, partly masked
-   channels, alpha tests, PABE, targets sampling themselves, another target
-   between, work ending passes - through each, compared pixel for pixel. A
-   barrier left out where a batch reads what its pass drew shows here. */
-void LocalReadMatchesCopies() {
+/* The renderer's ways of drawing the same thing, compared pixel for pixel:
+   blending in the shader from a copy of the target, or reading it in place
+   (VK_KHR_dynamic_rendering_local_read) - and in place as a tile-based GPU
+   reads it (an iPad's, through MoltenVK: what memory held when the pass
+   began or since its last barrier, which PS2GPU_LOCAL_READ_EMULATE
+   reproduces on any GPU); passes ended as work comes, or deferred, the work
+   going before them (PS2GPU_DEFER_PASSES); attachments loaded and stored
+   whole or only as used (PS2GPU_TILE_HINTS). The same random stream through
+   each: blends the blender cannot do, partly masked channels, alpha tests,
+   PABE, a target sampling itself or another, through the CLUT too, depth,
+   and between the draws work that touches what a pass uses or does not -
+   textures uploaded again, targets written back to GPU memory and loaded
+   from it, textures decoded and CLUTs loaded from it, depth buffers in and
+   out. Every target, the depth buffer and GPU memory must come out the
+   same: a barrier left out, or work put before a pass it should follow,
+   shows here. */
+void PathsAgree() {
     struct Setup {
         const char* name;
         const char* local_read;
         const char* emulate;
+        const char* defer;
+        const char* hints;
     };
-    const Setup setups[] = {{"copies", "0", "0"}, {"local read, emulated as a tile-based GPU", "0", "1"},
-                            {"local read", "1", "0"}};
+    std::vector<Setup> setups = {{"as before", "0", "0", "0", "0"},
+                                 {"tile hints", "0", "0", "0", "1"},
+                                 {"deferred passes", "0", "0", "1", "1"},
+                                 {"emulated tile-based local read", "0", "1", "0", "1"},
+                                 {"emulated tile-based local read, deferred", "0", "1", "1", "1"},
+                                 {"local read", "1", "0", "0", "1"},
+                                 {"local read, deferred", "1", "0", "1", "1"}};
+    // PS2GPU_TEST_PATHS="LEDH,LEDH,...": the ways compared instead (each four
+    // digits: local read, its emulation, deferred passes, tile hints), the
+    // first the reference.
+    std::vector<std::string> custom;
+    if (const char* paths = std::getenv("PS2GPU_TEST_PATHS")) {
+        setups.clear();
+        std::string list = paths;
+        for (std::size_t at = 0; at + 4 <= list.size(); at += 5) custom.push_back(list.substr(at, 4));
+        static const char* const kDigit[2] = {"0", "1"};
+        for (const std::string& c : custom)
+            setups.push_back({c.c_str(), kDigit[c[0] == '1'], kDigit[c[1] == '1'], kDigit[c[2] == '1'], kDigit[c[3] == '1']});
+    }
     std::vector<std::unique_ptr<ps2gpu::Gpu>> gpus;
     std::vector<std::unique_ptr<ps2gpu::GsRenderer>> renderers;
     std::vector<const char*> names;
     for (const Setup& setup : setups) {
         setenv("PS2GPU_LOCAL_READ", setup.local_read, 1);
         setenv("PS2GPU_LOCAL_READ_EMULATE", setup.emulate, 1);
+        setenv("PS2GPU_DEFER_PASSES", setup.defer, 1);
+        setenv("PS2GPU_TILE_HINTS", setup.hints, 1);
         std::string error;
         auto gpu = ps2gpu::CreateGpu(&error);
         if (!gpu) continue;
@@ -449,24 +478,38 @@ void LocalReadMatchesCopies() {
         renderers.push_back(std::move(renderer));
         names.push_back(setup.name);
     }
-    unsetenv("PS2GPU_LOCAL_READ");
-    unsetenv("PS2GPU_LOCAL_READ_EMULATE");
+    for (const char* name : {"PS2GPU_LOCAL_READ", "PS2GPU_LOCAL_READ_EMULATE", "PS2GPU_DEFER_PASSES", "PS2GPU_TILE_HINTS"})
+        unsetenv(name);
     if (renderers.size() < 2) return;
-    // A texture to draw with, and to upload again between draws (work that
-    // ends a pass, touching nothing it draws).
-    std::vector<std::uint32_t> texels(16 * 16);
-    for (std::uint32_t i = 0; i < texels.size(); ++i)
-        texels[i] = Rgba(std::uint8_t(i * 7), std::uint8_t(i * 13), std::uint8_t(i * 29), std::uint8_t(0x20 + (i & 0x7F)));
-    for (auto& r : renderers) r->UploadTexture(0x1234, texels.data(), 16, 16);
+    // Two contents for a texture the draws sample, uploaded in turn (work a
+    // pass sampling it must come before), and one they never sample.
+    std::vector<std::uint32_t> texels[2] = {std::vector<std::uint32_t>(16 * 16), std::vector<std::uint32_t>(16 * 16)};
+    for (std::uint32_t i = 0; i < 16 * 16; ++i) {
+        texels[0][i] = Rgba(std::uint8_t(i * 7), std::uint8_t(i * 13), std::uint8_t(i * 29), std::uint8_t(0x20 + (i & 0x7F)));
+        texels[1][i] = Rgba(std::uint8_t(255 - i), std::uint8_t(i * 3), std::uint8_t(i * 5), std::uint8_t(0x80 - (i & 0x3F)));
+    }
+    int texture_content = 0;
+    for (auto& r : renderers) r->UploadTexture(0x1234, texels[0].data(), 16, 16);
+    // Three 64x64 targets four pages apart (a 64x64 CT32 target takes two), a
+    // 16-bit one among them, and a depth buffer.
+    constexpr std::uint32_t kA = 0xA0, kB = 0xA4, kC = 0xA8, kZ = 0x80;
+    for (auto& r : renderers) {
+        Rect(*r, Target(kA), 0, 0, 64, 64, Rgba(10, 20, 30, 0x40));
+        Rect(*r, Target(kB), 0, 0, 64, 64, Rgba(40, 50, 60, 0x90));
+        ps2gpu::GsDrawState c = Target(kC);
+        c.psm = 0x02;
+        Rect(*r, c, 0, 0, 64, 64, Rgba(80, 90, 100, 0x80));
+    }
+    bool decoded = false, clut_loaded = false;
     std::mt19937 random(20261016);
     auto pick = [&](int n) { return int(random() % std::uint32_t(n)); };
-    for (int op = 0; op < 1500; ++op) {
-        ps2gpu::GsDrawState s = Target(0xA0);
+    for (int op = 0; op < 2500; ++op) {
+        ps2gpu::GsDrawState s = Target(kA);
         const int which = pick(10);
-        if (which == 0) {                           // another target: a pass ends
-            s = Target(0xA1);
-        } else if (which == 1) {                    // a 16-bit view (blends in the shader)
-            s = Target(0xA2);
+        if (which == 0) {
+            s = Target(kB);
+        } else if (which == 1) {                    // the 16-bit one (its blends are the shader's)
+            s = Target(kC);
             s.psm = 0x02;
         }
         // Blending: the blender's, or one it cannot do (the shader's).
@@ -495,16 +538,39 @@ void LocalReadMatchesCopies() {
             s.aref = 0x60;
             s.afail = pick(2) ? 1 : 3;
         }
+        if (s.fbp == kA && pick(3) == 0) {          // depth: tested, written or not
+            s.depth = true;
+            s.zbp = kZ;
+            s.ztst = 2 + pick(2);
+            s.depth_write = pick(4) != 0;
+        }
+        if (pick(12) == 0) {                        // the destination alpha test
+            s.date = true;
+            s.datm = pick(2);
+        }
         s.sprite_prim = pick(2) == 0;
-        if (pick(5) == 0) {                         // textured
+        const int texture = pick(12);
+        if (texture < 2) {                          // a texture uploaded
             s.textured = true;
             s.texture = 0x1234;
             s.tfx = ps2gpu::TextureFunction(pick(4));
-            s.wms = s.wmt = 0;
-        } else if (pick(25) == 0 && s.fbp == 0xA0) { // its own target as the texture: a copy first
+        } else if (texture == 2 && decoded) {       // one decoded from GPU memory
+            s.textured = true;
+            s.texture = 0x2000;
+            s.tw = s.th = 64;
+            s.tfx = ps2gpu::TextureFunction::Decal;
+        } else if (texture == 3 && s.fbp != kB) {   // another target as the texture
             s.textured = true;
             s.texture_target = true;
-            s.tex_fbp = 0xA0;
+            s.tex_fbp = kB;
+            s.tex_fbw = 1;
+            s.tw = s.th = 64;
+            s.tfx = ps2gpu::TextureFunction::Modulate;
+            if (clut_loaded && pick(2)) s.tex_format = 4;   // its alpha through the CLUT (PSMT8H)
+        } else if (texture == 4 && s.fbp == kA) {   // its own target: a copy first
+            s.textured = true;
+            s.texture_target = true;
+            s.tex_fbp = kA;
             s.tex_fbw = 1;
             s.tw = s.th = 64;
             s.tfx = ps2gpu::TextureFunction::Modulate;
@@ -519,30 +585,100 @@ void LocalReadMatchesCopies() {
         }
         const std::uint32_t colour = Rgba(std::uint8_t(pick(256)), std::uint8_t(pick(256)), std::uint8_t(pick(256)),
                                           std::uint8_t(pick(256)));
-        for (auto& r : renderers) Rect(*r, s, x0, y0, x1, y1, colour);
-        if (pick(40) == 0)                          // work between draws
-            for (auto& r : renderers) r->UploadTexture(0x1235, texels.data(), 16, 16);
-        if (pick(300) == 0)                         // a read-back: everything submitted, waited for
-            for (auto& r : renderers) Pixel(*r, 0xA0, 1, 1);
+        const std::uint32_t z = std::uint32_t(pick(0x1000000));
+        for (auto& r : renderers) DepthRect(*r, s, x0, y0, x1, y1, z, colour);
+        // Work between the draws.
+        switch (pick(60)) {
+            case 0:                                 // the sampled texture's other content
+                texture_content ^= 1;
+                for (auto& r : renderers) r->UploadTexture(0x1234, texels[texture_content].data(), 16, 16);
+                break;
+            case 1:                                 // a texture never drawn with
+                for (auto& r : renderers) r->UploadTexture(0x1235, texels[1].data(), 16, 16);
+                break;
+            case 2: {                               // a target to GPU memory, and a texture decoded from it
+                const std::uint32_t from = pick(2) ? kA : kB;
+                ps2gpu::GsTextureDecode d;
+                d.tbp = from * 32;
+                d.tbw = 1;
+                d.psm = 0;
+                d.tw = d.th = 64;
+                for (auto& r : renderers) {
+                    r->TargetToMemory(from, 1, 0, 64, 64, 0);
+                    r->TextureFromMemory(0x2000, d);
+                }
+                decoded = true;
+                break;
+            }
+            case 3: {                               // the CLUT from GPU memory (A's pixels)
+                ps2gpu::GsClutLoad load;
+                load.cbp = kA * 32;
+                load.cpsm = 0;
+                load.eight = true;
+                for (auto& r : renderers) {
+                    r->TargetToMemory(kA, 1, 0, 64, 64, 0);
+                    r->ClutFromMemory(load);
+                }
+                clut_loaded = true;
+                break;
+            }
+            case 4: {                               // B back from GPU memory (the rows drawn into another way)
+                const std::uint32_t first_row = std::uint32_t(pick(32));
+                for (auto& r : renderers) r->TargetRowsFromMemory(kB, 1, 0, 64, 64, first_row, 16);
+                break;
+            }
+            case 5: {                               // the depth buffer out to memory and back
+                for (auto& r : renderers) {
+                    r->DepthToMemory(kZ, 64, 64, 1, 0x30, 64, 64, 0);
+                    r->DepthFromMemory(kZ, 64, 64, 1, 0x30);
+                }
+                break;
+            }
+            case 6: {                               // memory written by the CPU (blocks under no target)
+                std::vector<std::uint8_t> bytes(256 * 4, std::uint8_t(pick(256)));
+                for (auto& r : renderers) r->MemoryWrite(0x3000, 0x3004, bytes.data());
+                break;
+            }
+            case 7:                                 // a read-back: everything submitted, waited for
+                for (auto& r : renderers) Pixel(*r, kA, 1, 1);
+                break;
+            default:
+                break;
+        }
     }
-    const std::uint32_t targets[3][2] = {{0xA0, 0}, {0xA1, 0}, {0xA2, 0x02}};
+    auto compare = [&](const char* what, const std::vector<std::uint32_t>& reference,
+                       const std::vector<std::uint32_t>& got, const char* name) {
+        std::size_t differ = 0, first = 0;
+        for (std::size_t p = 0; p < got.size() && p < reference.size(); ++p)
+            if (got[p] != reference[p] && !differ++) first = p;
+        char text[240];
+        std::snprintf(text, sizeof text, "%s: %s as before (%zu differ, the first at %zu)", name, what, differ, first);
+        Check(differ == 0 && got.size() == reference.size() && !got.empty(), text);
+    };
+    const std::uint32_t targets[3][2] = {{kA, 0}, {kB, 0}, {kC, 0x02}};
     for (const auto& [fbp, psm] : targets) {
         std::vector<std::uint32_t> reference, pixels;
         std::uint32_t w = 0, h = 0;
         renderers[0]->ReadTarget(fbp, 1, psm, &reference, &w, &h);
         for (std::size_t i = 1; i < renderers.size(); ++i) {
             renderers[i]->ReadTarget(fbp, 1, psm, &pixels, &w, &h);
-            std::size_t differ = 0, first = 0;
-            for (std::size_t p = 0; p < pixels.size() && p < reference.size(); ++p)
-                if (pixels[p] != reference[p] && !differ++) first = p;
-            char what[200];
-            std::snprintf(what, sizeof what, "%s draws target %X as the copies do (%zu pixels differ, first at %zu,%zu)",
-                          names[i], unsigned(fbp), differ, first % 64, first / 64);
-            Check(differ == 0 && pixels.size() == reference.size() && !pixels.empty(), what);
+            char what[64];
+            std::snprintf(what, sizeof what, "target %X drawn", unsigned(fbp));
+            compare(what, reference, pixels, names[i]);
         }
     }
-    std::printf("local read checked against copies: %zu ways (%s", renderers.size(), names[0]);
-    for (std::size_t i = 1; i < names.size(); ++i) std::printf(", %s", names[i]);
+    std::vector<std::uint32_t> reference_z, z;
+    renderers[0]->ReadDepth(kZ, 64, 64, &reference_z);
+    std::vector<std::uint32_t> reference_memory(1u << 20), memory(1u << 20);
+    renderers[0]->MemoryRead(0, 16384, reinterpret_cast<std::uint8_t*>(reference_memory.data()));
+    for (std::size_t i = 1; i < renderers.size(); ++i) {
+        renderers[i]->ReadDepth(kZ, 64, 64, &z);
+        compare("the depth buffer", reference_z, z, names[i]);
+        renderers[i]->MemoryRead(0, 16384, reinterpret_cast<std::uint8_t*>(memory.data()));
+        compare("GPU memory", reference_memory, memory, names[i]);
+    }
+    std::printf("the renderer's paths agree: %zu ways (%s", renderers.size(), names[0]);
+    for (std::size_t i = 1; i < names.size(); ++i) std::printf("; %s", names[i]);
     std::printf(")\n");
 }
 
@@ -551,7 +687,7 @@ void LocalReadMatchesCopies() {
 int main() {
     // The renderers that read their targets in place, against the copies,
     // first - each with a device of its own.
-    LocalReadMatchesCopies();
+    PathsAgree();
     std::string error;
     auto gpu = ps2gpu::CreateGpu(&error);
     if (!gpu) {

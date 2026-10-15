@@ -139,6 +139,8 @@ std::uint64_t g_breaks[kBreaks] = {}, g_work_breaks[kWorks] = {};
 // Of the passes work ended, those it could have gone before: it neither
 // touches the pass's target or depth buffer nor writes what its draws read.
 std::uint64_t g_work_hoistable[kWorks] = {};
+// Work recorded before an open pass that went on (deferred passes).
+std::uint64_t g_work_hoisted[kWorks] = {};
 std::uint64_t g_blend_copies[kBlendWhys] = {};     // copies for the destination, by why
 std::uint64_t g_batches = 0, g_blend_batches = 0, g_date_batches = 0;
 // Local read: batches that read their target in place, and the barriers
@@ -523,16 +525,41 @@ private:
     WorkKind work_ = kWorkOther;
     bool work_conflicts_ = true;
     /* Before recording work: its kind; the images it reads or writes, and
-       of those the ones it writes; whether it writes the CLUT. */
+       of those the ones it writes; whether it writes the CLUT. It conflicts
+       with the open pass if it touches its target or depth buffer, or an
+       image its draws read (it would write it, or move its layout), or
+       writes the CLUT they read. */
     void Work(WorkKind kind, std::initializer_list<const Image*> touched = {},
               std::initializer_list<const Image*> written = {}, bool writes_clut = false) {
         work_ = kind;
         bool conflicts = writes_clut && pass_reads_clut_;
-        for (const Image* image : touched) conflicts = conflicts || image == open_target_ || image == open_depth_;
-        for (const Image* image : written)
-            conflicts = conflicts || std::find(pass_reads_.begin(), pass_reads_.end(), image) != pass_reads_.end();
+        auto read_by_pass = [&](const Image* image) {
+            return std::find(pass_reads_.begin(), pass_reads_.end(), image) != pass_reads_.end();
+        };
+        for (const Image* image : touched)
+            conflicts = conflicts || image == open_target_ || image == open_depth_ || read_by_pass(image);
+        for (const Image* image : written) conflicts = conflicts || read_by_pass(image);
         work_conflicts_ = conflicts || kind == kWorkReadback || kind == kWorkOther;
     }
+    /* DEFERRED PASSES (PS2GPU_DEFER_PASSES=0 turns them off): a pass's draws
+       go into a secondary command buffer, and the pass - its begin, the
+       draws, its end - into the frame's only when it ends. Work recorded
+       meanwhile that does not conflict with it (Work) goes into the frame's
+       at once, so before the pass: it ends no pass (on a tile-based GPU, no
+       store and reload of the target). A target the next batch samples is
+       made ready the same way. The pass's area is what its batches' scissors
+       cover (MoltenVK sizes the Metal pass by it). */
+    bool defer_passes_ = true;
+    VkCommandBuffer pass_cmd_ = VK_NULL_HANDLE;             // the open pass's draws
+    VkRenderingAttachmentInfo pass_colour_{}, pass_depth_{}, pass_stencil_{};
+    std::int32_t pass_area_[4] = {};                        // x0, y0, x1, y1 (image pixels, exclusive end)
+    struct Secondaries {
+        std::vector<VkCommandBuffer> list;
+        std::size_t used = 0;
+        bool reset_pending = false;
+    };
+    Secondaries secondaries_[VulkanGpu::kSlots];
+    VkCommandBuffer NewSecondary();
     void EndPass(VkCommandBuffer cmd, int why) {
         // Work() describes the one recording that follows it.
         const WorkKind work = work_;
@@ -540,6 +567,10 @@ private:
         work_ = kWorkOther;
         work_conflicts_ = true;
         if (!open_target_) return;
+        if (why == kBreakWork && !conflicts && defer_passes_) {
+            ++g_work_hoisted[work];                 // recorded before the pass, which goes on
+            return;
+        }
         ++g_breaks[why];
         if (why == kBreakWork) {
             ++g_work_breaks[work];
@@ -549,7 +580,27 @@ private:
             std::fprintf(stderr, "[pass] %s: %u batches, ended by %s%s%s%s\n", pass_label_, pass_batches_,
                          kBreakNames[why], why == kBreakWork ? " - " : "", why == kBreakWork ? kWorkNames[work] : "",
                          why == kBreakWork && !conflicts ? " (could go before the pass)" : "");
-        vkCmdEndRendering(cmd);
+        if (defer_passes_) {
+            vkEndCommandBuffer(pass_cmd_);
+            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            ri.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+            const std::int32_t x0 = std::min(pass_area_[0], pass_area_[2]), y0 = std::min(pass_area_[1], pass_area_[3]);
+            ri.renderArea = {{x0, y0},
+                             {std::uint32_t(std::max(1, pass_area_[2] - x0)), std::uint32_t(std::max(1, pass_area_[3] - y0))}};
+            ri.layerCount = 1;
+            ri.colorAttachmentCount = 1;
+            ri.pColorAttachments = &pass_colour_;
+            ri.pDepthAttachment = &pass_depth_;
+            ri.pStencilAttachment = &pass_stencil_;
+            g_pass_pixels += std::uint64_t(ri.renderArea.extent.width) * ri.renderArea.extent.height;
+            vkCmdBeginRendering(cmd, &ri);
+            vkCmdExecuteCommands(cmd, 1, &pass_cmd_);
+            vkCmdEndRendering(cmd);
+            g_.Mark(cmd, kProfDraw);
+            pass_cmd_ = VK_NULL_HANDLE;
+        } else {
+            vkCmdEndRendering(cmd);
+        }
         open_target_ = open_depth_ = nullptr;
         pass_reads_.clear();
         pass_reads_clut_ = false;
@@ -1013,6 +1064,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
     if (const char* emulate = std::getenv("PS2GPU_LOCAL_READ_EMULATE"))
         emulate_tbdr_ = emulate[0] && emulate[0] != '0' && !g_.local_read;
     if (emulate_tbdr_) std::fprintf(stderr, "[gpu] local read emulated as a tile-based GPU reads (a copy at each pass)\n");
+    if (const char* defer = std::getenv("PS2GPU_DEFER_PASSES")) defer_passes_ = defer[0] != '0';
     return InitMemory(error);
 }
 
@@ -1811,6 +1863,29 @@ void VulkanGsRenderer::DateSetup(VkCommandBuffer cmd, Image& target, Image& dept
     vkCmdEndRendering(cmd);
 }
 
+VkCommandBuffer VulkanGsRenderer::NewSecondary() {
+    // One list a command buffer slot: a slot's are free again once its
+    // submission has run.
+    Secondaries& s = secondaries_[g_.slot()];
+    if (!s.reset_pending) {
+        s.reset_pending = true;
+        g_.AfterSubmit([&s] {
+            s.used = 0;
+            s.reset_pending = false;
+        });
+    }
+    if (s.used == s.list.size()) {
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = g_.pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+        ai.commandBufferCount = 1;
+        VkCommandBuffer c = VK_NULL_HANDLE;
+        if (vkAllocateCommandBuffers(g_.device, &ai, &c) != VK_SUCCESS) return VK_NULL_HANDLE;
+        s.list.push_back(c);
+    }
+    return s.list[s.used++];
+}
+
 VkDescriptorSet VulkanGsRenderer::InputSet(Image& image) {
     if (image.input) return image.input;
     VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
@@ -2108,6 +2183,8 @@ void VulkanGsRenderer::UploadTarget(std::uint32_t fbp, std::uint32_t fbw, std::u
                     std::size_t(w) * 4);
     Work(kWorkUpload, {t}, {t});
     g_.Record([&](VkCommandBuffer cmd) {
+        // (Made just now, it was cleared in this layout: the copy after the clear.)
+        if (t->layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) MemoryBarrier(cmd);
         Transition(cmd, *t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
         VkBufferImageCopy copy{};
@@ -2202,6 +2279,7 @@ void VulkanGsRenderer::UploadDepth(std::uint32_t zbp, std::uint32_t width, std::
     for (std::size_t i = 0; i < std::size_t(width) * height; ++i) out[i] = float(double(z[i]) / 4294967296.0);
     Work(kWorkUpload, {d}, {d});
     g_.Record([&](VkCommandBuffer cmd) {
+        if (d->layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) MemoryBarrier(cmd);   // (the copy after its clear)
         Transition(cmd, *d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
         VkBufferImageCopy copy{};
@@ -2671,7 +2749,9 @@ void VulkanGsRenderer::Flush() {
             int why = -1;                   // what ends the open pass, if anything (PassBreak)
             if (state_.date) why = kBreakDate;
             else if (copy_first) why = texture_copy ? kBreakFeedback : kBreakBlend;
-            else if (source && source->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) why = kBreakSource;
+            // (A deferred pass goes on: the transition is recorded before it.)
+            else if (!defer_passes_ && source && source->layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+                why = kBreakSource;
             else if (open_target_ != t) why = kBreakTarget;
             else if (open_depth_ != depth) why = kBreakDepth;
             if (why >= 0) EndPass(cmd, why);
@@ -2718,10 +2798,12 @@ void VulkanGsRenderer::Flush() {
                 g_.Mark(cmd, kProfFeedback);
                 Transition(cmd, *feedback_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-            } else if (source) {
+            }
+            // Another target as the texture: readable - also when a copy of this
+            // one was taken for the shader's blend (it was left as it was then).
+            if (source && !texture_copy)
                 Transition(cmd, *source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-            }
             if (!open_target_) {
             if (snapshot) {
                 // Emulated local read: what memory holds as the pass begins.
@@ -2788,8 +2870,36 @@ void VulkanGsRenderer::Flush() {
             ri.pDepthAttachment = &z;
             ri.pStencilAttachment = &stencil;
             ++g_passes;
-            g_pass_pixels += std::uint64_t(ri.renderArea.extent.width) * ri.renderArea.extent.height;
-            vkCmdBeginRendering(cmd, &ri);
+            if (defer_passes_ && !pass_cmd_) {
+                // Its draws into a secondary command buffer; the pass itself
+                // into the frame's as it ends (EndPass).
+                pass_cmd_ = NewSecondary();
+                if (!pass_cmd_) defer_passes_ = false;          // (none to be had: as before)
+            }
+            if (defer_passes_) {
+                const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
+                VkCommandBufferInheritanceRenderingInfo inherit{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO};
+                inherit.colorAttachmentCount = 1;
+                inherit.pColorAttachmentFormats = &format;
+                inherit.depthAttachmentFormat = kDepthFormat;
+                inherit.stencilAttachmentFormat = kDepthFormat;
+                inherit.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+                VkCommandBufferInheritanceInfo inheritance{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
+                inheritance.pNext = &inherit;
+                VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+                begin.pInheritanceInfo = &inheritance;
+                vkBeginCommandBuffer(pass_cmd_, &begin);
+                pass_colour_ = colour;
+                pass_depth_ = z;
+                pass_stencil_ = stencil;
+                pass_area_[0] = pass_area_[1] = 1 << 30;
+                pass_area_[2] = pass_area_[3] = 0;
+                drawn_ = DrawState{};           // a command buffer of its own: nothing bound yet
+            } else {
+                g_pass_pixels += std::uint64_t(ri.renderArea.extent.width) * ri.renderArea.extent.height;
+                vkCmdBeginRendering(cmd, &ri);
+            }
             open_target_ = t;
             open_depth_ = depth;
             pass_batches_ = 0;
@@ -2800,12 +2910,14 @@ void VulkanGsRenderer::Flush() {
                               unsigned(ri.renderArea.extent.height), state_.depth ? "" : "own ",
                               unsigned(state_.depth ? state_.zbp : state_.fbp));
             }
+            // Where the draws go: the deferred pass's own command buffer, or the frame's.
+            const VkCommandBuffer dc = defer_passes_ ? pass_cmd_ : cmd;
             if (barrier) {
                 VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
                 b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
                 b.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
                 ++g_barriers;
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                vkCmdPipelineBarrier(dc, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 1, &b, 0,
                                      nullptr, 0, nullptr);
                 pass_drawn_any_ = false;
@@ -2832,7 +2944,7 @@ void VulkanGsRenderer::Flush() {
                 }
             }
             // What its draws read, for what may go before the pass (EndPass's accounting).
-            if (source) PassReads(copy_first ? feedback_ : source);
+            if (source) PassReads(texture_copy ? feedback_ : source);
             else if (state_.textured) PassReads(&texture->image);
             if (shader_blend && feedback_ && !in_place) PassReads(feedback_);
             if (snapshot) PassReads(snapshot);
@@ -2840,25 +2952,25 @@ void VulkanGsRenderer::Flush() {
             // ZTST: NEVER, ALWAYS, GEQUAL, GREATER - the larger Z is nearer.
             static const VkCompareOp kCompare[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS,
                                                     VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
-            if (drawn_.recording != g_.recording_id()) drawn_ = DrawState{g_.recording_id()};
+            if (!defer_passes_ && drawn_.recording != g_.recording_id()) drawn_ = DrawState{g_.recording_id()};
             DrawState& d = drawn_;
             const int depth_test = state_.depth ? 1 : 0, stencil_test = state_.date ? 1 : 0;
             const int compare = int(state_.ztst & 3);
-            if (d.depth_test != depth_test) vkCmdSetDepthTestEnable(cmd, VkBool32(d.depth_test = depth_test));
-            if (d.stencil_test != stencil_test) vkCmdSetStencilTestEnable(cmd, VkBool32(d.stencil_test = stencil_test));
-            if (d.compare != compare) vkCmdSetDepthCompareOp(cmd, kCompare[d.compare = compare]);
+            if (d.depth_test != depth_test) vkCmdSetDepthTestEnable(dc, VkBool32(d.depth_test = depth_test));
+            if (d.stencil_test != stencil_test) vkCmdSetStencilTestEnable(dc, VkBool32(d.stencil_test = stencil_test));
+            if (d.compare != compare) vkCmdSetDepthCompareOp(dc, kCompare[d.compare = compare]);
             if (d.sets[0] != set || d.sets[1] != clut_set_) {
                 d.sets[0] = set;
                 d.sets[1] = clut_set_;
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, d.sets, 0, nullptr);
+                vkCmdBindDescriptorSets(dc, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, d.sets, 0, nullptr);
             }
             if (destination_set)
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 2, 1, &destination_set, 0,
+                vkCmdBindDescriptorSets(dc, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 2, 1, &destination_set, 0,
                                         nullptr);
             const VkViewport vp{0, 0, float(t->pw()), float(t->ph()), 0, 1};
             if (std::memcmp(&vp, &d.viewport, sizeof vp) != 0) {
                 d.viewport = vp;
-                vkCmdSetViewport(cmd, 0, 1, &vp);
+                vkCmdSetViewport(dc, 0, 1, &vp);
             }
             const std::int32_t x0 = std::max(0, state_.scissor_x0), y0 = std::max(0, state_.scissor_y0);
             const std::int32_t x1 = std::min(std::int32_t(t->width) - 1, state_.scissor_x1);
@@ -2866,21 +2978,27 @@ void VulkanGsRenderer::Flush() {
             const std::int32_t k = std::int32_t(t->scale);
             const VkRect2D sc{{x0 * k, y0 * k},
                               {std::uint32_t(std::max(0, x1 - x0 + 1) * k), std::uint32_t(std::max(0, y1 - y0 + 1) * k)}};
+            if (defer_passes_) {             // the pass's area: what its batches' scissors cover
+                pass_area_[0] = std::min(pass_area_[0], sc.offset.x);
+                pass_area_[1] = std::min(pass_area_[1], sc.offset.y);
+                pass_area_[2] = std::max(pass_area_[2], sc.offset.x + std::int32_t(sc.extent.width));
+                pass_area_[3] = std::max(pass_area_[3], sc.offset.y + std::int32_t(sc.extent.height));
+            }
             if (std::memcmp(&sc, &d.scissor, sizeof sc) != 0) {
                 d.scissor = sc;
-                vkCmdSetScissor(cmd, 0, 1, &sc);
+                vkCmdSetScissor(dc, 0, 1, &sc);
             }
             const float size[2] = {float(t->width), float(t->height)};
             if (size[0] != d.size[0] || size[1] != d.size[1]) {
                 d.size[0] = size[0];
                 d.size[1] = size[1];
-                vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, 8, size);
+                vkCmdPushConstants(dc, layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, 8, size);
             }
             // The ring's chunk bound once, at its start; the batch by its first vertex.
             if (d.vertices != vertex_buffer) {
                 d.vertices = vertex_buffer;
                 const VkDeviceSize zero = 0;
-                vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer, &zero);
+                vkCmdBindVertexBuffers(dc, 0, 1, &vertex_buffer, &zero);
             }
             const std::uint32_t first = std::uint32_t(vertex_offset / sizeof(PackedVertex));
             // PABE splits each pass again: blended where As >= 0x80 (the shader's
@@ -2901,20 +3019,20 @@ void VulkanGsRenderer::Flush() {
                         if (!chosen) continue;
                         if (d.pipeline != chosen) {
                             d.pipeline = chosen;
-                            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, chosen);
+                            vkCmdBindPipeline(dc, VK_PIPELINE_BIND_POINT_GRAPHICS, chosen);
                         }
                         const int depth_write = pass.depth_write && op != 1 ? 1 : 0;
                         if (d.depth_write != depth_write)
-                            vkCmdSetDepthWriteEnable(cmd, VkBool32(d.depth_write = depth_write));
+                            vkCmdSetDepthWriteEnable(dc, VkBool32(d.depth_write = depth_write));
                         params.afail = pass.mode;
                         params.pabe = half;
                         params.logic = merge ? 3u : op;
                         params.keep = keep;
-                        vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset,
+                        vkCmdPushConstants(dc, layout_, VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset,
                                            sizeof params, &params);
                         ++g_draws;
-                        vkCmdDraw(cmd, count, 1, first, 0);
-                        g_.Mark(cmd, kProfDraw);
+                        vkCmdDraw(dc, count, 1, first, 0);
+                        if (!defer_passes_) g_.Mark(cmd, kProfDraw);
                     }
                 }
             }
@@ -3107,6 +3225,16 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (decode_pipeline_) vkDestroyPipeline(g_.device, decode_pipeline_, nullptr);
     if (decode_) vkDestroyShaderModule(g_.device, decode_, nullptr);
     if (input_set_layout_) vkDestroyDescriptorSetLayout(g_.device, input_set_layout_, nullptr);
+    // The swizzle on images and depth buffers, the memory patch, depth loads.
+    for (VkPipeline p : {swizzle_image_pipeline_, patch_pipeline_, swizzle_depth_pipeline_, depth_load_pipeline_})
+        if (p) vkDestroyPipeline(g_.device, p, nullptr);
+    for (VkPipelineLayout l : {swizzle_image_layout_, patch_layout_, swizzle_depth_layout_, depth_load_layout_})
+        if (l) vkDestroyPipelineLayout(g_.device, l, nullptr);
+    for (VkShaderModule m : {swizzle_image_, patch_, swizzle_depth_, depth_load_vert_, depth_load_frag_})
+        if (m) vkDestroyShaderModule(g_.device, m, nullptr);
+    for (VkDescriptorSetLayout l : {image_set_layout_, depth_set_layout_})
+        if (l) vkDestroyDescriptorSetLayout(g_.device, l, nullptr);
+    if (storage_pool_) vkDestroyDescriptorPool(g_.device, storage_pool_, nullptr);
     for (auto [buffer, memory] : {std::pair{gsmem_, gsmem_memory_}, std::pair{linear_, linear_memory_},
                                   std::pair{clut_, clut_memory_}}) {
         if (buffer) vkDestroyBuffer(g_.device, buffer, nullptr);
@@ -3152,7 +3280,7 @@ std::string RendererBreakdown(const char* prefix) {
     // much of it could have gone before them), why batches read their
     // target, and how much the passes covered.
     static std::uint64_t last_breaks[kBreaks] = {}, last_work[kWorks] = {}, last_hoist[kWorks] = {},
-                         last_blend[kBlendWhys] = {}, last_more[7] = {};
+                         last_hoisted[kWorks] = {}, last_blend[kBlendWhys] = {}, last_more[7] = {};
     auto delta = [](std::uint64_t now_value, std::uint64_t* then) {
         const std::uint64_t d = now_value - *then;
         *then = now_value;
@@ -3175,6 +3303,19 @@ std::string RendererBreakdown(const char* prefix) {
         const unsigned long long h = delta(g_work_hoistable[i], &last_hoist[i]);
         if (!d) continue;
         std::snprintf(text, sizeof text, " %s %llu (%llu)", kWorkNames[i], d, h);
+        out += text;
+    }
+    bool any_hoisted = false;
+    for (int i = 0; i < kWorks; ++i) {
+        const unsigned long long d = delta(g_work_hoisted[i], &last_hoisted[i]);
+        if (!d) continue;
+        if (!any_hoisted) {
+            out += "\n";
+            out += prefix;
+            out += "work recorded before an open pass, which went on:";
+            any_hoisted = true;
+        }
+        std::snprintf(text, sizeof text, " %s %llu", kWorkNames[i], d);
         out += text;
     }
     static const char* const kBlendNames[kBlendWhys] = {"", "FBMSK merge", "16-bit", "Ad", "FIX>0x80"};
