@@ -37,6 +37,7 @@
 #include <string>
 #include <thread>
 
+#include "ps2host/platform.h"
 #include "ps2host/profile.h"
 #include "ps2host/timeline.h"
 #include "ps2host/run.h"
@@ -65,6 +66,7 @@ struct Worker {
     void Run() {
         t_on_worker = true;
         FastThread();
+        if (platform::kMobile) SampleThisThread("VIF1 worker (VU1)");
         if (SampleVif1Thread()) StartSampler();
         for (;;) {
             std::function<void()> command;

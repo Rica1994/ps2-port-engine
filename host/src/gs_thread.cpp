@@ -34,6 +34,7 @@
 #endif
 
 #include "ps2host/gs.h"
+#include "ps2host/platform.h"
 #include "ps2host/timeline.h"
 #include "ps2host/profile.h"
 #include "ps2host/run.h"
@@ -117,6 +118,37 @@ struct Feed {
     std::atomic<bool> sleeping{false};
     std::mutex mutex;
     std::condition_variable wake;
+    // The EE (or VIF1's worker) waiting for the GS thread to take more - for
+    // room, or for all of it (Sync). On a tablet it sleeps for it rather than
+    // spinning: a phone's two or so fast cores are the GS thread's and the
+    // VIF1 worker's to use (an iPad's race spun half its time away yielding).
+    std::atomic<bool> tail_waiting{false};
+    std::mutex tail_mutex;
+    std::condition_variable tail_moved;
+
+    void TailMoved() {
+        if (tail_waiting.load(std::memory_order_seq_cst)) {
+            std::lock_guard<std::mutex> lock(tail_mutex);
+            tail_moved.notify_all();
+        }
+    }
+
+    /* Until `done`: a few spins, then asleep (the GS thread's TailMoved
+       wakes it; a millisecond at most, to look for a failure). */
+    template <typename Done>
+    void BlockUntil(Done done) {
+        for (int spins = 0; spins < 256; ++spins) {
+            if (done()) return;
+            Pause();
+        }
+        while (!done()) {
+            Rethrow();
+            std::unique_lock<std::mutex> lock(tail_mutex);
+            tail_waiting.store(true, std::memory_order_seq_cst);
+            if (!done()) tail_moved.wait_for(lock, std::chrono::milliseconds(1));
+            tail_waiting.store(false, std::memory_order_relaxed);
+        }
+    }
     std::exception_ptr failed;                  // set by the GS thread, taken by the EE's
     std::atomic<bool> has_failed{false};
     std::thread thread;
@@ -158,6 +190,10 @@ struct Feed {
         const u64 at = head.load(std::memory_order_relaxed);
         if (at + words - tail.load(std::memory_order_acquire) <= kRing) return;
         Timed timed(Section::GsWait);
+        if (platform::kMobile) {
+            BlockUntil([&] { return at + words - tail.load(std::memory_order_acquire) <= kRing; });
+            return;
+        }
         while (at + words - tail.load(std::memory_order_acquire) > kRing) {
             Rethrow();
             std::this_thread::yield();
@@ -176,6 +212,7 @@ struct Feed {
         const u64 target = head.load(std::memory_order_relaxed);
         if (tail.load(std::memory_order_acquire) >= target) return Rethrow();
         Timed timed(Section::GsWait);
+        if (platform::kMobile) BlockUntil([&] { return tail.load(std::memory_order_acquire) >= target; });
         for (int spins = 0; tail.load(std::memory_order_acquire) < target; ++spins) {
             Rethrow();
             if (spins < 4096) Pause();
@@ -257,12 +294,14 @@ struct Feed {
                     }
                     t += size;
                     tail.store(t, std::memory_order_release);
+                    TailMoved();
                 }
             } catch (...) {
                 failed = std::current_exception();
                 has_failed = true;
                 // Skip what is left: the EE thread stops at its next call.
                 tail.store(head.load(std::memory_order_acquire), std::memory_order_release);
+                TailMoved();
             }
         }
     }
@@ -283,6 +322,7 @@ void StartGsThread() {
     g_feed->thread = std::thread([] {
         timeline::NameThread("GS");
         FastThread();
+        if (platform::kMobile) SampleThisThread("GS");
         if (SampleGsThread()) StartSampler();
         g_feed->Run();
     });

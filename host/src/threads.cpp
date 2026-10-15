@@ -433,8 +433,11 @@ void VblankTimer() {
             TimerTick();
             continue;
         }
-        if (wake - clock::now() > margin) SleepUntil(wake - margin);
-        while (clock::now() < wake && !StopRequested() && !g_timer_stop) std::this_thread::yield();
+        // A tablet sleeps the whole way: its few fast cores are the game's, a
+        // spin to the microsecond theirs lost (the blank comes a little late).
+        if (platform::kMobile) SleepUntil(wake);
+        else if (wake - clock::now() > margin) SleepUntil(wake - margin);
+        while (!platform::kMobile && clock::now() < wake && !StopRequested() && !g_timer_stop) std::this_thread::yield();
         if (clock::now() >= next) {
             const auto late = clock::now() - next;
             if (late > std::chrono::milliseconds(1) && timeline::On())
@@ -726,6 +729,7 @@ namespace {
 void StartRealTimeThreads() {
     platform::RaiseTimerResolution();
     FastThread();
+    if (platform::kMobile) SampleThisThread("EE");
     if (!TimerThread().joinable()) {
         TimerThread() = std::thread([] {
             timeline::NameThread("vertical blank timer");

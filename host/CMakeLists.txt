@@ -50,6 +50,7 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/gs_memory.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gpu_bridge.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/profile.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/sampler_apple.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/platform.cpp)
 # The IOP interpreter names library functions from engine/data/iop_exports.csv,
 # built in (iop_exports.inc: a line of it a string), so that the executable
@@ -303,7 +304,9 @@ function(ps2_ios_app target title version game_dir)
         XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "2"            # iPad
         XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "${CMAKE_OSX_DEPLOYMENT_TARGET}"
         XCODE_ATTRIBUTE_LD_RUNPATH_SEARCH_PATHS "@executable_path/Frameworks"
-        XCODE_ATTRIBUTE_GCC_OPTIMIZATION_LEVEL[variant=Release] "3"
+        # Optimised in every configuration: Xcode runs Debug by default, and
+        # the translated game unoptimised is many times too slow to play.
+        XCODE_ATTRIBUTE_GCC_OPTIMIZATION_LEVEL "3"
         XCODE_ATTRIBUTE_DEAD_CODE_STRIPPING "YES"
         XCODE_ATTRIBUTE_ENABLE_BITCODE "NO"
         XCODE_EMBED_FRAMEWORKS "${framework}"

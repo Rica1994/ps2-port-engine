@@ -509,8 +509,13 @@ struct VuCore {
         const __m128 x = _mm_mul_ps(
             _mm_castsi128_ps(lifted::CleanLanes(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs])))),
             _mm_set1_ps(kScaleF[Shift]));
+#if PS2RT_VU_NEON
+        // NEON's conversion saturates both ways itself (FCVTZS).
+        const __m128i value = _mm_cvttps_epi32(x);
+#else
         const __m128i over = _mm_castps_si128(_mm_cmpge_ps(x, _mm_set1_ps(2147483648.0f)));
         const __m128i value = _mm_xor_si128(_mm_cvttps_epi32(x), over);
+#endif
         __m128i* to = reinterpret_cast<__m128i*>(v.regs.vf[ft]);
         if constexpr (Dest == 15) _mm_storeu_si128(to, value);
         else _mm_storeu_si128(to, Blend(LaneMask(Dest), value, _mm_loadu_si128(to)));

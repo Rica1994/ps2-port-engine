@@ -1377,8 +1377,12 @@ void VulkanDisplay::PresentLoop() {
         // In order, each when it is due.
         const Clock::time_point due = std::min(Clock::time_point{std::chrono::nanoseconds(paced_[slot].due_ns)},
                                                Clock::now() + std::chrono::milliseconds(50));
+#if defined(PS2GPU_IOS) || defined(__ANDROID__)
+        SleepUntil(due);                // (no spin: a tablet's fast cores are the game's)
+#else
         if (Clock::now() + std::chrono::microseconds(1500) < due) SleepUntil(due - std::chrono::microseconds(700));
         while (Clock::now() < due) std::this_thread::yield();
+#endif
         {
             std::lock_guard<std::mutex> hold(paced_lock_);
             if (stop_) {

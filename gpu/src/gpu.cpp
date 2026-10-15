@@ -12,6 +12,14 @@
 
 namespace ps2gpu {
 
+/* PS2GPU_NO_LOGIC_OP=1: as a device without logicOp (Metal's, under MoltenVK)
+   - the shader's FBMSK fallback, testable on any GPU. */
+static bool NoLogicOp() {
+    const char* v = std::getenv("PS2GPU_NO_LOGIC_OP");
+    return v && *v && *v != '0';
+}
+
+
 void SetGpuWaitObserver(GpuWaitObserver observer) { g_wait_observer = observer; }
 
 bool VulkanGpu::Init(std::string* error) {
@@ -83,7 +91,7 @@ bool VulkanGpu::Init(std::string* error) {
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.features.dualSrcBlend = supported.dualSrcBlend;
     features.features.logicOp = supported.logicOp;      // FBMSK's partly masked channels
-    logic_op = supported.logicOp == VK_TRUE;
+    logic_op = supported.logicOp == VK_TRUE && !NoLogicOp();
     features.features.textureCompressionBC = supported.textureCompressionBC;     // texture packs' DDS
     bc = supported.textureCompressionBC == VK_TRUE;
     features.pNext = needs.chain;
@@ -157,7 +165,7 @@ bool VulkanGpu::InitShared(VkInstance shared_instance, VkPhysicalDevice shared_g
     dual_source = shared_dual_source;
     VkPhysicalDeviceFeatures supported;                 // the Display enables logicOp where there is one
     vkGetPhysicalDeviceFeatures(shared_gpu, &supported);
-    logic_op = supported.logicOp == VK_TRUE;
+    logic_op = supported.logicOp == VK_TRUE && !NoLogicOp();
     bc = supported.textureCompressionBC == VK_TRUE;     // (the Display enables it too)
     describe_ = describe;
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};

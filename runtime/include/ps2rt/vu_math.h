@@ -23,14 +23,29 @@
 #if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #include <emmintrin.h>
 #define PS2RT_VU_SSE 1
+#elif (defined(__aarch64__) || defined(__arm64__)) && !defined(_MSC_VER)
+/* arm64 (an iPad, an Android tablet): the same four lanes at once in NEON,
+   through sse2neon's SSE intrinsics (ps2rt/sse2neon.h, MIT). FPCR's mode
+   (fp_mode.h: toward zero, denormals flushed) governs NEON as MXCSR's SSE. */
+#ifndef SSE2NEON_SUPPRESS_WARNINGS
+#define SSE2NEON_SUPPRESS_WARNINGS
+#endif
+#include "ps2rt/sse2neon.h"
+#define PS2RT_VU_SSE 1
+#define PS2RT_VU_NEON 1
 #else
 #define PS2RT_VU_SSE 0
 #endif
+#ifndef PS2RT_VU_NEON
+#define PS2RT_VU_NEON 0
+#endif
 /* SSE4.1 (pminud): every x86-64 processor a Vulkan port runs on has it; MSVC
    takes its intrinsics without /arch, and other compilers say so with
-   __SSE4_1__. */
+   __SSE4_1__. NEON has its equivalents. */
 #if PS2RT_VU_SSE && (defined(__SSE4_1__) || defined(_M_X64))
 #include <smmintrin.h>
+#define PS2RT_VU_SSE41 1
+#elif PS2RT_VU_NEON
 #define PS2RT_VU_SSE41 1
 #else
 #define PS2RT_VU_SSE41 0

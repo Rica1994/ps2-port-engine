@@ -188,7 +188,15 @@ bool PartlyMasked(std::uint32_t kept) {
    from a copy of the target. */
 bool Is16Bit(std::uint32_t psm) { return psm == 0x02 || psm == 0x0A || psm == 0x32 || psm == 0x3A; }
 
+/* Without logicOp (Metal's: MoltenVK has none), a channel FBMSK masks only
+   in part is merged in the shader instead - the source's written bits ORed
+   with the kept bits of a copy of the target - blended or not (Burnout 3's
+   race writes two bits of each half of its frame's pixels through a 16-bit
+   view: written whole, the iPad's race came out in the wrong colours). */
+bool g_masks_in_shader = false;
+
 bool ShaderBlend(const GsDrawState& s) {
+    if (g_masks_in_shader && PartlyMasked(KeptBits(s.fbmsk, s.psm))) return true;
     if (!s.blend) return false;
     // Into a 16-bit target: the blend's result cut to five bits a channel,
     // as the GS stores it (the blender would keep eight: the next blend over
@@ -217,7 +225,7 @@ constexpr std::uint32_t kShaderBlend = 1u << 15;
    in the shader. */
 std::uint32_t PipelineKey(const GsDrawState& s) {
     const std::uint32_t masked = (~WriteMask(KeptBits(s.fbmsk, s.psm)) & 0xF) << 9;
-    if (!s.blend) return masked;
+    if (!s.blend) return masked | (ShaderBlend(s) ? kShaderBlend : 0u);
     return masked | 1u | std::uint32_t(s.a) << 1 | std::uint32_t(s.b) << 3 | std::uint32_t(s.c) << 5 |
            std::uint32_t(s.d) << 7 | (ShaderBlend(s) ? kShaderBlend : 0u);
 }
@@ -802,6 +810,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
     frag_ = g_.dual_source ? module(spirv_gs_frag, sizeof spirv_gs_frag)
                            : module(spirv_gs_frag_single, sizeof spirv_gs_frag_single);
     frag_blend_ = module(spirv_gs_frag_blend, sizeof spirv_gs_frag_blend);
+    g_masks_in_shader = !g_.logic_op;
     if (!vert_ || !frag_ || !frag_blend_) {
         if (error) *error = "the GS shaders did not load";
         return false;
@@ -2358,6 +2367,8 @@ void VulkanGsRenderer::Flush() {
                              (state_.a == BlendColour::Source && state_.b == BlendColour::Zero &&
                               state_.c == BlendAlpha::Fix && state_.fix == 0x80 && state_.d == BlendColour::Zero);
     const bool logic = g_.logic_op && PartlyMasked(kept) && source_only;
+    // No logicOp: the shader merges the kept bits from its copy (gs.frag's logic 3).
+    const bool merge = !g_.logic_op && PartlyMasked(kept);
     std::vector<Pass> passes;
     if (!state_.alpha_test || state_.atst == 1) {
         passes = {{2, depth_write, mask}};
@@ -2395,6 +2406,7 @@ void VulkanGsRenderer::Flush() {
     params.scale = source ? source->scale : 1;
     params.blend_ops = std::uint32_t(state_.a) | std::uint32_t(state_.b) << 2 | std::uint32_t(state_.c) << 4 |
                        std::uint32_t(state_.d) << 6;
+    if (!state_.blend) params.blend_ops = 0;    // (A - B) * C + D as Cs - Cs + Cs: the source as it is
     if (state_.textured && t->scale > 1) params.blend_ops |= (t->scale & 0xFFu) << 8;
     if (Is16Bit(state_.psm)) params.blend_ops |= 1u << 16;    // gs.frag: colour cut to five bits a channel
     const std::uint32_t count = std::uint32_t(pending_.size());
@@ -2541,7 +2553,7 @@ void VulkanGsRenderer::Flush() {
                             vkCmdSetDepthWriteEnable(cmd, VkBool32(d.depth_write = depth_write));
                         params.afail = pass.mode;
                         params.pabe = half;
-                        params.logic = op;
+                        params.logic = merge ? 3u : op;
                         params.keep = keep;
                         vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset,
                                            sizeof params, &params);

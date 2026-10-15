@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <bitset>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -60,9 +61,11 @@
 #include <vector>
 
 #include "ps2host/gs.h"
+#include "ps2host/platform.h"
 #include "ps2host/profile.h"
 #include "ps2host/run.h"
 #include "ps2host/timeline.h"
+#include "ps2host/vu.h"
 #include "ps2host/settings.h"
 #include "ps2host/texture_pack.h"
 
@@ -1726,7 +1729,31 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                          static_cast<unsigned long long>(frame), static_cast<unsigned long long>(s.serial),
                          static_cast<unsigned long long>(s.write_backs), static_cast<unsigned long long>(s.reloads),
                          static_cast<unsigned long long>(s.decodes), s.owned.size(), s.textures.size());
-        if (frame % 300 == 0 && std::getenv("PS2HOST_GPU_PROFILE"))
+        if (platform::kMobile) {
+            // Every five seconds: frames a second, where the time went (the
+            // run's so far) and the GPU's work - burnout3.log's report.
+            using Clock = std::chrono::steady_clock;
+            static Clock::time_point last = Clock::now();
+            static unsigned long long last_frame = frame;
+            const double seconds = std::chrono::duration<double>(Clock::now() - last).count();
+            if (seconds >= 5.0) {
+                const Vu& vu1 = Vu1();
+                static u64 last_pairs = 0, last_compiled = 0;
+                std::fprintf(stderr, "[perf] frame %llu: %.1f frames a second; %s\n[perf]   %s\n[perf]   %s\n"
+                             "[perf]   VU1: %.1f M instruction pairs a second, %.0f%% compiled; %llu stale\n",
+                             static_cast<unsigned long long>(frame), double(frame - last_frame) / seconds,
+                             ProfileSummary().c_str(), ps2gpu::GpuProfileReport().c_str(),
+                             ps2gpu::RendererCounters().c_str(), double(vu1.pairs() - last_pairs) / seconds / 1e6,
+                             vu1.pairs() > last_pairs ? 100.0 * double(vu1.compiled_pairs() - last_compiled) /
+                                                            double(vu1.pairs() - last_pairs) : 0.0,
+                             static_cast<unsigned long long>(vu1.compiled_stale()));
+                last_pairs = vu1.pairs();
+                last_compiled = vu1.compiled_pairs();
+                std::fflush(stderr);
+                last = Clock::now();
+                last_frame = frame;
+            }
+        } else if (frame % 300 == 0 && std::getenv("PS2HOST_GPU_PROFILE"))
             std::fprintf(stderr, "[gpu] frame %llu: %s\n", static_cast<unsigned long long>(frame),
                          ps2gpu::GpuProfileReport().c_str());
         if (frame % 100 == 0 && std::getenv("PS2HOST_GPU_COUNT")) {

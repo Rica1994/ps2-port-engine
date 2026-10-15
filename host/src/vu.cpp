@@ -238,7 +238,16 @@ std::vector<Vu::u32> Reachable(const Vu::Span& micro, Vu::u32 entry) {
     return pcs;
 }
 
-void RecordProgram(const Vu::Span& micro, int unit, Vu::u32 entry) {
+void RecordProgram(const Vu::Span& micro, int unit, Vu::u32 entry, std::uint64_t generation) {
+    // Once for an entry while instruction memory stays as it is: following
+    // the program is the costly part (a tablet records as it plays).
+    thread_local std::unordered_set<std::uint64_t> followed;
+    thread_local std::uint64_t followed_generation = 0;
+    if (generation != followed_generation) {
+        followed.clear();
+        followed_generation = generation;
+    }
+    if (!followed.insert(std::uint64_t(unit) << 32 | entry).second) return;
     const std::vector<Vu::u32> pcs = Reachable(micro, entry);
     std::string line = "vu" + std::to_string(unit);
     char text[32];
@@ -818,7 +827,7 @@ Vu::u64 Vu::Run(u32 pc, u64 limit) {
     const int unit = data_mask_ == 0x3FF ? 1 : 0;
     pc &= u32(micro.size() - 1) & ~7u;
     ++starts_[pc];
-    if (g_record) RecordProgram(micro, unit, pc);
+    if (g_record) RecordProgram(micro, unit, pc, micro_generation_);
     if (unit == 1 && g_snapshotting.load(std::memory_order_relaxed) && g_snapshots_left) {
         Snapshot s{};
         s.pc = pc;
@@ -857,7 +866,7 @@ bool Vu::RunCompiled(VuRunState& state, u64 limit) {
     while (!state.done && state.count < limit && state.delayed == kNone && !state.stopping) {
         const auto found = Compiled().find(std::uint64_t(unit) << 32 | state.pc);
         if (found == Compiled().end()) {
-            if (g_record && ran) RecordProgram(micro, unit, state.pc);
+            if (g_record && ran) RecordProgram(micro, unit, state.pc, micro_generation_);
             break;
         }
         const VuCompiled* program = nullptr;
@@ -981,7 +990,7 @@ void Vu::Interpret(VuRunState& state, u64 limit) {
             // Where a jump to a register's address goes is a program of its own
             // (one recorded, and compiled, from there); compiled code, if any
             // starts here, goes on.
-            if (g_record && by_register) RecordProgram(micro, unit, pc);
+            if (g_record && by_register) RecordProgram(micro, unit, pc, micro_generation_);
             state.pc = pc;
             state.count = count;
             state.delayed = delayed;

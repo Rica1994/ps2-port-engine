@@ -41,7 +41,7 @@ layout(push_constant) uniform Params {
     uint tw, th;        // TEX0's size (0: the image's own)
     uint tex_format;    // a target read as 0 32-bit, 1 24-bit, 2 16-bit texels, 4 PSMT8H through the CLUT
     uint ta0, ta1, aem; // TEXA
-    uint logic;         // FBMSK masking part of a channel: 1 the AND pass, 2 the OR pass, 0 neither
+    uint logic;         // FBMSK masking part of a channel: 1 the AND pass, 2 the OR pass, 3 both in the shader, 0 neither
     uint keep;          // ...the bits FBMSK keeps, RGBA bytes as the target holds them
     uint scale;         // a target drawn larger (the internal resolution): its pixels to a GS texel
     uint blend_ops;     // bits 0-7, SHADER_BLEND: ALPHA's A, B, C, D, two bits each; 8-15: Snap's scale;
@@ -307,6 +307,11 @@ void main() {
     // ORed with the rest of the source's bits (the pipelines' logic ops).
     if (p.logic == 1u) colour = unpackUnorm4x8(p.keep);
     if (p.logic == 2u) colour = unpackUnorm4x8(packUnorm4x8(c / 255.0) & ~p.keep);
+#ifdef SHADER_BLEND
+    // ...and without logic ops, both at once from the copy of the target.
+    if (p.logic == 3u)
+        colour = unpackUnorm4x8((packUnorm4x8(c / 255.0) & ~p.keep) | (packUnorm4x8(dst / 255.0) & p.keep));
+#endif
 #ifndef SINGLE_OUTPUT
     float k = p.fix_factor != 0u ? float(p.fix) : c.a;
     factor = vec4(k / 128.0);

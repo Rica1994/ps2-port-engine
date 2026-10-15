@@ -39,6 +39,12 @@ using Clock = std::chrono::steady_clock;
 std::uint64_t Ticks() {
 #if defined(_MSC_VER)
     return __rdtsc();
+#elif defined(__aarch64__)
+    // The counter itself (an iPad's steady_clock went through
+    // mach_continuous_time: a tenth of a race spent reading the time).
+    std::uint64_t ticks;
+    __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(ticks));
+    return ticks;
 #else
     return std::uint64_t(Clock::now().time_since_epoch().count());
 #endif

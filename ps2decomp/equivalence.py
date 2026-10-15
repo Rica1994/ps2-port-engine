@@ -259,7 +259,7 @@ def _build(paths, work: str) -> str:
     script = os.path.join(work, "build.bat")
     with open(script, "w", encoding="utf-8") as handle:
         handle.write('@echo off\ncall "%s" >nul\ncd /d "%s"\n' % (cppcheck.find_vcvars(), work))
-        handle.write('cl /nologo /std:c++17 /O2 /EHsc /bigobj /MP4 /W1 /LD /I"%s" @"%s" /Fe"%s" '
+        handle.write('cl /nologo /std:c++17 /O2 /EHsc /bigobj /MP4 /W1 /LD /I"%s" @"%s" /Fe"%s" /link /OPT:NOREF /OPT:NOICF /INCREMENTAL:NO '
                      '>build.log 2>&1\nexit /b %%errorlevel%%\n'
                      % (os.path.join(cppcheck.RUNTIME, "include"), response, dll))
     if subprocess.run(["cmd", "/c", script], capture_output=True).returncode or \

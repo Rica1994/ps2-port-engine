@@ -35,6 +35,10 @@ std::string ProfileSummary();
    often on the stack at all ("total"), by name from the executable's
    symbols. Windows only (elsewhere it reports nothing). */
 void StartSampler();
+/* A tablet's (iOS) own profiler: the calling thread sampled from now on, and
+   where it spent its time written to the log every ten seconds
+   (sampler_apple.cpp); nothing elsewhere. */
+void SampleThisThread(const char* name);
 /* --sample-gs: the sampler on the GS thread instead (gs_thread.cpp starts it
    there), where the GS model and the GPU bridge run. */
 void SetSampleGsThread(bool on);

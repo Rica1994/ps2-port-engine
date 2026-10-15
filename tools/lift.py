@@ -84,6 +84,31 @@ def _annotated(text: str, names: dict) -> str:
     return _CALL.sub(name, text)
 
 
+# Functions MSVC's optimiser does not finish (Visual Studio 2026's took hours
+# over one, its file's object never written): the game's
+# config/msvc_slow.txt, an address a line. Written without optimisation by
+# MSVC alone; every other compiler, and the checks' semantics, unchanged.
+MSVC_SLOW: set = set()
+
+
+def load_msvc_slow(game) -> None:
+    path = game.path(os.path.join("config", "msvc_slow.txt"))
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.split("#")[0].strip()
+            if line:
+                MSVC_SLOW.add(int(line, 16))
+
+
+def _msvc_guarded(address: int, text: str) -> str:
+    if address not in MSVC_SLOW:
+        return text
+    return ("#if defined(_MSC_VER) && !defined(__clang__)\n#pragma optimize(\"\", off)\n#endif\n" + text +
+            "\n#if defined(_MSC_VER) && !defined(__clang__)\n#pragma optimize(\"\", on)\n#endif\n")
+
+
 def _remove(path: str) -> None:
     """os.remove, waiting out a moment's lock: on Windows a scanner or a compiler
     just finishing can hold a file the run is about to replace (a 40-minute
@@ -122,7 +147,7 @@ def write_chunks(lifted: dict, directory: str, prefix: str, unverified=None,
                     handle.write("/* %s (%s) */\n" % names[address])
                 if address in unverified:
                     handle.write("/* NOT VERIFIED: %s */\n" % unverified[address])
-                handle.write(_annotated(lifted[address], names))
+                handle.write(_msvc_guarded(address, _annotated(lifted[address], names)))
                 handle.write("\n")
         paths.append(path)
     return paths
@@ -453,6 +478,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     game = game_config.from_args(args)
+    load_msvc_slow(game)
     database = game.load_database()
     elf = game.load_elf()
     section = elf.exec_sections[0]

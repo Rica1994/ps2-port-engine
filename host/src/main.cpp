@@ -11,6 +11,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -195,7 +196,11 @@ std::vector<std::string> PlayArguments(const char* self) {
     LogToFile(here, stem + ".log");
     std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
     return {self ? self : "port", "--disc", disc, "--memcard", (here / "memcard").string(), "--window", "--gpu",
-            "--audio", "--timeout", "315360000"};     // ten years
+            "--audio", "--timeout", "315360000",     // ten years
+            "--frame-times", platform::kMobile ? "300" : "0",   // a tablet's log: pictures a second
+            // A tablet records the VU programs it plays that are not compiled
+            // ahead: sent back, they are compiled into the next build.
+            "--vu-record", platform::kMobile ? (here / "vu_programs_new.txt").string() : std::string()};
 #else
     (void)self;
     return {self ? self : "port"};

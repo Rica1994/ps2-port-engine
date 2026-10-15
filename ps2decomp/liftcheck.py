@@ -181,7 +181,7 @@ def _build(sources, work_dir: str, parallel: int) -> str:
         handle.write('cd /d "%s"\n' % work_dir)
         # /O2 for the same reason as the derived code's check; /EHsc for Abort;
         # /bigobj because a lifted file has far more sections than the default allows.
-        handle.write('cl /nologo /std:c++17 /O2 /EHsc /bigobj /MP%d /W3 /LD /I"%s" %s /Fe"%s" '
+        handle.write('cl /nologo /std:c++17 /O2 /EHsc /bigobj /MP%d /W3 /LD /I"%s" %s /Fe"%s" /link /OPT:NOREF /OPT:NOICF /INCREMENTAL:NO '
                      '>lift_build.log 2>&1\n'
                      % (parallel, os.path.join(cppcheck.RUNTIME, "include"),
                         " ".join('"%s"' % p for p in all_sources), dll))
