@@ -21,13 +21,17 @@ bool VulkanGpu::Init(std::string* error) {
         if (error) *error = text;
         return false;
     };
-    VkResult r = volkInitialize();
+    VkResult r = LoadVulkan();
     if (r != VK_SUCCESS) return fail("volkInitialize (is there a Vulkan driver?)", r);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "ps2gpu";
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
+    std::vector<const char*> instance_extensions;
+    AddInstancePortability(&instance_extensions, &ici.flags);
+    ici.enabledExtensionCount = std::uint32_t(instance_extensions.size());
+    ici.ppEnabledExtensionNames = instance_extensions.data();
     if ((r = vkCreateInstance(&ici, nullptr, &instance)) != VK_SUCCESS) return fail("vkCreateInstance", r);
     volkLoadInstance(instance);
 
@@ -39,7 +43,8 @@ bool VulkanGpu::Init(std::string* error) {
     for (VkPhysicalDevice candidate : list) {
         VkPhysicalDeviceProperties p;
         vkGetPhysicalDeviceProperties(candidate, &p);
-        if (p.apiVersion < VK_API_VERSION_1_3) continue;
+        DeviceRequirements usable;
+        if (!DeviceRequirementsFor(candidate, false, &usable)) continue;    // no dynamic rendering
         std::uint32_t families = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(candidate, &families, nullptr);
         std::vector<VkQueueFamilyProperties> props(families);
@@ -56,7 +61,7 @@ bool VulkanGpu::Init(std::string* error) {
         }
     }
     if (!gpu) {
-        if (error) *error = "no Vulkan 1.3 device with a graphics queue";
+        if (error) *error = "no Vulkan device with dynamic rendering and a graphics queue";
         return false;
     }
     VkPhysicalDeviceProperties p;
@@ -68,9 +73,8 @@ bool VulkanGpu::Init(std::string* error) {
     qci.queueFamilyIndex = family;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
-    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    v13.dynamicRendering = VK_TRUE;
-    v13.synchronization2 = VK_TRUE;
+    DeviceRequirements needs;
+    DeviceRequirementsFor(gpu, false, &needs);
     // Dual-source blending: the GS's blend factor (source alpha or FIX, where
     // 0x80 is 1.0) is a second fragment output, not the alpha written.
     VkPhysicalDeviceFeatures supported;
@@ -82,12 +86,15 @@ bool VulkanGpu::Init(std::string* error) {
     logic_op = supported.logicOp == VK_TRUE;
     features.features.textureCompressionBC = supported.textureCompressionBC;     // texture packs' DDS
     bc = supported.textureCompressionBC == VK_TRUE;
-    features.pNext = &v13;
+    features.pNext = needs.chain;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &features;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = std::uint32_t(needs.extensions.size());
+    dci.ppEnabledExtensionNames = needs.extensions.data();
     if ((r = vkCreateDevice(gpu, &dci, nullptr, &device)) != VK_SUCCESS) return fail("vkCreateDevice", r);
+    if (!needs.core13) UseDynamicRenderingExtension();
     // Device functions stay the loader's (volkLoadInstance): they dispatch by
     // handle, so the window's device and this one can live side by side. volk
     // keeps one global table; loading a device into it would point the other

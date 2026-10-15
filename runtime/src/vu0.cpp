@@ -10,7 +10,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <xmmintrin.h>
+#include "ps2rt/fp_mode.h"
 
 namespace lifted {
 
@@ -207,9 +207,7 @@ void RunFmac(Context& c, const FmacOp& f) {
 const bool kMacroNearest = std::getenv("PS2RT_EE_ROUND_NEAREST") != nullptr;
 
 struct MacroRounding {
-    unsigned saved = _mm_getcsr();
-    MacroRounding() { if (!kMacroNearest) _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u); }
-    ~MacroRounding() { if (!kMacroNearest) _mm_setcsr(saved); }
+    VuFloatMode mode{!kMacroNearest};
 };
 
 void Cop2(Context& c, u32 word) {

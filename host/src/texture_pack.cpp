@@ -2,6 +2,7 @@
    read in the background. */
 
 #include "ps2host/texture_pack.h"
+#include "ps2host/platform.h"
 
 #include <algorithm>
 #include <atomic>
@@ -382,7 +383,7 @@ std::shared_ptr<Image> LoadPng(const std::vector<u8>& file) {
 }
 
 std::shared_ptr<Image> Load(const std::filesystem::path& path) {
-    std::FILE* f = _wfopen(path.wstring().c_str(), L"rb");
+    std::FILE* f = platform::OpenFile(path, "rb");
     if (!f) return nullptr;
     std::vector<u8> bytes;
     std::fseek(f, 0, SEEK_END);

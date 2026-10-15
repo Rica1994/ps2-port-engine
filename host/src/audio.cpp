@@ -13,6 +13,8 @@
  * playing it: how sound is checked without anyone listening.
  */
 
+#ifdef _WIN32
+
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -221,3 +223,128 @@ void AudioFrames(const short* frames, unsigned count) {
 }
 
 }  // namespace ps2host
+
+#else  // !_WIN32: SDL3's audio stream (CoreAudio on iOS/macOS, AAudio on Android...)
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "ps2host/run.h"
+
+#ifdef PS2HOST_VULKAN
+#include <SDL3/SDL_audio.h>
+#include <SDL3/SDL_init.h>
+#endif
+
+namespace ps2host {
+
+namespace {
+
+/* Kept queued at most: past it the newest samples are dropped rather than
+   the emulation waiting (as the eight waveOut buffers on Windows). */
+constexpr unsigned kMaxQueuedFrames = 8 * 1024;
+
+struct Device {
+#ifdef PS2HOST_VULKAN
+    SDL_AudioStream* stream = nullptr;
+#endif
+    unsigned long long dropped = 0;
+    bool mute = false;
+    std::FILE* wav = nullptr;
+    unsigned long long wav_frames = 0;
+    std::vector<short> silence;
+
+    ~Device() { Close(); }
+    void Close() {
+#ifdef PS2HOST_VULKAN
+        if (stream) {
+            SDL_DestroyAudioStream(stream);
+            stream = nullptr;
+        }
+#endif
+        if (!wav) return;
+        WriteHeader(unsigned(wav_frames * 4));
+        std::fclose(wav);
+        wav = nullptr;
+    }
+    void WriteHeader(unsigned data) {
+        unsigned char h[44] = {'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ',
+                               16, 0, 0, 0, 1, 0, 2, 0, 0x80, 0xBB, 0, 0, 0, 0xEE, 2, 0,
+                               4, 0, 16, 0, 'd', 'a', 't', 'a', 0, 0, 0, 0};
+        const unsigned riff = 36 + data;
+        std::memcpy(h + 4, &riff, 4);
+        std::memcpy(h + 40, &data, 4);
+        std::fseek(wav, 0, SEEK_SET);
+        std::fwrite(h, 1, 44, wav);
+        std::fseek(wav, 0, SEEK_END);
+    }
+};
+
+Device& D() {
+    static Device device;
+    return device;
+}
+
+}  // namespace
+
+void CloseAudio() { D().Close(); }
+
+bool OpenAudio() {
+#ifdef PS2HOST_VULKAN
+    Device& d = D();
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+        std::fprintf(stderr, "[audio] no sound: %s\n", SDL_GetError());
+        return false;
+    }
+    const SDL_AudioSpec spec{SDL_AUDIO_S16, 2, 48000};
+    d.stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+    if (!d.stream) {
+        std::fprintf(stderr, "[audio] no sound: %s\n", SDL_GetError());
+        return false;
+    }
+    d.mute = std::getenv("PS2HOST_AUDIO_MUTE") != nullptr;
+    SDL_ResumeAudioStreamDevice(d.stream);
+    std::fprintf(stderr, "[audio] playing (SDL %s)\n", SDL_GetCurrentAudioDriver());
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool OpenWavDump(const std::string& path) {
+    Device& d = D();
+    d.wav = std::fopen(path.c_str(), "wb");
+    if (!d.wav) return false;
+    d.WriteHeader(0);
+    return true;
+}
+
+void AudioFrames(const short* frames, unsigned count) {
+    Device& d = D();
+    if (d.wav) {
+        std::fwrite(frames, 4, count, d.wav);
+        d.wav_frames += count;
+    }
+#ifdef PS2HOST_VULKAN
+    if (!d.stream) return;
+    const int queued = SDL_GetAudioStreamQueued(d.stream);
+    if (queued >= 0 && unsigned(queued) / 4 + count > kMaxQueuedFrames) {
+        d.dropped += count;
+        return;
+    }
+    if (d.mute) {
+        d.silence.assign(std::size_t(count) * 2, 0);
+        frames = d.silence.data();
+    }
+    SDL_PutAudioStreamData(d.stream, frames, int(count * 4));
+#endif
+}
+
+}  // namespace ps2host
+
+#endif  // _WIN32

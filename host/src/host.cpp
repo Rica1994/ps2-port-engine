@@ -1,8 +1,6 @@
 #include "ps2host/host.h"
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "ps2host/platform.h"
 
 #include <algorithm>
 #include <atomic>
@@ -570,9 +568,7 @@ int Run(const Options& options) {
         if (!options.memcard.empty()) {
             where = std::filesystem::absolute(options.memcard).parent_path();
         } else {
-            wchar_t exe[MAX_PATH] = {};
-            GetModuleFileNameW(nullptr, exe, MAX_PATH);
-            where = std::filesystem::path(exe).parent_path();
+            where = platform::UserDirectory();
         }
         LoadSettings((where / "pc_settings.ini").string());
     }

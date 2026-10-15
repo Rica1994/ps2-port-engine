@@ -18,7 +18,7 @@
 #include <cstring>
 #include <functional>
 #include <unordered_map>
-#include <xmmintrin.h>
+#include "ps2rt/fp_mode.h"
 #include <unordered_set>
 #include <vector>
 
@@ -808,9 +808,7 @@ namespace {
    after it gave corners twelve times too long - huge smoke puffs lit with
    wrapped colours (the race's white-outs and stretched textures). */
 struct VuRounding {
-    unsigned saved = _mm_getcsr();
-    VuRounding() { _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u); }
-    ~VuRounding() { _mm_setcsr(saved); }
+    lifted::VuFloatMode mode;
 };
 }  // namespace
 

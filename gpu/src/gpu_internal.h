@@ -17,6 +17,23 @@
 
 namespace ps2gpu {
 
+/* Vulkan as each platform has it (vulkan_setup.cpp). */
+VkResult LoadVulkan();                      // volk, from the system's loader or the app's MoltenVK
+const char* MoltenVkPath();                 // where MoltenVK was found (Apple), else null
+void AddInstancePortability(std::vector<const char*>* extensions, VkInstanceCreateFlags* flags);
+/* What a device is created with for the renderer: dynamic rendering (Vulkan
+   1.3's, or the extension's on a 1.2 device), the portability subset where
+   listed. `chain` heads the features' pNext chain (pointing into this). */
+struct DeviceRequirements {
+    std::vector<const char*> extensions;
+    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamic{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR};
+    void* chain = nullptr;
+    bool core13 = false;
+};
+bool DeviceRequirementsFor(VkPhysicalDevice gpu, bool swapchain, DeviceRequirements* out);
+void UseDynamicRenderingExtension();        // after creating a device with !core13
+
 /* SubmitStats: submissions, the time spent waiting for the GPU, and what
    waited (a read-back of which kind, a resize, a full ring). */
 inline std::uint64_t g_submits = 0;

@@ -18,12 +18,19 @@
 #include "gpu_internal.h"
 #include "downsample_comp.h"
 #include "fxaa_comp.h"
+#include "touch_controls.h"
+#include "touch_frag.h"
+#include "touch_vert.h"
 
 #include <algorithm>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
+#ifdef __APPLE__
+#include <pthread.h>
+#include <pthread/qos.h>
 #endif
 #include <atomic>
 #include <chrono>
@@ -289,6 +296,24 @@ private:
     std::uint64_t presents_ = 0;
     double interval_sum_ = 0, interval_squares_ = 0, interval_longest_ = 0;
     std::unique_ptr<VulkanGpu> shared_;
+    // TOUCH CONTROLS (touch_controls.h): on a tablet's touch screen (or with
+    // PS2GPU_TOUCH=1), drawn over the picture into the swapchain image (a
+    // colour target then, through views_), read as the controller.
+    bool touch_enabled_ = false;
+    TouchControls touch_;
+    std::int64_t pointer_finger_ = -1;      // the finger that is the mouse's pointer, if any
+    std::vector<VkImageView> views_;        // the swapchain images' (touch_enabled_)
+    VkPipelineLayout touch_layout_ = VK_NULL_HANDLE;
+    VkPipeline touch_pipeline_ = VK_NULL_HANDLE;
+    VkFormat touch_format_ = VK_FORMAT_UNDEFINED;
+    bool touch_failed_ = false;
+    static constexpr int kTouchShapes = 16;
+    VkBuffer touch_buffers_[kInFlight] = {};
+    VkDeviceMemory touch_memory_[kInFlight] = {};
+    void* touch_mapped_[kInFlight] = {};
+    void DrawTouch(std::uint32_t index);
+    bool EnsureTouchPipeline();
+    void TouchEvent(const SDL_Event& e);
 };
 
 Gpu* VulkanDisplay::SharedGpu() {
@@ -311,6 +336,13 @@ bool VulkanDisplay::Check(VkResult result, const char* what) {
 }
 
 bool VulkanDisplay::Init(const char* title, int width, int height) {
+#if defined(__ANDROID__) || (defined(__APPLE__) && defined(PS2GPU_IOS))
+    touch_enabled_ = true;
+#endif
+    if (const char* touch = std::getenv("PS2GPU_TOUCH")) touch_enabled_ = touch[0] == '1';
+    // Touches are the touch controls' and, off them, the pointer's (TouchEvent):
+    // not SDL's mouse too.
+    if (touch_enabled_) SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         error_ = std::string("SDL_Init: ") + SDL_GetError();
         return false;
@@ -318,6 +350,9 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     // Controllers: optional (the keyboard still plays), and read whichever
     // window has focus - the console's pad does not care either.
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    // iOS: the game's sound plays with the ringer switched to silent, as a
+    // game's does (SDL's default, "ambient", is muted by it).
+    SDL_SetHint(SDL_HINT_AUDIO_CATEGORY, "playback");
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         std::fprintf(stderr, "[window] no game controllers: %s\n", SDL_GetError());
     } else {
@@ -332,8 +367,18 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
         std::fprintf(stderr, "[window] %d controller(s) plugged in, %d of them with a known layout\n", joysticks,
                      gamepads);
     }
-    if (!Check(volkInitialize(), "volkInitialize (is there a Vulkan driver?)")) return false;
-    window_ = SDL_CreateWindow(title, width, height, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+    if (!Check(LoadVulkan(), "volkInitialize (is there a Vulkan driver?)")) return false;
+    // SDL's surface through the same Vulkan: on Apple's systems the app's
+    // MoltenVK by its path (SDL would take volk's pointer in the executable
+    // for the function of that name).
+    if (const char* moltenvk = MoltenVkPath()) SDL_Vulkan_LoadLibrary(moltenvk);
+    SDL_WindowFlags window_flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE;
+#if defined(__ANDROID__) || (defined(__APPLE__) && defined(PS2GPU_IOS))
+    // A tablet's one window: the whole screen, landscape, under the notch too.
+    window_flags |= SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+#endif
+    window_ = SDL_CreateWindow(title, width, height, window_flags);
     if (!window_) {
         error_ = std::string("SDL_CreateWindow: ") + SDL_GetError();
         return false;
@@ -341,14 +386,16 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
 
     // The instance, with the extensions SDL needs for its surface.
     Uint32 count = 0;
-    const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&count);
+    const char* const* sdl_extensions = SDL_Vulkan_GetInstanceExtensions(&count);
+    std::vector<const char*> extensions(sdl_extensions, sdl_extensions + count);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = title;
     app.apiVersion = VK_API_VERSION_1_3;      // the GS renderer draws on this device too
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ici.pApplicationInfo = &app;
-    ici.enabledExtensionCount = count;
-    ici.ppEnabledExtensionNames = extensions;
+    AddInstancePortability(&extensions, &ici.flags);
+    ici.enabledExtensionCount = std::uint32_t(extensions.size());
+    ici.ppEnabledExtensionNames = extensions.data();
     if (!Check(vkCreateInstance(&ici, nullptr, &instance_), "vkCreateInstance")) return false;
     volkLoadInstance(instance_);
     if (!SDL_Vulkan_CreateSurface(window_, instance_, nullptr, &surface_)) {
@@ -371,6 +418,8 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
             VkBool32 present = VK_FALSE;
             vkGetPhysicalDeviceSurfaceSupportKHR(candidate, f, surface_, &present);
             if (!(props[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) || !present) continue;
+            DeviceRequirements usable;
+            if (!DeviceRequirementsFor(candidate, true, &usable)) break;     // no dynamic rendering
             VkPhysicalDeviceProperties p;
             vkGetPhysicalDeviceProperties(candidate, &p);
             const int score = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
@@ -399,27 +448,26 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     qci.queueFamilyIndex = family_;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
-    const char* device_extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    DeviceRequirements needs;
+    DeviceRequirementsFor(gpu_, true, &needs);
     // What the GS renderer needs, for when it draws on this device
     // (SharedGpu): dynamic rendering, and dual-source blending if there is any.
     VkPhysicalDeviceFeatures supported;
     vkGetPhysicalDeviceFeatures(gpu_, &supported);
     dual_source_ = supported.dualSrcBlend == VK_TRUE;
-    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    v13.dynamicRendering = VK_TRUE;
-    v13.synchronization2 = VK_TRUE;
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.features.dualSrcBlend = supported.dualSrcBlend;
     features.features.logicOp = supported.logicOp;
     features.features.textureCompressionBC = supported.textureCompressionBC;     // texture packs' DDS
-    features.pNext = &v13;
+    features.pNext = needs.chain;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &features;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
-    dci.ppEnabledExtensionNames = device_extensions;
+    dci.enabledExtensionCount = std::uint32_t(needs.extensions.size());
+    dci.ppEnabledExtensionNames = needs.extensions.data();
     if (!Check(vkCreateDevice(gpu_, &dci, nullptr, &device_), "vkCreateDevice")) return false;
+    if (!needs.core13) UseDynamicRenderingExtension();
     // Device functions stay the loader's: see gpu.cpp.
     vkGetDeviceQueue(device_, family_, 0, &queue_);
 
@@ -486,6 +534,8 @@ bool VulkanDisplay::CreateSwapchain() {
     sci.imageExtent = extent_;
     sci.imageArrayLayers = 1;
     sci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    const bool touch_target = touch_enabled_ && (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    if (touch_target) sci.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     sci.preTransform = caps.currentTransform;
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -499,6 +549,17 @@ bool VulkanDisplay::CreateSwapchain() {
     vkGetSwapchainImagesKHR(device_, swapchain_, &n, nullptr);
     images_.resize(n);
     vkGetSwapchainImagesKHR(device_, swapchain_, &n, images_.data());
+    if (touch_target) {
+        views_.assign(n, VK_NULL_HANDLE);
+        for (std::uint32_t i = 0; i < n; ++i) {
+            VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.image = images_[i];
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = format_;
+            vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            if (vkCreateImageView(device_, &vci, nullptr, &views_[i]) != VK_SUCCESS) views_[i] = VK_NULL_HANDLE;
+        }
+    }
     VkSemaphoreCreateInfo semaphore{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     rendered_.resize(n);
     for (auto& s : rendered_)
@@ -515,6 +576,9 @@ void VulkanDisplay::DestroySwapchain() {
     }
     for (VkSemaphore s : rendered_) vkDestroySemaphore(device_, s, nullptr);
     rendered_.clear();
+    for (VkImageView v : views_)
+        if (v) vkDestroyImageView(device_, v, nullptr);
+    views_.clear();
     images_.clear();
     if (swapchain_) vkDestroySwapchainKHR(device_, swapchain_, nullptr);
     swapchain_ = VK_NULL_HANDLE;
@@ -669,6 +733,194 @@ void VulkanDisplay::DrawOverlay(VkImage target) {
     copy.imageOffset = {16, 16, 0};
     copy.imageExtent = {w, h, 1};
     vkCmdCopyBufferToImage(cmd_, overlay_buffer_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+}
+
+/* A finger on the touch screen: the touch controls', or - off them - the
+   mouse's pointer, a tap a click (the port's menus). A controller's button
+   puts the controls away. */
+void VulkanDisplay::TouchEvent(const SDL_Event& e) {
+    if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        touch_.ControllerUsed();
+        return;
+    }
+    if (e.type != SDL_EVENT_FINGER_DOWN && e.type != SDL_EVENT_FINGER_MOTION && e.type != SDL_EVENT_FINGER_UP &&
+        e.type != SDL_EVENT_FINGER_CANCELED)
+        return;
+    int pw = 0, ph = 0, ww = 0, wh = 0;
+    SDL_GetWindowSizeInPixels(window_, &pw, &ph);
+    SDL_GetWindowSize(window_, &ww, &wh);
+    const float x = e.tfinger.x * float(pw), y = e.tfinger.y * float(ph);
+    const std::int64_t id = std::int64_t(e.tfinger.fingerID);
+    if (e.type == SDL_EVENT_FINGER_DOWN) {
+        if (!touch_.Down(id, x, y, float(pw), float(ph)) && pointer_finger_ < 0) {
+            pointer_finger_ = id;
+            MouseAt(e.tfinger.x * float(ww), e.tfinger.y * float(wh));
+            std::lock_guard<std::mutex> hold(mouse_lock_);
+            mouse_.held |= 1u;
+            mouse_.pressed |= 1u;
+        }
+    } else if (e.type == SDL_EVENT_FINGER_MOTION) {
+        touch_.Move(id, x, y, float(pw), float(ph));
+        if (id == pointer_finger_) MouseAt(e.tfinger.x * float(ww), e.tfinger.y * float(wh));
+    } else {
+        touch_.Up(id);
+        if (id == pointer_finger_) {
+            pointer_finger_ = -1;
+            std::lock_guard<std::mutex> hold(mouse_lock_);
+            mouse_.held &= ~1u;
+        }
+    }
+}
+
+/* touch.vert and touch.frag drawing into the swapchain's format, blended over
+   the picture; a vertex buffer of shapes per present in flight. */
+bool VulkanDisplay::EnsureTouchPipeline() {
+    if (touch_failed_) return false;
+    if (touch_pipeline_ && touch_format_ == format_) return true;
+    auto fail = [&](const char* what) {
+        std::fprintf(stderr, "[window] no touch controls: %s\n", what);
+        touch_failed_ = true;
+        return false;
+    };
+    if (touch_pipeline_) {
+        vkDestroyPipeline(device_, touch_pipeline_, nullptr);
+        touch_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (!touch_layout_) {
+        VkPushConstantRange range{VK_SHADER_STAGE_VERTEX_BIT, 0, 2 * sizeof(float)};
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &range;
+        if (vkCreatePipelineLayout(device_, &pli, nullptr, &touch_layout_) != VK_SUCCESS) return fail("layout");
+    }
+    for (int i = 0; i < kInFlight; ++i) {
+        if (touch_buffers_[i]) continue;
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = kTouchShapes * sizeof(TouchControls::Shape);
+        bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        if (vkCreateBuffer(device_, &bci, nullptr, &touch_buffers_[i]) != VK_SUCCESS) return fail("buffer");
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(device_, touch_buffers_[i], &req);
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = FindMemory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (mai.memoryTypeIndex == ~0u || vkAllocateMemory(device_, &mai, nullptr, &touch_memory_[i]) != VK_SUCCESS)
+            return fail("memory");
+        vkBindBufferMemory(device_, touch_buffers_[i], touch_memory_[i], 0);
+        vkMapMemory(device_, touch_memory_[i], 0, bci.size, 0, &touch_mapped_[i]);
+    }
+    VkShaderModule modules[2] = {};
+    const std::pair<const std::uint32_t*, std::size_t> code[2] = {{spirv_touch_vert, sizeof spirv_touch_vert},
+                                                                  {spirv_touch_frag, sizeof spirv_touch_frag}};
+    for (int i = 0; i < 2; ++i) {
+        VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smi.codeSize = code[i].second;
+        smi.pCode = code[i].first;
+        if (vkCreateShaderModule(device_, &smi, nullptr, &modules[i]) != VK_SUCCESS) return fail("shaders");
+    }
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    for (int i = 0; i < 2; ++i) {
+        stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[i].stage = i == 0 ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[i].module = modules[i];
+        stages[i].pName = "main";
+    }
+    VkVertexInputBindingDescription binding{0, sizeof(TouchControls::Shape), VK_VERTEX_INPUT_RATE_INSTANCE};
+    VkVertexInputAttributeDescription attributes[2] = {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0},
+                                                       {1, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 16}};
+    VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vertex.vertexBindingDescriptionCount = 1;
+    vertex.pVertexBindingDescriptions = &binding;
+    vertex.vertexAttributeDescriptionCount = 2;
+    vertex.pVertexAttributeDescriptions = attributes;
+    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewport.viewportCount = 1;
+    viewport.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_NONE;
+    raster.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState blend{};
+    blend.blendEnable = VK_TRUE;
+    blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blend.colorBlendOp = VK_BLEND_OP_ADD;
+    blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blend.alphaBlendOp = VK_BLEND_OP_ADD;
+    blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+                           VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo blending{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blending.attachmentCount = 1;
+    blending.pAttachments = &blend;
+    const VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dynamic_states;
+    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachmentFormats = &format_;
+    VkGraphicsPipelineCreateInfo gpi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gpi.pNext = &rendering;
+    gpi.stageCount = 2;
+    gpi.pStages = stages;
+    gpi.pVertexInputState = &vertex;
+    gpi.pInputAssemblyState = &assembly;
+    gpi.pViewportState = &viewport;
+    gpi.pRasterizationState = &raster;
+    gpi.pMultisampleState = &multisample;
+    gpi.pColorBlendState = &blending;
+    gpi.pDynamicState = &dynamic;
+    gpi.layout = touch_layout_;
+    const VkResult made = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gpi, nullptr, &touch_pipeline_);
+    for (VkShaderModule m : modules) vkDestroyShaderModule(device_, m, nullptr);
+    if (made != VK_SUCCESS) return fail("pipeline");
+    touch_format_ = format_;
+    return true;
+}
+
+/* The touch controls over the swapchain image (TRANSFER_DST), left to be
+   presented. */
+void VulkanDisplay::DrawTouch(std::uint32_t index) {
+    const VkImage target = images_[index];
+    std::vector<TouchControls::Shape> shapes = touch_.Shapes(float(extent_.width), float(extent_.height));
+    if (shapes.size() > std::size_t(kTouchShapes)) shapes.resize(kTouchShapes);
+    if (!shapes.empty()) std::memcpy(touch_mapped_[slot_], shapes.data(), shapes.size() * sizeof shapes[0]);
+    Barrier(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    attachment.imageView = views_[index];
+    attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+    info.renderArea = {{0, 0}, extent_};
+    info.layerCount = 1;
+    info.colorAttachmentCount = 1;
+    info.pColorAttachments = &attachment;
+    vkCmdBeginRendering(cmd_, &info);
+    if (!shapes.empty()) {
+        const VkViewport viewport{0.0f, 0.0f, float(extent_.width), float(extent_.height), 0.0f, 1.0f};
+        const VkRect2D scissor{{0, 0}, extent_};
+        vkCmdSetViewport(cmd_, 0, 1, &viewport);
+        vkCmdSetScissor(cmd_, 0, 1, &scissor);
+        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, touch_pipeline_);
+        const VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(cmd_, 0, 1, &touch_buffers_[slot_], &offset);
+        const float size[2] = {float(extent_.width), float(extent_.height)};
+        vkCmdPushConstants(cmd_, touch_layout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof size, size);
+        vkCmdDraw(cmd_, 6, std::uint32_t(shapes.size()), 0, 0);
+    }
+    vkCmdEndRendering(cmd_);
+    Barrier(cmd_, target, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 }
 
 void VulkanDisplay::DestroyPostImages() {
@@ -886,6 +1138,10 @@ bool VulkanDisplay::FinishPresent(std::uint32_t index, VkImage source, std::uint
     vkCmdBlitImage(cmd_, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
     DrawOverlay(target);
+    if (touch_enabled_ && index < views_.size() && views_[index] && touch_.Visible() && EnsureTouchPipeline()) {
+        DrawTouch(index);           // leaves the image to be presented
+        return true;
+    }
     Barrier(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
@@ -1099,6 +1355,8 @@ void VulkanDisplay::PresentLoop() {
     // Each picture shown at its time with every core busy: the highest priority
     // (asleep almost always).
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+#elif defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
     for (;;) {
         int slot;
@@ -1308,6 +1566,22 @@ bool VulkanDisplay::Pump() {
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) closed_ = true;
+        if (e.type == SDL_EVENT_DID_ENTER_BACKGROUND) {
+            // A phone's or tablet's app in the background may not use the GPU
+            // (iOS stops it, or the app): the game waits here - its thread is
+            // the one pumping - until it is in front again.
+            std::fprintf(stderr, "[window] in the background: paused\n");
+            SDL_Event wait;
+            while (SDL_WaitEvent(&wait)) {
+                if (wait.type == SDL_EVENT_QUIT || wait.type == SDL_EVENT_TERMINATING) {
+                    closed_ = true;
+                    break;
+                }
+                if (wait.type == SDL_EVENT_DID_ENTER_FOREGROUND) break;
+            }
+            stale_ = true;                      // the swapchain made again for the window as it is now
+            std::fprintf(stderr, "[window] in front again\n");
+        }
         if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) stale_ = true;
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat && e.key.scancode == SDL_SCANCODE_RETURN &&
             (e.key.mod & SDL_KMOD_ALT))
@@ -1345,6 +1619,7 @@ bool VulkanDisplay::Pump() {
             std::lock_guard<std::mutex> hold(mouse_lock_);
             mouse_.held = 0;
         }
+        if (touch_enabled_) TouchEvent(e);
         if (e.type == SDL_EVENT_GAMEPAD_ADDED && !gamepad_) {
             gamepad_ = SDL_OpenGamepad(e.gdevice.which);
             triggers_unsent_ = true;
@@ -1446,7 +1721,14 @@ void VulkanDisplay::UpdateCursor() {
 }
 
 bool VulkanDisplay::Pad(PadState* state) const {
-    if (!gamepad_) return false;
+    if (!gamepad_) {
+        // The touch controls as the controller while they are shown.
+        if (!touch_enabled_ || !touch_.Visible()) return false;
+        PadState s;
+        touch_.Merge(&s.buttons, s.sticks);
+        *state = s;
+        return true;
+    }
     // SDL's buttons by position (south is the DualShock's cross) to
     // DualShock 2 inputs.
     static const std::pair<SDL_GamepadButton, int> kButtons[] = {
@@ -1474,6 +1756,7 @@ bool VulkanDisplay::Pad(PadState* state) const {
         const int v = SDL_GetGamepadAxis(gamepad_, kAxes[i]);
         s.sticks[i] = (v > -4096 && v < 4096) ? 0x80 : std::uint8_t((v + 32768) >> 8);
     }
+    if (touch_enabled_ && touch_.Visible()) touch_.Merge(&s.buttons, s.sticks);   // both at once
     *state = s;
     return true;
 }
@@ -1543,6 +1826,14 @@ VulkanDisplay::~VulkanDisplay() {
     if (post_sampler_) vkDestroySampler(device_, post_sampler_, nullptr);
     if (overlay_buffer_) vkDestroyBuffer(device_, overlay_buffer_, nullptr);
     if (overlay_memory_) vkFreeMemory(device_, overlay_memory_, nullptr);
+    if (device_) {
+        for (int i = 0; i < kInFlight; ++i) {
+            if (touch_buffers_[i]) vkDestroyBuffer(device_, touch_buffers_[i], nullptr);
+            if (touch_memory_[i]) vkFreeMemory(device_, touch_memory_[i], nullptr);
+        }
+        if (touch_pipeline_) vkDestroyPipeline(device_, touch_pipeline_, nullptr);
+        if (touch_layout_) vkDestroyPipelineLayout(device_, touch_layout_, nullptr);
+    }
     DestroySwapchain();
     if (device_) {
         for (int i = 0; i < kInFlight; ++i) {

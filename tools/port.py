@@ -3,13 +3,15 @@
 
     python engine/tools/port.py --game games/<name>            # generate, build, run
     python engine/tools/port.py --game games/<name> build      # generate and build only
+    python engine/tools/port.py --game games/<name> generate   # generate only (an iPad's build: docs/IOS.md)
     python engine/tools/port.py --game games/<name> run -- --trace
     python engine/tools/port.py init <name> --iso "<disc image>" --title "..."  # a new game
 
 The port is the game's translated functions (src/lifted, from lift.py --emit) on
 the native host (engine/host): guest memory, a dispatch table from guest address
 to translated function, the EE kernel's services. This generates the dispatch
-table, builds games/<name>/port/ with CMake and Ninja under MSVC, and runs the
+table, builds games/<name>/port/ with CMake and Ninja (under MSVC on Windows,
+with Clang or GCC from the PATH elsewhere: Linux, macOS), and runs the
 result on the executable from the user's own disc, printing how far it got.
 
 Some code only exists at run time: kept as data and copied out - a kernel
@@ -162,11 +164,34 @@ def _visual_studio_tool(*parts) -> str:
     return os.path.join(root, "Common7", "IDE", "CommonExtensions", "Microsoft", "CMake", *parts)
 
 
+EXE = ".exe" if os.name == "nt" else ""
+
+
+def _build_elsewhere(source: str, binary: str, generated: str) -> None:
+    """Linux and macOS: CMake and Ninja from the PATH, Clang where there is one."""
+    import shutil
+    env = dict(os.environ)
+    if "CXX" not in env and shutil.which("clang++"):
+        env["CC"], env["CXX"] = "clang", "clang++"
+    configure = ["cmake", "-S", source, "-B", binary, "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+                 "-DPS2_GENERATED_DIR=" + generated]
+    for step in (configure, ["cmake", "--build", binary]):
+        result = subprocess.run(step, capture_output=True, text=True, env=env)
+        if result.returncode:
+            errors = [line for line in (result.stdout + result.stderr).splitlines()
+                      if "error" in line.lower()]
+            raise SystemExit("port build failed:\n" + "\n".join(errors[:40] or
+                                                               (result.stdout + result.stderr)[-4000:].splitlines()))
+
+
 def build(game, generated: str) -> str:
     """Configure and build the port; returns the executable's path."""
     source = game.path("port")
     binary = game.path(os.path.join(game.build, "port", "cmake"))
     os.makedirs(binary, exist_ok=True)
+    if os.name != "nt":
+        _build_elsewhere(source, binary, generated)
+        return _test_and_name(game, binary)
     cmake = _visual_studio_tool("CMake", "bin", "cmake.exe")
     ninja = _visual_studio_tool("Ninja", "ninja.exe")
     script = os.path.join(binary, "build.bat")
@@ -182,13 +207,17 @@ def build(game, generated: str) -> str:
                   if "error" in line.lower()]
         raise SystemExit("port build failed:\n" + "\n".join(errors[:40] or
                                                            (result.stdout + result.stderr)[-4000:].splitlines()))
-    tests = os.path.join(binary, "ps2host", "ps2host_tests.exe")
+    return _test_and_name(game, binary)
+
+
+def _test_and_name(game, binary: str) -> str:
+    tests = os.path.join(binary, "ps2host", "ps2host_tests" + EXE)
     result = subprocess.run([tests], capture_output=True, text=True)
     print(result.stdout.strip())
     if result.returncode:
         raise SystemExit("the host's own tests failed")
     target = os.path.basename(os.path.normpath(game.directory))
-    executable = os.path.join(binary, target + ".exe")
+    executable = os.path.join(binary, target + EXE)
     print("built %s" % executable)
     return executable
 
@@ -235,7 +264,7 @@ def main(argv=None) -> int:
         return init_game.main(argv[1:])
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     game_config.add_argument(parser)
-    parser.add_argument("action", nargs="?", default="all", choices=("all", "build", "run"))
+    parser.add_argument("action", nargs="?", default="all", choices=("all", "build", "run", "generate"))
     parser.add_argument("--rounds", type=int, default=60,
                         help="build-and-run rounds to translate code found at run time")
     parser.add_argument("extra", nargs=argparse.REMAINDER,
@@ -245,8 +274,11 @@ def main(argv=None) -> int:
     extra = [a for a in args.extra if a != "--"]
     if args.action == "run":
         target = os.path.basename(os.path.normpath(game.directory))
-        executable = game.path(os.path.join(game.build, "port", "cmake", target + ".exe"))
+        executable = game.path(os.path.join(game.build, "port", "cmake", target + EXE))
         return run(game, executable, extra)
+    if args.action == "generate":
+        print("generated: %s" % generate(game))
+        return 0
     if args.action == "build":
         build(game, generate(game))
         return 0

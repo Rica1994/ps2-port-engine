@@ -91,6 +91,69 @@ def find_vcvars() -> str:
     return vcvars
 
 
+def posix_compiler() -> str:
+    """Clang (or GCC) where there is no MSVC: Linux, macOS."""
+    import shutil
+    for name in (os.environ.get("CXX"), "clang++", "g++"):
+        if name and shutil.which(name):
+            return shutil.which(name)
+    raise CompilerUnavailable("no C++ compiler found (clang++ or g++)")
+
+
+_CLANG_ERROR = re.compile(r"^(.*?):(\d+):(?:\d+:)? (?:fatal )?error: ")
+
+
+def compile_shared(sources, include_dirs, library: str, work_dir: str, parallel: int = 4,
+                   log_name: str = "build.log", warnings: bool = False) -> str:
+    """The POSIX twin of the cl /LD builds below: sources compiled at -O2 (the
+    optimiser is what turns undefined behaviour into wrong answers) into a
+    shared library, `parallel` at a time. Errors are reported as MSVC words
+    them ("file(line): error ..."), which the callers read."""
+    from concurrent.futures import ThreadPoolExecutor
+    compiler = posix_compiler()
+    flags = ["-std=c++17", "-O2", "-fPIC", "-fexceptions", "-D__declspec(x)="]
+    flags += [] if warnings else ["-w"]
+    if re.search(r"x86_64|amd64", os.uname().machine, re.I):
+        flags.append("-msse4.1")
+    flags += ["-I" + os.path.abspath(d) for d in include_dirs]
+    log_path = os.path.join(work_dir, log_name)
+    objects = []
+
+    def compile_one(source):
+        obj = os.path.join(work_dir, "%s_%d.o" % (os.path.splitext(os.path.basename(source))[0],
+                                                  abs(hash(os.path.abspath(source))) % 100000))
+        result = subprocess.run([compiler] + flags + ["-c", source, "-o", obj],
+                                capture_output=True, text=True)
+        return obj, result.returncode, result.stdout + result.stderr
+
+    log = []
+    failed = False
+    with ThreadPoolExecutor(max_workers=max(1, parallel)) as pool:
+        for obj, code, text in pool.map(compile_one, sources):
+            objects.append(obj)
+            log.append(text)
+            failed = failed or code != 0
+    if not failed:
+        result = subprocess.run([compiler, "-shared", "-o", library] + objects + ["-lpthread"],
+                                capture_output=True, text=True)
+        log.append(result.stdout + result.stderr)
+        failed = result.returncode != 0
+    text = "\n".join(log)
+    text = "\n".join(_CLANG_ERROR.sub(lambda m: "%s(%s): error : " % (m.group(1), m.group(2)), line)
+                     for line in text.splitlines())
+    with open(log_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    for obj in objects:
+        try:
+            os.remove(obj)
+        except OSError:
+            pass
+    if failed or not os.path.exists(library):
+        errors = [line for line in text.splitlines() if " error " in line or "fatal" in line]
+        raise CompileError("\n".join(errors) or text[-2000:] or "the build did not run")
+    return library
+
+
 def functions_in(source: str) -> list:
     """(address, name, return type, parameter indices) for every emitted function."""
     found = []
@@ -211,7 +274,7 @@ def harness_source(functions, typed: bool, externs=()) -> str:
 
 def build(generated_path: str, runtime_sources, include_dir: str, work_dir: str) -> tuple:
     """Compile the generated file into a DLL; returns (dll path, functions)."""
-    vcvars = find_vcvars()
+    vcvars = find_vcvars() if os.name == "nt" else None
     # Absolute: the build script changes into work_dir before compiling, so a
     # relative path (a relative --game) would name a file that is not there.
     work_dir = os.path.abspath(work_dir)
@@ -237,6 +300,10 @@ def build(generated_path: str, runtime_sources, include_dir: str, work_dir: str)
     # /O2 on purpose: an optimiser is what turns undefined behaviour into wrong
     # answers, so checking an unoptimised build would hide exactly the problems
     # this exists to find.
+    if os.name != "nt":
+        dll = dll[:-4] + ".so"
+        compile_shared(sources, [include_dir, generated_dir], dll, work_dir, 1)
+        return dll, functions
     script = os.path.join(work_dir, "build.bat")
     with open(script, "w", encoding="utf-8") as handle:
         handle.write("@echo off\n")

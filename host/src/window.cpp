@@ -8,10 +8,9 @@
  * thread at each frame (FrameDone).
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
-#include <windows.h>
+#include "ps2host/keys.h"     // <windows.h> on Windows
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <memory>
@@ -35,7 +34,11 @@ namespace ps2host {
 
 namespace {
 
+#ifdef _WIN32
 HWND g_window = nullptr;
+#else
+void* g_window = nullptr;           // no window but the Vulkan display's elsewhere
+#endif
 bool g_closed = false;
 
 #ifdef PS2HOST_VULKAN
@@ -72,6 +75,7 @@ int Scancode(int key) {
 }
 #endif
 
+#ifdef _WIN32
 LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
     switch (message) {
         case WM_CLOSE:
@@ -126,6 +130,50 @@ void PresentGdi() {
                   DIB_RGB_COLORS, SRCCOPY);
     ReleaseDC(g_window, dc);
 }
+#else
+bool OpenGdiWindow(const wchar_t*, int, int) { return false; }
+void PresentGdi() {}
+#endif
+
+#if defined(PS2HOST_VULKAN) && !defined(_WIN32)
+/* The overlay's text without GDI: the public-domain 8x8 VGA font
+   (font8x8_basic.h, fetched at configure time), scaled to the line. */
+#include "font8x8_basic.h"
+
+std::vector<std::uint32_t> DrawOverlayText(const std::vector<std::string>& lines, int line, int* width_out,
+                                           int* height_out) {
+    const int scale = std::max(1, (line - 4) / 8);
+    const int advance = 8 * scale;
+    std::size_t longest = 0;
+    for (const std::string& text : lines) longest = std::max(longest, text.size());
+    const int width = std::min(1280, int(longest) * advance + line);
+    const int height = std::min(720, int(lines.size()) * line + line / 2);
+    auto rgb = [](unsigned r, unsigned g, unsigned b) { return 0xFF000000u | (r << 16) | (g << 8) | b; };
+    std::vector<std::uint32_t> pixels(std::size_t(width) * height, rgb(16, 20, 32));
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        const bool chosen = !lines[i].empty() && lines[i][0] == '>';
+        const std::uint32_t colour = chosen ? rgb(255, 210, 60) : i == 0 ? rgb(120, 190, 255) : rgb(235, 235, 235);
+        const int top = int(i) * line + line / 4 + (line - 8 * scale) / 2;
+        for (std::size_t c = 0; c < lines[i].size(); ++c) {
+            const unsigned char ch = static_cast<unsigned char>(lines[i][c]);
+            const char* glyph = font8x8_basic[ch < 128 ? ch : '?'];
+            const int left = line / 2 + int(c) * advance;
+            for (int row = 0; row < 8; ++row)
+                for (int col = 0; col < 8; ++col) {
+                    if (!((static_cast<unsigned char>(glyph[row]) >> col) & 1)) continue;
+                    for (int dy = 0; dy < scale; ++dy)
+                        for (int dx = 0; dx < scale; ++dx) {
+                            const int x = left + col * scale + dx, y = top + row * scale + dy;
+                            if (x >= 0 && x < width && y >= 0 && y < height) pixels[std::size_t(y) * width + x] = colour;
+                        }
+                }
+        }
+    }
+    *width_out = width;
+    *height_out = height;
+    return pixels;
+}
+#endif
 
 #ifdef PS2HOST_VULKAN
 /* The "antialiasing" setting as the display takes it: supersampling's
@@ -202,7 +250,11 @@ bool WindowFocused() {
 #ifdef PS2HOST_VULKAN
     if (g_display) return g_display->Focused();
 #endif
+#ifdef _WIN32
     return g_window && GetForegroundWindow() == g_window;
+#else
+    return false;
+#endif
 }
 
 bool WindowClosed() { return g_closed; }
@@ -214,7 +266,12 @@ bool HostKeyDown(int key) {
 #ifdef PS2HOST_VULKAN
     if (g_display) return g_display->KeyDown(Scancode(key));
 #endif
+#ifdef _WIN32
     return (GetAsyncKeyState(key) & 0x8000) != 0;
+#else
+    (void)key;
+    return false;
+#endif
 }
 
 void HostTriggerEffects(const HostTriggerEffect& left, const HostTriggerEffect& right) {
@@ -386,6 +443,11 @@ void SetWindowOverlay(const std::vector<std::string>& lines) {
     // yellow (the one chosen).
     const std::uint32_t screen = std::max(480u, g_display->PixelHeight());
     const int line = std::max(14, int(screen / 48));
+#ifndef _WIN32
+    int width = 0, height = 0;
+    std::vector<std::uint32_t> pixels = DrawOverlayText(lines, line, &width, &height);
+    g_display->SetOverlay(std::move(pixels), std::uint32_t(width), std::uint32_t(height));
+#else
     HDC dc = CreateCompatibleDC(nullptr);
     HFONT font = CreateFontA(-(line - 4), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, ANSI_CHARSET, OUT_DEFAULT_PRECIS,
                              CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
@@ -430,6 +492,7 @@ void SetWindowOverlay(const std::vector<std::string>& lines) {
     DeleteObject(font);
     DeleteDC(dc);
     g_display->SetOverlay(std::move(pixels), std::uint32_t(width), std::uint32_t(height));
+#endif
 #else
     (void)lines;
 #endif

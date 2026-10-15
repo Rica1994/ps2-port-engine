@@ -19,9 +19,7 @@
 #include "ps2host/settings.h"
 #include "ps2host/texture_pack.h"
 
-#ifdef _WIN32
-#include <windows.h>
-#endif
+#include "ps2host/keys.h"
 
 namespace ps2host {
 
@@ -136,7 +134,6 @@ enum Input { kToggle, kUp, kDown, kLeft, kRight, kAccept, kBack, kInputs };
 std::array<bool, kInputs> Held() {
     std::array<bool, kInputs> held{};
     const bool focused = WindowFocused();
-#ifdef _WIN32
     auto key = [&](int vk) { return focused && HostKeyDown(vk); };
     held[kToggle] = key(VK_F1);
     held[kUp] = key(VK_UP);
@@ -145,7 +142,6 @@ std::array<bool, kInputs> Held() {
     held[kRight] = key(VK_RIGHT);
     held[kAccept] = key(VK_RETURN);
     held[kBack] = key(VK_ESCAPE);
-#endif
     HostPadState pad;
     if (focused && HostPad(&pad)) {
         // DualShock 2 order: 1 L3, 2 R3, 4 up, 5 right, 6 down, 7 left, 13 circle, 14 cross.

@@ -1,23 +1,42 @@
 /*
  * Every game port's entry point. The game supplies its translated functions (the
  * table engine/tools/port.py generates) and its overrides; the rest is shared.
+ *
+ * On Windows the port is a windowed program: it asks for the disc image with a
+ * file dialog the first time. On iOS/iPadOS (and Android) it is an app: the
+ * player copies the disc image into the app's folder in the Files app, and the
+ * port finds it there. Elsewhere (Linux, macOS) it takes the disc image as an
+ * argument, or the one named in pc_settings.ini, or one beside it.
  */
 
+#include <cctype>
 #include <cstdio>
-#include <fcntl.h>
 #include <filesystem>
-#include <io.h>
-#include <sys/stat.h>
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#include <sys/stat.h>
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
 #include <commdlg.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+#if defined(PS2HOST_VULKAN) && !defined(_WIN32)
+// SDL's own entry point where the system wants one (iOS's UIApplicationMain,
+// Android's activity): main() below becomes SDL_main.
+#include <SDL3/SDL_main.h>
+#endif
 
 #include "ps2host/disc.h"
 #include "ps2host/host.h"
+#include "ps2host/platform.h"
 #include "ps2host/run.h"
 #include "ps2host/settings.h"
 
@@ -33,9 +52,11 @@ void RegisterGameOverrides();
 
 namespace {
 
-/* The port is built for AVX2 (engine/host/CMakeLists.txt; the VU's lanes and
-   the rest take its three-operand forms): a processor without it is told so
-   rather than stopped by an illegal instruction somewhere. */
+namespace platform = ps2host::platform;
+
+/* The port is built for AVX2 on Windows (engine/host/CMakeLists.txt; the VU's
+   lanes and the rest take its three-operand forms): a processor without it is
+   told so rather than stopped by an illegal instruction somewhere. */
 bool HasAvx2() {
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86)) && defined(__AVX2__)
     int info[4];
@@ -58,15 +79,39 @@ std::string g_log;     // the log a run started without arguments writes
 /* Whether `path` is an image of the game's disc: the executable it boots is
    the one the port was translated from (game.json's). */
 bool IsGameDisc(const std::string& path) {
+    if (path.empty()) return false;
     ps2host::Disc disc;
     if (!disc.Open(path)) return false;
     std::string boot = disc.BootPath();
     const std::size_t semicolon = boot.find(';');
     if (semicolon != std::string::npos) boot.resize(semicolon);
     while (!boot.empty() && (boot[0] == '\\' || boot[0] == '/')) boot.erase(0, 1);
-    return _stricmp(boot.c_str(), PS2HOST_GAME_EXECUTABLE) == 0;
+    return platform::CompareNoCase(boot.c_str(), PS2HOST_GAME_EXECUTABLE) == 0;
 }
 
+bool IsDiscImageName(const std::filesystem::path& p) {
+    std::string ext = p.extension().string();
+    for (char& c : ext) c = char(std::tolower(static_cast<unsigned char>(c)));
+    return ext == ".iso" || ext == ".cue" || ext == ".bin";
+}
+
+/* The first image of the game's disc in `folder` (and the folders in it, one
+   level down): where the player put it with the Files app. */
+std::string FindDisc(const std::filesystem::path& folder) {
+    std::error_code ec;
+    std::vector<std::filesystem::path> candidates;
+    for (const auto& entry : std::filesystem::directory_iterator(folder, ec)) {
+        if (entry.is_regular_file(ec) && IsDiscImageName(entry.path())) candidates.push_back(entry.path());
+        else if (entry.is_directory(ec))
+            for (const auto& inner : std::filesystem::directory_iterator(entry.path(), ec))
+                if (inner.is_regular_file(ec) && IsDiscImageName(inner.path())) candidates.push_back(inner.path());
+    }
+    for (const auto& c : candidates)
+        if (IsGameDisc(c.string())) return c.string();
+    return {};
+}
+
+#ifdef _WIN32
 /* The player's disc image, from a file dialog; "" if they cancel. */
 std::string PickDisc() {
     char file[MAX_PATH] = {};
@@ -81,33 +126,12 @@ std::string PickDisc() {
 }
 #endif
 
-/* Started without arguments - from Explorer, a shortcut - the port plays its
-   game from the player's own disc image: the one chosen before (kept in the
-   PC settings, beside the executable), or asked for and checked to be the
-   game's disc; the memory card a directory beside it too. In a window, with
-   sound, on the GPU, with no time limit (the default is for test runs).
-   An empty list: the player gave none. */
-std::vector<std::string> PlayArguments(const char* self) {
-#ifdef PS2HOST_GAME_EXECUTABLE
-    wchar_t exe[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    const std::filesystem::path here = std::filesystem::path(exe).parent_path();
-    ps2host::LoadSettings((here / "pc_settings.ini").string());     // where --memcard puts them
-    std::string disc = ps2host::Setting("disc");
-    while (!IsGameDisc(disc)) {
-        if (!disc.empty() && GetFileAttributesA(disc.c_str()) != INVALID_FILE_ATTRIBUTES)
-            MessageBoxA(nullptr, ("This is not an image of the " PS2HOST_GAME_NAME " disc "
-                                  "(" PS2HOST_GAME_EXECUTABLE "):\n\n" + disc).c_str(),
-                        PS2HOST_GAME_NAME, MB_OK | MB_ICONWARNING);
-        disc = PickDisc();
-        if (disc.empty()) return {};
-    }
-    if (disc != ps2host::Setting("disc")) ps2host::SetSetting("disc", disc);
-    // No terminal to read: what the run says goes to a log beside it. Opened
-    // once, shared (fopen's would lock the file to one stream), and given to
-    // both: their lines in the order they were written.
-    g_log = std::filesystem::path(exe).stem().string() + ".log";
+/* What the run says, to a log beside the settings: there is no terminal to
+   read. Opened once and given to both streams: their lines in order. */
+void LogToFile(const std::filesystem::path& here, const std::string& name) {
+    g_log = name;
     const std::string log = (here / g_log).string();
+#ifdef _WIN32
     std::FILE* stream = nullptr;
     freopen_s(&stream, "NUL", "w", stdout);    // streams with descriptors, in a windowed program
     freopen_s(&stream, "NUL", "w", stderr);
@@ -117,18 +141,68 @@ std::vector<std::string> PlayArguments(const char* self) {
         _dup2(file, _fileno(stderr));
         _close(file);
     }
+#else
+    const int file = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (file >= 0) {
+        dup2(file, fileno(stdout));
+        dup2(file, fileno(stderr));
+        close(file);
+    }
+#endif
     std::setvbuf(stdout, nullptr, _IONBF, 0);  // a run ended by force loses nothing
     std::setvbuf(stderr, nullptr, _IONBF, 0);
+}
+#endif
+
+/* Started without arguments - from Explorer, a shortcut, the home screen - the
+   port plays its game from the player's own disc image: the one chosen before
+   (kept in the PC settings), or asked for (Windows) or found (a tablet, in the
+   app's folder) and checked to be the game's disc; the memory card a
+   directory beside the settings. In a window, with sound, on the GPU, with no
+   time limit (the default is for test runs). An empty list: the player gave
+   none. */
+std::vector<std::string> PlayArguments(const char* self) {
+#ifdef PS2HOST_GAME_EXECUTABLE
+    const std::filesystem::path here = platform::UserDirectory();
+    ps2host::LoadSettings((here / "pc_settings.ini").string());     // where --memcard puts them
+    std::string disc = ps2host::Setting("disc");
+#ifdef _WIN32
+    while (!IsGameDisc(disc)) {
+        std::error_code ec;
+        if (!disc.empty() && std::filesystem::exists(disc, ec))
+            platform::ShowMessage(PS2HOST_GAME_NAME, "This is not an image of the " PS2HOST_GAME_NAME " disc "
+                                                     "(" PS2HOST_GAME_EXECUTABLE "):\n\n" + disc, false);
+        disc = PickDisc();
+        if (disc.empty()) return {};
+    }
+#else
+    if (!IsGameDisc(disc)) disc = FindDisc(here);
+    if (disc.empty()) {
+        platform::ShowMessage(PS2HOST_GAME_NAME,
+                              platform::kMobile
+                                  ? "Copy your own disc image of " PS2HOST_GAME_NAME " (" PS2HOST_GAME_EXECUTABLE
+                                    ", an .iso) into this app's folder with the Files app (On My iPad > "
+                                    "the game's folder), then start the game again."
+                                  : "Put your own disc image of " PS2HOST_GAME_NAME " (" PS2HOST_GAME_EXECUTABLE
+                                    ", an .iso) beside the game, or name it: --disc <image>.",
+                              false);
+        return {};
+    }
+#endif
+    if (disc != ps2host::Setting("disc")) ps2host::SetSetting("disc", disc);
+    std::string stem = std::filesystem::path(self ? self : "port").stem().string();
+    if (stem.empty()) stem = "port";
+    LogToFile(here, stem + ".log");
     std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
-    return {self, "--disc", disc, "--memcard", (here / "memcard").string(), "--window", "--gpu",
+    return {self ? self : "port", "--disc", disc, "--memcard", (here / "memcard").string(), "--window", "--gpu",
             "--audio", "--timeout", "315360000"};     // ten years
 #else
-    return {self};
+    (void)self;
+    return {self ? self : "port"};
 #endif
 }
 
-}  // namespace
-
+#ifdef _WIN32
 /* A port built as a windowed program has no console of its own. Started from
    a terminal its output goes to that one; redirected (a file, a pipe: the
    tools' runs), where it was sent. */
@@ -140,14 +214,19 @@ void AttachTerminal() {
     freopen_s(&stream, "CONOUT$", "w", stdout);
     freopen_s(&stream, "CONOUT$", "w", stderr);
 }
+#endif
+
+}  // namespace
 
 int main(int argc, char** argv) {
+#ifdef _WIN32
     AttachTerminal();
+#endif
     std::vector<std::string> play;
     std::vector<char*> play_argv;
-    if (argc == 1) {
-        play = PlayArguments(argv[0]);
-        if (play.empty()) return 0;
+    if (argc <= 1) {
+        play = PlayArguments(argc > 0 ? argv[0] : nullptr);
+        if (play.size() <= 1) return 0;
         for (std::string& arg : play) play_argv.push_back(arg.data());
         play_argv.push_back(nullptr);
         argc = int(play.size());
@@ -168,10 +247,10 @@ int main(int argc, char** argv) {
     const int code = ps2host::Main(argc, argv);
     if (!play.empty() && code != 0) {         // closing the window ends a run with 0
         std::fflush(nullptr);
-        const std::string text = "The game stopped because of an error. What happened is in " +
-                                 g_log + ", beside the game.";
-        MessageBoxA(nullptr, text.c_str(), ps2host::GameTitle().empty() ? "PS2 port" : ps2host::GameTitle().c_str(),
-                    MB_OK | MB_ICONERROR);
+        platform::ShowMessage(ps2host::GameTitle().empty() ? "PS2 port" : ps2host::GameTitle(),
+                              "The game stopped because of an error. What happened is in " + g_log +
+                                  ", beside the game.",
+                              true);
     }
     // What must be finished is (the report written, the settings and the
     // memory card saved as they changed, the WAV's header here); the rest -
@@ -182,6 +261,10 @@ int main(int argc, char** argv) {
     ps2host::CloseAudio();
     ps2host::ReleaseController();
     std::fflush(nullptr);
+#ifdef _WIN32
     TerminateProcess(GetCurrentProcess(), UINT(code));
+#else
+    _exit(code);
+#endif
     return code;
 }

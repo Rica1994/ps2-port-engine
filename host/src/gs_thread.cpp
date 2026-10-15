@@ -101,6 +101,10 @@ u32 Header(u32 type, int path, u32 count) { return type << 28 | u32(path & 0xF) 
 void Pause() {
 #if defined(_MSC_VER)
     _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm64__)
+    __asm__ __volatile__("yield");
 #endif
 }
 

@@ -7,7 +7,9 @@
 #include <cmath>
 #include <cstring>
 #if defined(__SSE2__) || defined(_M_X64)
+#if defined(__SSE2__) || defined(_M_X64)
 #include <emmintrin.h>
+#endif
 #endif
 
 namespace lifted {
