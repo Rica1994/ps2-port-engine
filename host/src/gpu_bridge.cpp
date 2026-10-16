@@ -286,6 +286,7 @@ struct Bridge {
 };
 
 Bridge* g_bridge = nullptr;
+std::atomic<long long> g_left_out_at{-1000000000000LL};   // NoteDrawLeftOut: steady clock, ns
 
 // Bumped by whatever could change what OnDraw works out for a primitive from
 // its registers alone - an image's staleness, memory synced, a write-back, a
@@ -1578,13 +1579,14 @@ void Rescale(Bridge& b, u32 scale) {
     std::fprintf(stderr, "[gpu] internal resolution: %ux\n", unsigned(scale));
 }
 
-/* The game's frames a second in the window's corner, once a second - a
-   tablet's by default (PS2HOST_FPS=0 hides it, =1 shows it on a PC): the
-   frames the game ended in that second, the number the log's [perf] lines
-   give. (Counting changes of the displayed frame buffer showed nothing: a
-   game may draw elsewhere and copy into one buffer it always shows.) Written
-   to the log too every ten seconds, so a run's log says what was on the
-   screen. Not over the PC settings' menu, which uses the same overlay. */
+/* The game's speed and its pictures in the window's corner, once a second
+   - a tablet's by default (PS2HOST_FPS=0 hides it, =1 shows it on a PC):
+   "67% SPEED  20 PICTURES/S". The speed is the game's ticks (the frames it
+   ends) against the 60 a second of a PS2: below 100% the game runs in slow
+   motion. The pictures are the ticks the GPU drew in (a skipped draw, or a
+   game drawing every other tick, shows the last picture again). Written to
+   the log too every ten seconds. Not over the PC settings' menu, which uses
+   the same overlay. */
 void ShowPictureRate(u64 frame) {
     static const bool shown = [] {
         const char* v = std::getenv("PS2HOST_FPS");
@@ -1595,16 +1597,25 @@ void ShowPictureRate(u64 frame) {
     using Clock = std::chrono::steady_clock;
     static Clock::time_point since = Clock::now();
     static u64 since_frame = frame;
+    static u64 last_serial = 0;
+    static unsigned pictures = 0;
     static int logged = 0;
+    if (g_bridge && g_bridge->serial != last_serial) {
+        last_serial = g_bridge->serial;
+        ++pictures;
+    }
     const double seconds = std::chrono::duration<double>(Clock::now() - since).count();
     if (seconds < 1.0) return;
-    const double rate = double(frame - since_frame) / seconds;
+    const double ticks = double(frame - since_frame) / seconds;
+    const double shown_rate = double(pictures) / seconds;
     since = Clock::now();
     since_frame = frame;
-    char text[32];
-    std::snprintf(text, sizeof text, "%.0f FPS", rate);
-    if (++logged % 10 == 1) std::fprintf(stderr, "[fps] frame %llu: %s on the screen\n",
-                                         static_cast<unsigned long long>(frame), text);
+    pictures = 0;
+    char text[64];
+    std::snprintf(text, sizeof text, "%.0f%% SPEED  %.0f PICTURES/S", ticks * 100.0 / 59.94, shown_rate);
+    if (++logged % 10 == 1)
+        std::fprintf(stderr, "[fps] frame %llu: %s (%.1f ticks/s)\n", static_cast<unsigned long long>(frame), text,
+                     ticks);
     if (!PcMenuOpen()) SetWindowOverlay({text});
 }
 
@@ -1723,7 +1734,14 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
             if (scale != g_bridge->renderer->Scale()) Rescale(*g_bridge, scale);
             if (ps2gpu::Display* display = WindowDisplay()) {
                 const bool pace = !VirtualClock() && SettingOn("frame_pacing", true);    // (PC SETTINGS)
-                PresentGpuPicture(*display, pace ? FrameDue(frame) : 0);
+                static u64 presented_serial = ~0ull;
+                const long long now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                const bool drawn_only = now_ns - g_left_out_at.load(std::memory_order_relaxed) < 1000000000LL;
+                if (!drawn_only || g_bridge->serial != presented_serial) {
+                    presented_serial = g_bridge->serial;
+                    PresentGpuPicture(*display, pace ? FrameDue(frame) : 0);
+                }
                 ShowPictureRate(frame);
             }
         });
@@ -1731,6 +1749,11 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     std::fprintf(stderr, "gpu: drawing on %s %s\n", device->Describe().c_str(),
                  bridge.primary ? "instead of the software GS" : "beside the software GS");
     return true;
+}
+
+void NoteDrawLeftOut() {
+    g_left_out_at = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 bool GpuPrimary() { return g_bridge && g_bridge->primary; }

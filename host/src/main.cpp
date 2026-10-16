@@ -226,7 +226,19 @@ std::vector<std::string> PlayArguments(const char* self) {
                 word += *c;
                 continue;
             }
-            if (!word.empty()) args.push_back(word);
+            // A script's own settings for the run, as the environment's
+            // (one line in an Xcode scheme does it all): --skip-cycle=...
+            // (PS2HOST_SKIP_CYCLE: what each drawing function costs),
+            // --frameskip=0/1 (PS2HOST_FRAMESKIP, a port's frame skipping).
+            const auto take = [&](const char* option, const char* variable) {
+                const std::string prefix = std::string(option) + "=";
+                if (word.compare(0, prefix.size(), prefix) != 0) return false;
+                platform::SetEnvironment(variable, word.substr(prefix.size()).c_str());
+                return true;
+            };
+            if (!word.empty() && !take("--skip-cycle", "PS2HOST_SKIP_CYCLE") &&
+                !take("--skip-seconds", "PS2HOST_SKIP_SECONDS") && !take("--frameskip", "PS2HOST_FRAMESKIP"))
+                args.push_back(word);
             word.clear();
             if (!*c) break;
         }

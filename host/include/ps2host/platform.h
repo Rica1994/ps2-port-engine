@@ -76,6 +76,8 @@ void ShowMessage(const std::string& title, const std::string& text, bool error);
 /* The process's memory footprint, and - on iOS - what the system still
    allows it before ending it for memory; in MB, 0 where unknown. */
 void MemoryUse(std::uint64_t* footprint_mb, std::uint64_t* available_mb);
+/* An environment variable set for the rest of the run. */
+void SetEnvironment(const char* name, const char* value);
 /* The C/C++ heap's bytes in use (malloc's zones; 0 where it cannot say). */
 std::uint64_t HeapInUse();
 /* The device's thermal state as the system tells it (Apple's: nominal, fair,

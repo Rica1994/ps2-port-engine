@@ -364,6 +364,14 @@ void MemoryUse(std::uint64_t* footprint_mb, std::uint64_t* available_mb) {
 #endif
 }
 
+void SetEnvironment(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 std::uint64_t HeapInUse() {
 #ifdef __APPLE__
     malloc_statistics_t stats{};

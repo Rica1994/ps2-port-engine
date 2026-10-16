@@ -944,7 +944,13 @@ void VulkanGsRenderer::DestroyImage(Image& t) {
 }
 
 bool VulkanGsRenderer::ImageMemory(const VkMemoryRequirements& req, std::uint32_t type, Image& t) {
-    constexpr VkDeviceSize kBlock = VkDeviceSize(64) << 20, kLargest = VkDeviceSize(16) << 20;
+    // A block holds 16 pieces of its size (1 MB of 64 KB ones, 32 MB of 2 MB
+    // ones): each size class keeps a block of its own, and with 64 MB for
+    // every class a race held a gigabyte of GPU memory mostly unused - ~580
+    // MB in the menus already, and another 64 MB at each new texture size
+    // (an iPad has none of that to spare: iOS ends the app). Larger than 2
+    // MB (a 1024x512 texture), an allocation of its own, freed with it.
+    constexpr VkDeviceSize kLargest = VkDeviceSize(2) << 20;
     std::uint32_t piece_class = 16;                 // 64 KB
     while ((VkDeviceSize(1) << piece_class) < std::max(req.size, req.alignment)) ++piece_class;
     t.memory_type = type;
@@ -959,12 +965,13 @@ bool VulkanGsRenderer::ImageMemory(const VkMemoryRequirements& req, std::uint32_
     auto& free = image_pieces_[std::uint64_t(type) << 32 | piece_class];
     if (free.empty()) {
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        const VkDeviceSize piece = VkDeviceSize(1) << piece_class;
+        const VkDeviceSize kBlock = piece * 16;
         mai.allocationSize = kBlock;
         mai.memoryTypeIndex = type;
         VkDeviceMemory block = VK_NULL_HANDLE;
         if (vkAllocateMemory(g_.device, &mai, nullptr, &block) != VK_SUCCESS) return false;
         image_blocks_.push_back(block);
-        const VkDeviceSize piece = VkDeviceSize(1) << piece_class;
         for (VkDeviceSize at = kBlock; at >= piece; at -= piece) free.emplace_back(block, at - piece);
     }
     t.memory = free.back().first;

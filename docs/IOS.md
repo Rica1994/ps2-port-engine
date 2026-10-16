@@ -121,6 +121,17 @@ network, and the Mac takes the PC's results with one command:
 
 The logs and the programs come from your disc: they stay on your machines.
 
+### Speed, pictures and frame skipping
+
+The corner shows **% SPEED** - the game's steps against a PS2's 60 a second:
+below 100% the whole game runs in slow motion - and **PICTURES/S**, the steps
+the GPU drew in. A port can leave a step's drawing out while the iPad lags
+behind (Burnout 3: `port/frame_skip.cpp`, on by default on a tablet;
+`frame_skip` in pc_settings.ini, `PS2HOST_FRAMESKIP=0/1`, or `--frameskip=0/1`
+in a `PS2HOST_SCRIPT` line): the game keeps its speed and shows fewer
+pictures. `--skip-cycle=0xT:0xA,0xB,...` (and `--skip-seconds=N`) in a script
+line measures what each drawing function costs (`host/src/host.cpp`).
+
 ### Leaving a run
 
 **Select + Start** held two seconds quits the app (its log sent first). The

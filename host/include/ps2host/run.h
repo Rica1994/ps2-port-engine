@@ -294,6 +294,12 @@ bool WindowClosed();
 void PresentFrame();
 /* The window's events alone (PresentFrame without the picture, which the GS
    thread presents): false once it has been closed. */
+/* Frame skipping (a port's): a frame's drawing was left out. For a second
+   after, the window shows a frame only when the GPU drew in it - a frame
+   whose drawing was left out keeps the last picture, not a frame buffer
+   nobody drew that frame. (Not longer: a film shown by image transfers
+   alone draws nothing.) */
+void NoteDrawLeftOut();
 /* A tablet's reports (report.cpp): the run's log (sent as `run_name`.log)
    and the VU programs it records (`folder`/vu_programs_new.txt), sent over
    the local network to PS2HOST_REPORT's or the build's PS2_REPORT_URL's
