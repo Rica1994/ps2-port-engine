@@ -168,9 +168,19 @@ void Report(const std::vector<Sample>& samples, const std::vector<std::uint64_t>
             ++found;
             ++states[s.state >= 0 && s.state < kStates ? s.state : 0];
             if (s.state != TH_STATE_RUNNING) {
-                // Asleep: where (the trap and what called it).
-                ++waits[NameOf(s.pc[0]) + (s.pc[1] ? "  <- " + NameOf(s.pc[1] - 4) : std::string()) +
-                        (s.pc[2] ? "  <- " + NameOf(s.pc[2] - 4) : std::string())];
+                // Asleep: the trap, and the first two callers in the port or
+                // in MoltenVK - which wait it is (the GS ring, a fence, the
+                // EE's frame...), not the system's own frames above it.
+                std::string where = NameOf(s.pc[0]);
+                int ours = 0;
+                for (int d = 1; d < kDepth && s.pc[d] && ours < 2; ++d) {
+                    const std::string& fn = NameOf(s.pc[d] - 4);
+                    if (fn.find("[burnout3]") == std::string::npos && fn.find("[MoltenVK]") == std::string::npos)
+                        continue;
+                    where += "  <- " + fn;
+                    ++ours;
+                }
+                ++waits[where];
                 continue;
             }
             ++count;
