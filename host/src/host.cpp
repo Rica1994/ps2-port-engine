@@ -303,6 +303,7 @@ namespace {
 struct Skips {
     bool any = false;
     std::set<u32> fixed;
+    std::set<u32> held;                     // PS2HOST_SKIP_HELD: skipped from the trigger's first call on
     u32 trigger = 0;
     std::vector<u32> cycle;
     std::size_t at = 0;                     // cycle[at - 1] is skipped; 0 before the trigger
@@ -341,10 +342,13 @@ Skips& TheSkips() {
             }
         }
         if (const char* secs = std::getenv("PS2HOST_SKIP_SECONDS")) s.seconds = std::max(1.0, std::atof(secs));
-        s.any = !s.fixed.empty() || (s.trigger && !s.cycle.empty());
+        if (const char* held = std::getenv("PS2HOST_SKIP_HELD"))
+            for (u32 a : HexList(held)) s.held.insert(a);
+        s.any = !s.fixed.empty() || (s.trigger && (!s.cycle.empty() || !s.held.empty()));
         if (s.any)
-            std::fprintf(stderr, "[skip] %zu functions skipped, %zu in turn from 0x%08X's first call, %.0f s each\n",
-                         s.fixed.size(), s.cycle.size(), unsigned(s.trigger), s.seconds);
+            std::fprintf(stderr, "[skip] %zu functions skipped, %zu from 0x%08X's first call on, %zu in turn from "
+                         "then, %.0f s each\n", s.fixed.size(), s.held.size(), unsigned(s.trigger), s.cycle.size(),
+                         s.seconds);
         return s;
     }();
     return skips;
@@ -377,7 +381,7 @@ bool Skipped(u32 address) {
                 std::fprintf(stderr, "[skip] the cycle is over: nothing skipped in turn\n");
         }
     }
-    return address == s.now || s.fixed.count(address) != 0;
+    return address == s.now || s.fixed.count(address) != 0 || (s.at > 0 && s.held.count(address) != 0);
 }
 
 }  // namespace

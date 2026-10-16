@@ -237,7 +237,8 @@ std::vector<std::string> PlayArguments(const char* self) {
                 return true;
             };
             if (!word.empty() && !take("--skip-cycle", "PS2HOST_SKIP_CYCLE") &&
-                !take("--skip-seconds", "PS2HOST_SKIP_SECONDS") && !take("--frameskip", "PS2HOST_FRAMESKIP"))
+                !take("--skip-seconds", "PS2HOST_SKIP_SECONDS") &&
+                !take("--skip-held", "PS2HOST_SKIP_HELD") && !take("--frameskip", "PS2HOST_FRAMESKIP"))
                 args.push_back(word);
             word.clear();
             if (!*c) break;
