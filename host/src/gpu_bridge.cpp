@@ -1743,9 +1743,20 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                 static u64 last_pairs = 0, last_compiled = 0, last_gpu_ns = 0;
                 const u64 frames = std::max<u64>(1, frame - last_frame);
                 const u64 gpu_ns = ps2gpu::GpuBusyNanoseconds();
+                // The machine's state too: a tablet that got hot slows its
+                // cores and GPU, and one short of memory compresses the
+                // app's pages - both look like a slow renderer in the log.
+                u64 footprint_mb = 0, available_mb = 0;
+                platform::MemoryUse(&footprint_mb, &available_mb);
+                char machine[160] = "";
+                if (footprint_mb || *platform::ThermalState())
+                    std::snprintf(machine, sizeof machine, "[perf]   memory: %llu MB in use, %llu MB left; thermal state %s\n",
+                                  static_cast<unsigned long long>(footprint_mb),
+                                  static_cast<unsigned long long>(available_mb),
+                                  *platform::ThermalState() ? platform::ThermalState() : "unknown");
                 std::fprintf(stderr, "[perf] frame %llu: %.1f frames a second; %s\n[perf]   this interval: %s GPU busy %.2f\n"
                              "[perf]   %s\n[perf]   %s\n%s\n"
-                             "[perf]   VU1: %.1f M instruction pairs a second, %.0f%% compiled; %llu stale\n",
+                             "[perf]   VU1: %.1f M instruction pairs a second, %.0f%% compiled; %llu stale\n%s",
                              static_cast<unsigned long long>(frame), double(frame - last_frame) / seconds,
                              ProfileSummary().c_str(), ProfileInterval(frames).c_str(),
                              double(gpu_ns - last_gpu_ns) / 1e6 / double(frames), ps2gpu::GpuProfileReport().c_str(),
@@ -1753,7 +1764,7 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                              double(vu1.pairs() - last_pairs) / seconds / 1e6,
                              vu1.pairs() > last_pairs ? 100.0 * double(vu1.compiled_pairs() - last_compiled) /
                                                             double(vu1.pairs() - last_pairs) : 0.0,
-                             static_cast<unsigned long long>(vu1.compiled_stale()));
+                             static_cast<unsigned long long>(vu1.compiled_stale()), machine);
                 last_pairs = vu1.pairs();
                 last_compiled = vu1.compiled_pairs();
                 last_gpu_ns = gpu_ns;

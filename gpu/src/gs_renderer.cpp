@@ -15,6 +15,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -107,6 +108,10 @@ struct Texture {
 
 // What the frames' command buffers hold (RendererCounters, PS2HOST_GPU_LOG).
 std::uint64_t g_barriers = 0, g_transitions = 0, g_dispatches = 0, g_draws = 0, g_passes = 0, g_feedback = 0;
+/* Pipelines made (PipelineFor) and the time making them: on MoltenVK each
+   is a Metal pipeline compiled on the thread that asks, tens of
+   milliseconds; a race's new blend and test combinations come in bursts. */
+std::uint64_t g_pipelines = 0, g_pipeline_ns = 0;
 
 /* Why the open rendering pass ended (RendererCounters): on a tile-based GPU
    (an iPad's) each end stores the target and its depth buffer to memory and
@@ -431,8 +436,8 @@ private:
        with it test nothing), nor stencil but from the DATE setup to its
        batch. Each pass's end stores the attachments and the next one loads
        them: a race picture ends ~550, and a target's own depth buffer is
-       most of them. On by default with MoltenVK (Init); PS2GPU_TILE_HINTS=1
-       or 0 anywhere. */
+       most of them. PS2GPU_TILE=1 or PS2GPU_TILE_HINTS=1 (Init; measured
+       on an A12, they changed nothing: TileWays). */
     bool tile_hints_ = false;
     Image* stencil_live_ = nullptr;     // the depth buffer whose stencil the DATE setup just set
     /* A target's descriptor for sampling it. */
@@ -542,8 +547,8 @@ private:
         for (const Image* image : written) conflicts = conflicts || read_by_pass(image);
         work_conflicts_ = conflicts || kind == kWorkReadback || kind == kWorkOther;
     }
-    /* DEFERRED PASSES (by default with MoltenVK; PS2GPU_DEFER_PASSES=1 or 0
-       anywhere): a pass's draws
+    /* DEFERRED PASSES (PS2GPU_TILE=1 or PS2GPU_DEFER_PASSES=1; measured on
+       an A12, they changed nothing: TileWays): a pass's draws
        go into a secondary command buffer, and the pass - its begin, the
        draws, its end - into the frame's only when it ends. Work recorded
        meanwhile that does not conflict with it (Work) goes into the frame's
@@ -1062,9 +1067,8 @@ bool VulkanGsRenderer::Init(std::string* error) {
     Fill(blank_, &white);
     g_.end_pass = [this](VkCommandBuffer cmd, bool submit) { EndPass(cmd, submit ? kBreakSubmit : kBreakWork); };
     if (const char* trace = std::getenv("PS2GPU_PASS_TRACE")) trace_frame_ = std::atoll(trace);
-    // The ways for a tile-based GPU: MoltenVK's defaults (an iPad's, a Mac's);
-    // anywhere by their variables (PS2GPU_TILE, all of them) - the pictures
-    // are the same either way.
+    // The ways for a tile-based GPU, by their variables (PS2GPU_TILE, all of
+    // them) - the pictures are the same either way.
     tile_hints_ = defer_passes_ = TileWays(g_.portability);
     if (const char* hints = std::getenv("PS2GPU_TILE_HINTS")) tile_hints_ = hints[0] != '0';
     if (const char* emulate = std::getenv("PS2GPU_LOCAL_READ_EMULATE"))
@@ -1740,8 +1744,11 @@ VkPipeline VulkanGsRenderer::PipelineFor(std::uint32_t key) {
     pci.pDynamicState = &dynamic;
     pci.layout = layout_;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(g_.device, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline) != VK_SUCCESS)
-        return VK_NULL_HANDLE;
+    const auto began = std::chrono::steady_clock::now();
+    const VkResult made = vkCreateGraphicsPipelines(g_.device, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline);
+    ++g_pipelines;
+    g_pipeline_ns += std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
+    if (made != VK_SUCCESS) return VK_NULL_HANDLE;
     pipelines_[key] = pipeline;
     return pipeline;
 }
@@ -3272,14 +3279,18 @@ std::string GpuProfileReport() {
 }
 
 std::string RendererCounters() {
-    static std::uint64_t last[6] = {};
-    const std::uint64_t now[6] = {g_barriers, g_transitions, g_dispatches, g_draws, g_passes, g_feedback};
-    char text[200];
-    std::snprintf(text, sizeof text, "%llu barriers, %llu transitions, %llu dispatches, %llu draws, %llu passes, %llu feedback copies",
+    static std::uint64_t last[8] = {};
+    const std::uint64_t now[8] = {g_barriers, g_transitions, g_dispatches, g_draws, g_passes, g_feedback, g_pipelines,
+                                  g_pipeline_ns};
+    char text[260];
+    std::snprintf(text, sizeof text,
+                  "%llu barriers, %llu transitions, %llu dispatches, %llu draws, %llu passes, %llu feedback copies, "
+                  "%llu pipelines made (%.0f ms)",
                   (unsigned long long)(now[0] - last[0]), (unsigned long long)(now[1] - last[1]),
                   (unsigned long long)(now[2] - last[2]), (unsigned long long)(now[3] - last[3]),
-                  (unsigned long long)(now[4] - last[4]), (unsigned long long)(now[5] - last[5]));
-    for (int i = 0; i < 6; ++i) last[i] = now[i];
+                  (unsigned long long)(now[4] - last[4]), (unsigned long long)(now[5] - last[5]),
+                  (unsigned long long)(now[6] - last[6]), double(now[7] - last[7]) / 1e6);
+    for (int i = 0; i < 8; ++i) last[i] = now[i];
     return text;
 }
 

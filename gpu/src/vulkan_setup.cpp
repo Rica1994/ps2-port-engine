@@ -171,9 +171,16 @@ bool DeviceRequirementsFor(VkPhysicalDevice gpu, bool swapchain, DeviceRequireme
 }
 
 bool TileWays(bool portability) {
+    // Off everywhere until they pay: on an A12 iPad (MoltenVK 1.4.2, 16 Oct
+    // 2026) deferred passes and the tile hints changed nothing one could
+    // measure (the race at 15-16 pictures a second before the traffic, 8-9
+    // in it, the GPU busy ~60 ms a picture either way: another target ends
+    // most passes, and copies for a texture most of the rest), and local
+    // read drew the 3D black but for a few effects - MoltenVK reads the
+    // attachment as a texture, and what it read was not the target.
+    (void)portability;
     const char* v = std::getenv("PS2GPU_TILE");
-    if (v && *v) return *v != '0';
-    return portability;
+    return v && *v && *v != '0';
 }
 
 bool UseLocalRead(bool portability) {

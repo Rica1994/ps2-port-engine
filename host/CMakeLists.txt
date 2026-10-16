@@ -124,6 +124,9 @@ else()
     endif()
     find_package(Threads REQUIRED)
     target_link_libraries(ps2host PUBLIC Threads::Threads)
+    if(APPLE)
+        target_link_libraries(ps2host PUBLIC objc)      # platform.cpp asks NSProcessInfo the thermal state
+    endif()
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         target_link_libraries(ps2host PUBLIC ${CMAKE_DL_LIBS})
     endif()
@@ -311,18 +314,13 @@ function(ps2_ios_app target title version game_dir)
         XCODE_ATTRIBUTE_ENABLE_BITCODE "NO"
         XCODE_EMBED_FRAMEWORKS "${framework}"
         XCODE_EMBED_FRAMEWORKS_CODE_SIGN_ON_COPY ON
-        XCODE_EMBED_FRAMEWORKS_REMOVE_HEADERS_ON_COPY ON
-        # Run from Xcode as from the home screen: Xcode's own Metal API
-        # validation and frame capture layers otherwise sit under every
-        # Metal call MoltenVK makes - thousands a picture, on the thread
-        # that draws (what a run from Xcode measured was partly theirs).
-        XCODE_SCHEME_ENABLE_GPU_API_VALIDATION OFF
-        XCODE_SCHEME_ENABLE_GPU_FRAME_CAPTURE_MODE "Disabled"
-        # Run as Release, as the scheme was set by hand before: CMake writes
-        # the scheme again at every configure (Debug and its debugger
-        # otherwise; the debugger it cannot leave out - Run > Info > Debug
-        # executable, by hand).
-        XCODE_SCHEME_LAUNCH_CONFIGURATION "Release")
+        XCODE_EMBED_FRAMEWORKS_REMOVE_HEADERS_ON_COPY ON)
+    # The scheme is Xcode's own (CMAKE_XCODE_GENERATE_SCHEME is off: CMake's
+    # would be written again at each configure, over the run's environment
+    # set in Xcode), so its run settings are set in Xcode, once - docs/IOS.md:
+    # Release, no debugger, and above all no Metal API validation and no GPU
+    # frame capture, which otherwise sit under every Metal call MoltenVK
+    # makes, thousands a picture, on the thread that draws.
     if(EXISTS ${game_dir}/port/ios_icon.png)
         set(catalog ${CMAKE_CURRENT_BINARY_DIR}/${target}_Assets.xcassets)
         file(MAKE_DIRECTORY ${catalog}/AppIcon.appiconset)

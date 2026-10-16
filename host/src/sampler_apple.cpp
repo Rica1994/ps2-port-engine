@@ -1,7 +1,8 @@
 /*
  * A tablet's own profiler (iOS): the threads that do the work - the EE's, the
- * GS thread, VIF1's worker - sampled a thousand times a second, and every ten
- * seconds the functions they were found in written to the log, by name. On an
+ * GS thread, VIF1's worker - sampled as often as the suspensions allow (a few
+ * hundred times a second), and every ten seconds the functions they were
+ * found in - running, or asleep in a wait - written to the log, by name. On an
  * iPad there is no terminal and Instruments may not name the port's functions;
  * the log is what comes back.
  *
@@ -52,8 +53,11 @@ struct Target {
 
 struct Sample {
     int target;
+    int state;                      // the thread's run state (TH_STATE_*) as found
     std::uint64_t pc[kDepth];
 };
+constexpr int kStates = 6;          // TH_STATE_RUNNING 1 .. TH_STATE_HALTED 5
+const char* const kStateNames[kStates] = {"?", "running", "stopped", "waiting", "uninterruptible", "halted"};
 
 std::mutex g_lock;
 std::vector<Target> g_targets;
@@ -145,14 +149,30 @@ const std::string& NameOf(std::uint64_t address) {
 
 // ---------------------------------------------------------------- sampling
 
-void Report(const std::vector<Sample>& samples, double seconds) {
+/* Every ten seconds: for each thread, how often each sample found it running,
+   waiting (asleep in the kernel: a lock, a condition, the GPU) or stopped,
+   then the functions of the running samples - self time with the caller
+   most often behind it, and the time inside each function - and where the
+   waiting samples were waiting (the wait's caller: a frame's fence, the
+   ring, Metal's compiler...). The loop runs as fast as the suspensions let
+   it (a few hundred times a second on an A12), so the shares are of its
+   loops, not of time to the millisecond. */
+void Report(const std::vector<Sample>& samples, const std::vector<std::uint64_t>& loops, double seconds) {
     std::lock_guard<std::mutex> hold(g_lock);
     for (int t = 0; t < int(g_targets.size()); ++t) {
-        std::map<std::string, std::uint64_t> self, total;
+        std::map<std::string, std::uint64_t> self, total, waits;
         std::map<std::string, std::map<std::string, std::uint64_t>> callers;
-        std::uint64_t count = 0;
+        std::uint64_t count = 0, states[kStates] = {}, found = 0;
         for (const Sample& s : samples) {
             if (s.target != t || !s.pc[0]) continue;
+            ++found;
+            ++states[s.state >= 0 && s.state < kStates ? s.state : 0];
+            if (s.state != TH_STATE_RUNNING) {
+                // Asleep: where (the trap and what called it).
+                ++waits[NameOf(s.pc[0]) + (s.pc[1] ? "  <- " + NameOf(s.pc[1] - 4) : std::string()) +
+                        (s.pc[2] ? "  <- " + NameOf(s.pc[2] - 4) : std::string())];
+                continue;
+            }
             ++count;
             const std::string& leaf = NameOf(s.pc[0]);
             ++self[leaf];
@@ -165,16 +185,25 @@ void Report(const std::vector<Sample>& samples, double seconds) {
                 ++total[fn];
             }
         }
-        if (!count) continue;
+        if (!found) continue;
         auto ranked = [](const std::map<std::string, std::uint64_t>& m) {
             std::vector<std::pair<std::uint64_t, std::string>> v;
             for (const auto& [k, n] : m) v.push_back({n, k});
             std::sort(v.rbegin(), v.rend());
             return v;
         };
-        std::fprintf(stderr, "[sample] %s thread: %llu samples in %.0f s (%.0f%% of the time running)\n",
-                     g_targets[t].name.c_str(), static_cast<unsigned long long>(count), seconds,
-                     100.0 * double(count) / (seconds * 1000.0));
+        const std::uint64_t loop_count = t < int(loops.size()) && loops[t] ? loops[t] : found;
+        std::string shares;
+        for (int i = 1; i < kStates; ++i) {
+            if (!states[i]) continue;
+            char text[48];
+            std::snprintf(text, sizeof text, "%s%s %.0f%%", shares.empty() ? "" : ", ", kStateNames[i],
+                          100.0 * double(states[i]) / double(loop_count));
+            shares += text;
+        }
+        std::fprintf(stderr, "[sample] %s thread: %llu samples in %.0f s (%llu a second): %s\n",
+                     g_targets[t].name.c_str(), static_cast<unsigned long long>(found), seconds,
+                     static_cast<unsigned long long>(double(loop_count) / seconds), shares.c_str());
         const auto by_self = ranked(self);
         for (int i = 0; i < 18 && i < int(by_self.size()); ++i) {
             const auto by_caller = ranked(callers[by_self[i].second]);
@@ -186,6 +215,11 @@ void Report(const std::vector<Sample>& samples, double seconds) {
         for (int i = 0; i < 18 && i < int(by_total.size()); ++i)
             std::fprintf(stderr, "[sample]   in   %5.1f%%  %s\n", 100.0 * double(by_total[i].first) / double(count),
                          by_total[i].second.c_str());
+        const auto by_wait = ranked(waits);
+        const std::uint64_t waited = found - count;
+        for (int i = 0; i < 8 && i < int(by_wait.size()); ++i)
+            std::fprintf(stderr, "[sample]   asleep %5.1f%%  %s\n", 100.0 * double(by_wait[i].first) / double(waited),
+                         by_wait[i].second.c_str());
     }
     std::fflush(stderr);
 }
@@ -193,6 +227,7 @@ void Report(const std::vector<Sample>& samples, double seconds) {
 void SamplerLoop() {
     std::vector<Sample> samples;
     samples.reserve(1 << 16);
+    std::vector<std::uint64_t> loops;         // a target: how many times it was looked at
     auto last = std::chrono::steady_clock::now();
     for (;;) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -201,13 +236,20 @@ void SamplerLoop() {
             std::lock_guard<std::mutex> hold(g_lock);
             targets = g_targets;
         }
+        if (loops.size() < targets.size()) loops.resize(targets.size(), 0);
         for (int t = 0; t < int(targets.size()); ++t) {
-            Sample s{t, {}};
+            Sample s{t, 0, {}};
             const Target& target = targets[t];
+            // The thread's state before it is stopped: stopping it would say
+            // "stopped" of a running one.
+            thread_basic_info_data_t basic{};
+            mach_msg_type_number_t bn = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(target.port, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&basic), &bn) == KERN_SUCCESS)
+                s.state = basic.run_state;
+            ++loops[t];
             if (thread_suspend(target.port) != KERN_SUCCESS) continue;
             arm_thread_state64_t state{};
             mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
-            bool running = false;
             if (thread_get_state(target.port, ARM_THREAD_STATE64, reinterpret_cast<thread_state_t>(&state), &n) ==
                 KERN_SUCCESS) {
                 s.pc[0] = arm_thread_state64_get_pc(state) & kAddressMask;
@@ -225,21 +267,16 @@ void SamplerLoop() {
                     if (next <= fp) break;
                     fp = next;
                 }
-                // A thread asleep in the kernel is not where the time goes.
-                thread_basic_info_data_t basic{};
-                mach_msg_type_number_t bn = THREAD_BASIC_INFO_COUNT;
-                if (thread_info(target.port, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&basic), &bn) ==
-                    KERN_SUCCESS)
-                    running = basic.run_state == TH_STATE_RUNNING;
             }
             thread_resume(target.port);
-            if (running) samples.push_back(s);
+            samples.push_back(s);
         }
         const auto now = std::chrono::steady_clock::now();
         const double seconds = std::chrono::duration<double>(now - last).count();
         if (seconds >= 10.0) {
-            Report(samples, seconds);
+            Report(samples, loops, seconds);
             samples.clear();
+            std::fill(loops.begin(), loops.end(), 0);
             last = std::chrono::steady_clock::now();
         }
     }

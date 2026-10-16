@@ -72,6 +72,15 @@ std::filesystem::path UserDirectory();
 /* A message to the player, in a box (there is no terminal to read). */
 void ShowMessage(const std::string& title, const std::string& text, bool error);
 
+/* ---- The machine's state, for a tablet's log ------------------------- */
+/* The process's memory footprint, and - on iOS - what the system still
+   allows it before ending it for memory; in MB, 0 where unknown. */
+void MemoryUse(std::uint64_t* footprint_mb, std::uint64_t* available_mb);
+/* The device's thermal state as the system tells it (Apple's: nominal, fair,
+   serious, critical - the last two slow the cores and the GPU); "" where
+   there is none to tell. */
+const char* ThermalState();
+
 /* Whether this is a phone or tablet build: no files beside the executable,
    one window filling the screen, touch. */
 constexpr bool kMobile =

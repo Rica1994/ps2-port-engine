@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -39,8 +40,15 @@
 #endif
 
 #ifdef __APPLE__
+#include <TargetConditionals.h>
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include <pthread/qos.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>
+#endif
 #endif
 
 #ifdef PS2HOST_VULKAN
@@ -326,6 +334,50 @@ void WakeValue(std::atomic<std::uint32_t>* value) {
     (void)value;
     { std::lock_guard<std::mutex> hold(WaitLock()); }   // a waiter between its check and its wait sees it
     WaitCondition().notify_all();
+#endif
+}
+
+/* ======================================================================== */
+/* The machine's state                                                       */
+/* ======================================================================== */
+
+void MemoryUse(std::uint64_t* footprint_mb, std::uint64_t* available_mb) {
+    *footprint_mb = *available_mb = 0;
+#ifdef __APPLE__
+    // The footprint is what iOS counts against the app (its own pages, the
+    // GPU's for its images and buffers): the number the Xcode gauge shows.
+    task_vm_info_data_t info{};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS)
+        *footprint_mb = info.phys_footprint >> 20;
+#if TARGET_OS_IPHONE
+    *available_mb = std::uint64_t(os_proc_available_memory()) >> 20;    // before iOS ends the app for memory
+#endif
+#elif defined(__linux__) || defined(__ANDROID__)
+    if (std::FILE* f = std::fopen("/proc/self/statm", "r")) {
+        unsigned long long size = 0, resident = 0;
+        if (std::fscanf(f, "%llu %llu", &size, &resident) == 2)
+            *footprint_mb = resident * std::uint64_t(sysconf(_SC_PAGESIZE)) >> 20;
+        std::fclose(f);
+    }
+#endif
+}
+
+const char* ThermalState() {
+#ifdef __APPLE__
+    // [[NSProcessInfo processInfo] thermalState], through the Objective-C
+    // runtime (this file is C++).
+    Class process_info = objc_getClass("NSProcessInfo");
+    if (!process_info) return "";
+    using IdCall = id (*)(id, SEL);
+    using LongCall = long (*)(id, SEL);
+    id info = reinterpret_cast<IdCall>(objc_msgSend)(reinterpret_cast<id>(process_info), sel_registerName("processInfo"));
+    if (!info) return "";
+    const long state = reinterpret_cast<LongCall>(objc_msgSend)(info, sel_registerName("thermalState"));
+    static const char* const kNames[] = {"nominal", "fair", "serious", "critical"};
+    return state >= 0 && state < 4 ? kNames[state] : "?";
+#else
+    return "";
 #endif
 }
 

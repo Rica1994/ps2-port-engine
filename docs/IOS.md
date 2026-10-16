@@ -60,8 +60,14 @@ missing, downloads MoltenVK's iOS framework from its releases, and writes
 
 1. Open the project in Xcode, choose the **burnout3** scheme and your iPad
    (connected by cable, or on the same network once paired), and use
-   **Product > Run**. For full speed, first set **Product > Scheme > Edit
-   Scheme > Run > Build Configuration** to **Release**.
+   **Product > Run**. For full speed, first set the scheme's run settings,
+   once (**Product > Scheme > Edit Scheme > Run**; the scheme is Xcode's own,
+   `cmake` leaves it alone): **Info > Build Configuration** to **Release**
+   and **Debug executable** off; **Diagnostics > Metal API Validation** off;
+   **Options > GPU Frame Capture** to **Disabled**. The two Metal layers
+   otherwise sit under every Metal call MoltenVK makes - thousands a
+   picture, on the thread that draws - and a run with them on measures them
+   as much as the game (a third of that thread's time in a race).
 2. The first time, the iPad refuses an app from an unknown developer: allow it
    in **Settings > General > VPN & Device Management**.
 3. The app says it needs the disc image. In the **Files** app, go to **On My
@@ -71,6 +77,20 @@ missing, downloads MoltenVK's iOS framework from its releases, and writes
 
 The saves (`memcard/`), the settings (`pc_settings.ini`) and the log of the
 last run (`burnout3.log`, for a bug report) are in the same folder.
+
+### A benchmark from Xcode
+
+With `PS2HOST_SCRIPT` in the scheme's **Arguments > Environment Variables**
+(the line of a `port/runs/*.args` file, say `race.args`'s), the app plays
+that scripted run by itself on the iPad's own disc image - the same frames
+every time - and quits at its end; its log is its own (`burnout3-<date>-
+<time>.log`, beside `burnout3.log`), with a `[perf]` block every five seconds:
+pictures a second, each thread's time by section, the GPU's busy time, the
+renderer's counts, memory and the thermal state, and every ten seconds where
+the GS thread was found (`[sample]`). Untick the variable to play again.
+Other variables read there: `PS2GPU_TILE=1` (the tile-based GPU's ways,
+`gpu/src/gpu_internal.h`), MoltenVK's own (`MVK_CONFIG_*`), and the host's
+(`docs/PORTING.md`).
 
 ## Touch controls
 
