@@ -1578,6 +1578,36 @@ void Rescale(Bridge& b, u32 scale) {
     std::fprintf(stderr, "[gpu] internal resolution: %ux\n", unsigned(scale));
 }
 
+/* The game's pictures a second in the window's corner, once a second - a
+   tablet's by default (PS2HOST_FPS=0 hides it, =1 shows it on a PC). A
+   picture is a new frame buffer shown: the game flips between two, drawing a
+   picture every other blank or slower, while the window is presented each
+   blank. Not over the PC settings' menu, which uses the same overlay. */
+void ShowPictureRate() {
+    static const bool shown = [] {
+        const char* v = std::getenv("PS2HOST_FPS");
+        if (v && *v) return *v != '0';
+        return platform::kMobile;
+    }();
+    if (!shown) return;
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point since = Clock::now();
+    static u32 last_fbp = ~0u;
+    static unsigned pictures = 0;
+    u32 fbp = 0, fbw = 0, psm = 0;
+    if (gs::TheGs().Displayed(&fbp, &fbw, &psm) && fbp != last_fbp) {
+        last_fbp = fbp;
+        ++pictures;
+    }
+    const double seconds = std::chrono::duration<double>(Clock::now() - since).count();
+    if (seconds < 1.0) return;
+    char text[32];
+    std::snprintf(text, sizeof text, "%.0f FPS", double(pictures) / seconds);
+    pictures = 0;
+    since = Clock::now();
+    if (!PcMenuOpen()) SetWindowOverlay({text});
+}
+
 void PresentGpuPicture(ps2gpu::Display& display, u64 due_ns) {
     u32 fbp = 0, fbw = 0, psm = 0;
     if (g_bridge && gs::TheGs().Displayed(&fbp, &fbw, &psm)) {
@@ -1694,6 +1724,7 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
             if (ps2gpu::Display* display = WindowDisplay()) {
                 const bool pace = !VirtualClock() && SettingOn("frame_pacing", true);    // (PC SETTINGS)
                 PresentGpuPicture(*display, pace ? FrameDue(frame) : 0);
+                ShowPictureRate();
             }
         });
     }
