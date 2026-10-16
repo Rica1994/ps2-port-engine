@@ -7,6 +7,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -15,6 +16,7 @@
 #include <set>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "ps2host/disc.h"
 #include "ps2host/gs.h"
@@ -290,7 +292,85 @@ void Note(const std::string& key, const std::string& text) {
     }
 }
 
+namespace {
+
+/* PS2HOST_SKIP="0xA,0xB": the game's functions at those addresses do
+   nothing (they return 0) - to find which of a frame's drawing functions
+   draws what, and what it costs. PS2HOST_SKIP_CYCLE="0xT:0xA,0xB,...": from
+   the first call of the function at T, each of the others skipped in turn
+   for PS2HOST_SKIP_SECONDS (10) seconds, then none; the log says which
+   ("[skip]"), so the [perf] blocks between tell what each one cost. */
+struct Skips {
+    bool any = false;
+    std::set<u32> fixed;
+    u32 trigger = 0;
+    std::vector<u32> cycle;
+    std::size_t at = 0;                     // cycle[at - 1] is skipped; 0 before the trigger
+    double seconds = 10.0;
+    std::chrono::steady_clock::time_point since;
+    u32 now = 0;                            // the cycle's function skipped now
+};
+
+std::vector<u32> HexList(const char* text) {
+    std::vector<u32> out;
+    for (const char* p = text; *p;) {
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(p, &end, 16);
+        if (end == p) { ++p; continue; }
+        out.push_back(u32(v));
+        p = end;
+    }
+    return out;
+}
+
+Skips& TheSkips() {
+    static Skips skips = [] {
+        Skips s;
+        if (const char* fixed = std::getenv("PS2HOST_SKIP"))
+            for (u32 a : HexList(fixed)) s.fixed.insert(a);
+        if (const char* cycle = std::getenv("PS2HOST_SKIP_CYCLE")) {
+            const char* colon = std::strchr(cycle, ':');
+            if (colon) {
+                s.trigger = u32(std::strtoul(cycle, nullptr, 16));
+                s.cycle = HexList(colon + 1);
+            }
+        }
+        if (const char* secs = std::getenv("PS2HOST_SKIP_SECONDS")) s.seconds = std::max(1.0, std::atof(secs));
+        s.any = !s.fixed.empty() || (s.trigger && !s.cycle.empty());
+        if (s.any)
+            std::fprintf(stderr, "[skip] %zu functions skipped, %zu in turn from 0x%08X's first call, %.0f s each\n",
+                         s.fixed.size(), s.cycle.size(), unsigned(s.trigger), s.seconds);
+        return s;
+    }();
+    return skips;
+}
+
+// Whether the call to `address` is to be skipped (PS2HOST_SKIP*).
+bool Skipped(u32 address) {
+    Skips& s = TheSkips();
+    if (address == s.trigger && s.at <= s.cycle.size()) {
+        const auto t = std::chrono::steady_clock::now();
+        if (s.at == 0 || std::chrono::duration<double>(t - s.since).count() >= s.seconds) {
+            ++s.at;
+            s.since = t;
+            s.now = s.at <= s.cycle.size() ? s.cycle[s.at - 1] : 0;
+            if (s.now)
+                std::fprintf(stderr, "[skip] now skipping 0x%08X (%zu of %zu)\n", unsigned(s.now), s.at, s.cycle.size());
+            else
+                std::fprintf(stderr, "[skip] the cycle is over: nothing skipped in turn\n");
+        }
+    }
+    return address == s.now || s.fixed.count(address) != 0;
+}
+
+}  // namespace
+
 void Dispatch(lifted::Context& c, u32 address) {
+    static const bool skipping = TheSkips().any;
+    if (skipping && Skipped(address)) {
+        c.r[2] = 0;
+        return;
+    }
     CachedCall& line = g_call_cache[(address >> 2) & (kCallCache - 1)];
     if (line.address == address && line.entry && g_watch.empty()) {
         ++*line.count;
