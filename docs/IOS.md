@@ -92,6 +92,41 @@ Other variables read there: `PS2GPU_TILE=1` (the tile-based GPU's ways,
 `gpu/src/gpu_internal.h`), MoltenVK's own (`MVK_CONFIG_*`), and the host's
 (`docs/PORTING.md`).
 
+### Reports and VU programs, without carrying files (a PC and a Mac)
+
+For development with a PC (the game's code generated there, from the disc)
+and a Mac (the iPad builds), the app sends its own reports over the local
+network, and the Mac takes the PC's results with one command:
+
+1. **On the PC**, in the game repository, leave this running:
+   ```
+   python engine/tools/ipad_reports.py --game games/burnout3 --out ../ipad-reports
+   ```
+   It prints the PC's address (allow Python through the firewall, private
+   networks). Each run's log arrives in `--out` as it runs (every fifteen
+   seconds, when the app leaves the front, and at its end), named after the
+   run (`burnout3-20261016-151448-scripted.log`). `vu_programs_new.txt` - the
+   VU programs the app started, in normal play and in scripted runs - is
+   merged into `build/vu_programs.txt` and compiled ahead at once.
+2. **On the Mac**, before each build, in the game repository:
+   ```sh
+   engine/tools/ipad_update.sh --pc http://<the PC's address>:8765    # the first time; then without --pc
+   ```
+   It pulls the sources, takes the compiled VU programs from the PC when they
+   changed, and brings the Xcode project up to date - with the PC's address
+   built into the app (CMake's `PS2_REPORT_URL`). Then Run.
+3. The first run asks whether the app may use the local network: allow it.
+   `PS2HOST_REPORT=http://host:port` in the scheme overrides the address, `0`
+   turns the reports off.
+
+The logs and the programs come from your disc: they stay on your machines.
+
+### Leaving a run
+
+**Select + Start** held two seconds quits the app (its log sent first). The
+Home button or the app switcher pauses the game and stops the controller's
+rumble until the app is in front again. Xcode's Stop button ends it at once.
+
 ## Touch controls
 
 A DualShock 2 drawn over the picture, while no controller is in use:

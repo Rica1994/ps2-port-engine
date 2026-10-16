@@ -1578,12 +1578,14 @@ void Rescale(Bridge& b, u32 scale) {
     std::fprintf(stderr, "[gpu] internal resolution: %ux\n", unsigned(scale));
 }
 
-/* The game's pictures a second in the window's corner, once a second - a
-   tablet's by default (PS2HOST_FPS=0 hides it, =1 shows it on a PC). A
-   picture is a new frame buffer shown: the game flips between two, drawing a
-   picture every other blank or slower, while the window is presented each
-   blank. Not over the PC settings' menu, which uses the same overlay. */
-void ShowPictureRate() {
+/* The game's frames a second in the window's corner, once a second - a
+   tablet's by default (PS2HOST_FPS=0 hides it, =1 shows it on a PC): the
+   frames the game ended in that second, the number the log's [perf] lines
+   give. (Counting changes of the displayed frame buffer showed nothing: a
+   game may draw elsewhere and copy into one buffer it always shows.) Written
+   to the log too every ten seconds, so a run's log says what was on the
+   screen. Not over the PC settings' menu, which uses the same overlay. */
+void ShowPictureRate(u64 frame) {
     static const bool shown = [] {
         const char* v = std::getenv("PS2HOST_FPS");
         if (v && *v) return *v != '0';
@@ -1592,19 +1594,17 @@ void ShowPictureRate() {
     if (!shown) return;
     using Clock = std::chrono::steady_clock;
     static Clock::time_point since = Clock::now();
-    static u32 last_fbp = ~0u;
-    static unsigned pictures = 0;
-    u32 fbp = 0, fbw = 0, psm = 0;
-    if (gs::TheGs().Displayed(&fbp, &fbw, &psm) && fbp != last_fbp) {
-        last_fbp = fbp;
-        ++pictures;
-    }
+    static u64 since_frame = frame;
+    static int logged = 0;
     const double seconds = std::chrono::duration<double>(Clock::now() - since).count();
     if (seconds < 1.0) return;
-    char text[32];
-    std::snprintf(text, sizeof text, "%.0f FPS", double(pictures) / seconds);
-    pictures = 0;
+    const double rate = double(frame - since_frame) / seconds;
     since = Clock::now();
+    since_frame = frame;
+    char text[32];
+    std::snprintf(text, sizeof text, "%.0f FPS", rate);
+    if (++logged % 10 == 1) std::fprintf(stderr, "[fps] frame %llu: %s on the screen\n",
+                                         static_cast<unsigned long long>(frame), text);
     if (!PcMenuOpen()) SetWindowOverlay({text});
 }
 
@@ -1724,7 +1724,7 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
             if (ps2gpu::Display* display = WindowDisplay()) {
                 const bool pace = !VirtualClock() && SettingOn("frame_pacing", true);    // (PC SETTINGS)
                 PresentGpuPicture(*display, pace ? FrameDue(frame) : 0);
-                ShowPictureRate();
+                ShowPictureRate(frame);
             }
         });
     }
@@ -1801,12 +1801,20 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                 // app's pages - both look like a slow renderer in the log.
                 u64 footprint_mb = 0, available_mb = 0;
                 platform::MemoryUse(&footprint_mb, &available_mb);
-                char machine[160] = "";
+                char machine[256] = "";
+                // Whose it is: the GPU driver's (images, buffers - Metal's
+                // allocated size on a tablet), the C/C++ heap's, the texture
+                // cache's share of the GPU's.
                 if (footprint_mb || *platform::ThermalState())
-                    std::snprintf(machine, sizeof machine, "[perf]   memory: %llu MB in use, %llu MB left; thermal state %s\n",
+                    std::snprintf(machine, sizeof machine,
+                                  "[perf]   memory: %llu MB in use, %llu MB left; thermal state %s; GPU %llu MB "
+                                  "(textures %llu MB), heap %llu MB\n",
                                   static_cast<unsigned long long>(footprint_mb),
                                   static_cast<unsigned long long>(available_mb),
-                                  *platform::ThermalState() ? platform::ThermalState() : "unknown");
+                                  *platform::ThermalState() ? platform::ThermalState() : "unknown",
+                                  static_cast<unsigned long long>(ps2gpu::GpuMemoryInUse() >> 20),
+                                  static_cast<unsigned long long>(g_bridge ? g_bridge->texture_bytes >> 20 : 0),
+                                  static_cast<unsigned long long>(platform::HeapInUse() >> 20));
                 std::fprintf(stderr, "[perf] frame %llu: %.1f frames a second; %s\n[perf]   this interval: %s GPU busy %.2f\n"
                              "[perf]   %s\n[perf]   %s\n%s\n"
                              "[perf]   VU1: %.1f M instruction pairs a second, %.0f%% compiled; %llu stale\n%s",

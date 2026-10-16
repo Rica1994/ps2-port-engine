@@ -312,6 +312,10 @@ std::string RendererBreakdown(const char* prefix);
 /* The GPU's time on the frames' command buffers, in all (nanoseconds; 0
    where the GPU keeps no time). */
 std::uint64_t GpuBusyNanoseconds();
+/* What the GPU's driver holds for the app, in all heaps (bytes;
+   VK_EXT_memory_budget's heap usage - MoltenVK's is Metal's allocated size).
+   0 where the device cannot say. */
+std::uint64_t GpuMemoryInUse();
 /* PS2HOST_GPU_PROFILE: the GPU's time since the last call, by what it did. */
 std::string GpuProfileReport();
 

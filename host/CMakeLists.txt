@@ -51,7 +51,13 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/gpu_bridge.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/profile.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/sampler_apple.cpp
-    ${CMAKE_CURRENT_LIST_DIR}/src/platform.cpp)
+    ${CMAKE_CURRENT_LIST_DIR}/src/platform.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/report.cpp)
+# A tablet's reports' receiver (report.cpp; engine/tools/ipad_reports.py), as
+# "http://192.168.1.20:8765" - set by engine/tools/ipad_update.sh. Empty: none.
+set(PS2_REPORT_URL "" CACHE STRING "Where a tablet build sends its logs (engine/tools/ipad_reports.py)")
+set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/src/report.cpp PROPERTIES
+    COMPILE_DEFINITIONS "PS2HOST_REPORT_DEFAULT=\"${PS2_REPORT_URL}\"")
 # The IOP interpreter names library functions from engine/data/iop_exports.csv,
 # built in (iop_exports.inc: a line of it a string), so that the executable
 # reads nothing from where it was built.

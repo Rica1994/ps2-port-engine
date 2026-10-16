@@ -7,6 +7,7 @@
 #define PS2HOST_RUN_H
 
 #include <atomic>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <functional>
@@ -293,6 +294,14 @@ bool WindowClosed();
 void PresentFrame();
 /* The window's events alone (PresentFrame without the picture, which the GS
    thread presents): false once it has been closed. */
+/* A tablet's reports (report.cpp): the run's log (sent as `run_name`.log)
+   and the VU programs it records (`folder`/vu_programs_new.txt), sent over
+   the local network to PS2HOST_REPORT's or the build's PS2_REPORT_URL's
+   receiver every fifteen seconds, when the app leaves the front and at the
+   end. Nothing without an address. */
+void StartReports(const std::filesystem::path& log, const std::filesystem::path& folder, const std::string& run_name);
+/* What changed, sent now (the run's end). */
+void SendReportsNow();
 bool PumpWindow();
 /* Fullscreen on or off (saved as the "fullscreen" setting, settings.h, which
    the window opens with); and whether it is. */

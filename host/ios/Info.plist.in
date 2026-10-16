@@ -31,6 +31,10 @@
     <true/>
     <key>LSSupportsOpeningDocumentsInPlace</key>
     <true/>
+    <!-- A development build sends its log to the developer's PC on the same
+         network (engine/host/src/report.cpp): iOS asks the player once. -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Sends the game's log to your computer on this network, for the port's development.</string>
     <!-- One full screen, landscape, no status bar. -->
     <key>UILaunchScreen</key>
     <dict/>

@@ -3264,6 +3264,28 @@ VulkanGsRenderer::~VulkanGsRenderer() {
 
 std::uint64_t GpuBusyNanoseconds() { return g_gpu_ns.load(); }
 
+std::uint64_t GpuMemoryInUse() {
+    const VkPhysicalDevice physical = g_physical.load();
+    if (!physical || !vkGetPhysicalDeviceMemoryProperties2) return 0;
+    static const bool budget = [physical] {
+        std::uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> all(count);
+        vkEnumerateDeviceExtensionProperties(physical, nullptr, &count, all.data());
+        for (const VkExtensionProperties& e : all)
+            if (std::strcmp(e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) return true;
+        return false;
+    }();
+    if (!budget) return 0;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT used{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    props.pNext = &used;
+    vkGetPhysicalDeviceMemoryProperties2(physical, &props);
+    std::uint64_t total = 0;
+    for (std::uint32_t h = 0; h < props.memoryProperties.memoryHeapCount; ++h) total += used.heapUsage[h];
+    return total;
+}
+
 std::string GpuProfileReport() {
     static const char* const kNames[kProfKinds] = {"other", "draws", "swizzle", "image<->linear", "memory copies",
                                                    "feedback copies", "decodes", "uploads", "clears", "DATE",

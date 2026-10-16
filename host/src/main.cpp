@@ -196,22 +196,30 @@ std::vector<std::string> PlayArguments(const char* self) {
     // PS2HOST_SCRIPT="<arguments>" (set in an Xcode scheme's environment, say):
     // a scripted run - a port/runs/*.args, --virtual-time and its presses - on
     // the player's own disc and settings, with no memory card (the runs were
-    // recorded with none) and no VU programs recorded: a tablet's benchmark,
-    // its numbers in a log of its own (burnout3-20261016-093000.log), so that
-    // runs one after another can be compared.
+    // recorded with none): a tablet's benchmark, its numbers in a log of its
+    // own (burnout3-20261016-093000.log), so that runs one after another can
+    // be compared. A tablet records the VU programs it starts in either kind
+    // of run, for the next build to compile ahead.
     const char* script = std::getenv("PS2HOST_SCRIPT");
-    std::string log = stem + ".log";
-    if (script && *script) {
-        char when[32] = "scripted";
+    char when[32] = "run";
+    {
         std::tm t{};
         if (platform::LocalTime(std::time(nullptr), &t)) std::strftime(when, sizeof when, "%Y%m%d-%H%M%S", &t);
-        log = stem + "-" + when + ".log";
     }
+    std::string log = stem + ".log";
+    if (script && *script) log = stem + "-" + when + ".log";
     LogToFile(here, log);
+    // The log and the recorded programs to the developer's PC as the run goes
+    // (report.cpp), each run's log under its own name there.
+    ps2host::StartReports(here / log, here, stem + "-" + when + (script && *script ? "-scripted" : ""));
     std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
     if (script && *script) {
         std::vector<std::string> args = {self ? self : "port", "--disc", disc, "--window", "--gpu", "--audio",
                                          "--timeout", "315360000", "--frame-times", "300"};
+        if (platform::kMobile) {
+            args.push_back("--vu-record");
+            args.push_back((here / "vu_programs_new.txt").string());
+        }
         std::string word;
         for (const char* c = script;; ++c) {
             if (*c && !std::isspace(static_cast<unsigned char>(*c))) {

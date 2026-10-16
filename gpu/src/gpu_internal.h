@@ -65,6 +65,8 @@ inline GpuWaitObserver g_wait_observer = nullptr;      // SetGpuWaitObserver
 /* The GPU's time on the command buffers handed over, in all (timestamps at
    each one's start and end; GpuBusyNanoseconds). */
 inline std::atomic<std::uint64_t> g_gpu_ns{0};
+/* The physical device the renderer draws on (GpuMemoryInUse). */
+inline std::atomic<VkPhysicalDevice> g_physical{VK_NULL_HANDLE};
 /* PS2HOST_GPU_PROFILE: the GPU's time by what it did (GpuProfileReport). */
 enum ProfileKind { kProfOther, kProfDraw, kProfSwizzle, kProfLinear, kProfMemory, kProfFeedback, kProfDecode,
                    kProfUpload, kProfClear, kProfDate, kProfReadback, kProfKinds };

@@ -63,6 +63,7 @@ bool VulkanGpu::Init(std::string* error) {
             if (score > best) {
                 best = score;
                 gpu = candidate;
+                g_physical = candidate;
                 family = f;
             }
             break;
@@ -161,6 +162,7 @@ bool VulkanGpu::InitShared(VkInstance shared_instance, VkPhysicalDevice shared_g
     owns_device = false;
     instance = shared_instance;
     gpu = shared_gpu;
+    g_physical = shared_gpu;
     device = shared_device;
     family = shared_family;
     queue = shared_queue;

@@ -1567,13 +1567,36 @@ bool VulkanDisplay::Pump() {
             rumble_renewed_ = now;
         }
     }
+    // Select + Start held two seconds: the app quits (the log and the reports
+    // written) - on a tablet, where a slow game is hard to leave otherwise.
+    if (gamepad_) {
+        static std::uint64_t held_since = 0;
+        const std::uint64_t now = SDL_GetTicks();
+        if (SDL_GetGamepadButton(gamepad_, SDL_GAMEPAD_BUTTON_BACK) &&
+            SDL_GetGamepadButton(gamepad_, SDL_GAMEPAD_BUTTON_START)) {
+            if (!held_since) held_since = now;
+            if (now - held_since >= 2000 && !closed_) {
+                std::fprintf(stderr, "[window] Select + Start held: quitting\n");
+                SDL_RumbleGamepad(gamepad_, 0, 0, 0);
+                closed_ = true;
+            }
+        } else {
+            held_since = 0;
+        }
+    }
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) closed_ = true;
-        if (e.type == SDL_EVENT_DID_ENTER_BACKGROUND) {
-            // A phone's or tablet's app in the background may not use the GPU
-            // (iOS stops it, or the app): the game waits here - its thread is
-            // the one pumping - until it is in front again.
+        if (e.type == SDL_EVENT_WILL_ENTER_BACKGROUND || e.type == SDL_EVENT_DID_ENTER_BACKGROUND) {
+            // A phone's or tablet's app leaving the front (the Home button,
+            // the app switcher, Control Centre - SDL's "will enter the
+            // background" is iOS's "resign active") may not use the GPU and
+            // must not play on unattended: the game waits here - its thread
+            // is the one pumping - until it is in front again. The motors stop
+            // first: a controller's rumble otherwise went on while the app was
+            // away (iOS's haptics server cut off mid-effect).
+            if (gamepad_) SDL_RumbleGamepad(gamepad_, 0, 0, 0);
+            rumble_sent_ = 0;
             std::fprintf(stderr, "[window] in the background: paused\n");
             SDL_Event wait;
             while (SDL_WaitEvent(&wait)) {

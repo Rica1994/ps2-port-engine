@@ -43,6 +43,7 @@
 #include <TargetConditionals.h>
 #include <mach-o/dyld.h>
 #include <mach/mach.h>
+#include <malloc/malloc.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <pthread/qos.h>
@@ -360,6 +361,16 @@ void MemoryUse(std::uint64_t* footprint_mb, std::uint64_t* available_mb) {
             *footprint_mb = resident * std::uint64_t(sysconf(_SC_PAGESIZE)) >> 20;
         std::fclose(f);
     }
+#endif
+}
+
+std::uint64_t HeapInUse() {
+#ifdef __APPLE__
+    malloc_statistics_t stats{};
+    malloc_zone_statistics(nullptr, &stats);        // all zones
+    return stats.size_in_use;
+#else
+    return 0;
 #endif
 }
 
