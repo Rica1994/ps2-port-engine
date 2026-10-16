@@ -704,10 +704,12 @@ private:
     /* Released textures by size (width << 32 | height), image, memory, view and
        descriptor sets whole, for the next texture of that size: a race releases
        and makes textures by the hundred a frame, and each made one was a driver
-       allocation and each released one a free. At most kPooledTextures kept. */
+       allocation and each released one a free. At most pool_limit_ kept:
+       1,024, or 128 on Apple's GPUs (MoltenVK) - an iPad's memory is the
+       app's and the system's together, and a pooled image is still memory. */
     std::unordered_map<std::uint64_t, std::vector<Texture>> texture_pool_;
     std::size_t pooled_textures_ = 0;
-    static constexpr std::size_t kPooledTextures = 1024;
+    std::size_t pool_limit_ = 1024;
     void* Staging(VkDeviceSize bytes, VkBuffer* buffer, VkDeviceSize* offset);
     void* RingAlloc(VertexRing* rings, VkBufferUsageFlags usage, VkDeviceSize bytes, VkBuffer* buffer,
                     VkDeviceSize* offset);
@@ -1070,6 +1072,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
     // The ways for a tile-based GPU, by their variables (PS2GPU_TILE, all of
     // them) - the pictures are the same either way.
     tile_hints_ = defer_passes_ = TileWays(g_.portability);
+    if (g_.portability) pool_limit_ = 128;
     if (const char* hints = std::getenv("PS2GPU_TILE_HINTS")) tile_hints_ = hints[0] != '0';
     if (const char* emulate = std::getenv("PS2GPU_LOCAL_READ_EMULATE"))
         emulate_tbdr_ = emulate[0] && emulate[0] != '0' && !g_.local_read;
@@ -2220,7 +2223,7 @@ void VulkanGsRenderer::ReleaseTexture(std::uint64_t key) {
     texture.replacement = 0;
     // Recorded draws may still sample it: it goes after they have run - into
     // the pool, or away.
-    if (texture.image.image && pooled_textures_ < kPooledTextures) {
+    if (texture.image.image && pooled_textures_ < pool_limit_) {
         ++pooled_textures_;
         g_.AfterSubmit([this, texture] {
             texture_pool_[std::uint64_t(texture.image.width) << 32 | texture.image.height].push_back(texture);

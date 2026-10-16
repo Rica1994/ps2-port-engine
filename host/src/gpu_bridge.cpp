@@ -185,6 +185,7 @@ struct Cached {
     std::vector<const Owned*> over;
     std::size_t owned_seen = 0;
     std::list<u64>::iterator lru;
+    u64 bytes = 0;                  // its decoded image's memory, about (all levels, RGBA)
 };
 
 struct Bridge {
@@ -215,6 +216,7 @@ struct Bridge {
     std::map<std::tuple<u32, u32, u32, bool>, Owned> owned;
     std::unordered_map<u64, Cached> textures;
     std::list<u64> texture_lru;     // most recent first
+    u64 texture_bytes = 0;          // the cached textures' decoded images, about (Cached::bytes)
     // The textures over each page (32 blocks) of local memory, for what a
     // write there invalidates: scanning all 2,048 on every write was 3% of a
     // race. Elements of `textures` stay put until erased.
@@ -234,6 +236,7 @@ struct Bridge {
         }
     }
     u64 next_texture = 1;
+    u64 evictions = 0;              // textures put out of the cache for room
     u64 serial = 0;                 // counts GPU draws, so a texture knows if one went over it
     // Bumped when an image starts holding drawing memory lacks, or reaches
     // further: until then, an image Use has checked against the others needs
@@ -894,6 +897,13 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
                                                                                     PixelBits(psm) / 8 / 256 + 32)));
         }
         b.IndexTexture(&t, true);
+        // Its image's memory: RGBA texels, a third more for the levels, in
+        // pieces of a power of two no smaller than 64 KB (the renderer's).
+        u64 texels = u64(tw) * th * 4;
+        if (mips.count > 1) texels += texels / 3;
+        t.bytes = 64 << 10;
+        while (t.bytes < texels) t.bytes <<= 1;
+        b.texture_bytes += t.bytes;
     } else {
         b.texture_lru.splice(b.texture_lru.begin(), b.texture_lru, t.lru);
     }
@@ -1032,13 +1042,24 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
     }
     const u64 renderer_key = t.renderer_key;
     // Keep the cache bounded: the least recently used go (4,096: a race keeps
-    // over 2,048 about, and each one evicted came back decoded again).
-    while (b.textures.size() > 4096) {
+    // over 2,048 about, and each one evicted came back decoded again) - and
+    // on a tablet by their memory too (PS2HOST_TEXTURE_MB, 320 MB): an A12
+    // iPad's race kept ~3,300, a gigabyte, and left the app ~100 MB short of
+    // being ended; iOS compressed its pages meanwhile and the threads spent a
+    // third of their time faulting them back - pictures stopped for a minute.
+    static const u64 budget = [] {
+        const char* mb = std::getenv("PS2HOST_TEXTURE_MB");
+        if (mb && *mb) return u64(std::strtoull(mb, nullptr, 10)) << 20;
+        return platform::kMobile ? u64(320) << 20 : u64(0);
+    }();
+    while (b.texture_lru.size() > 1 && (b.textures.size() > 4096 || (budget && b.texture_bytes > budget))) {
         const u64 old = b.texture_lru.back();
         b.texture_lru.pop_back();
         auto found = b.textures.find(old);
         if (found != b.textures.end()) {
             ++g_mutations;
+            ++b.evictions;
+            b.texture_bytes -= std::min(b.texture_bytes, found->second.bytes);
             b.renderer->ReleaseTexture(found->second.renderer_key);
             b.IndexTexture(&found->second, false);
             b.textures.erase(found);
@@ -1725,10 +1746,11 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
             s.renderer->Kick();
         }
         if (frame % 100 == 0)
-            std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads, %llu decodes, %zu images, %zu textures\n",
+            std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads, %llu decodes, %zu images, %zu textures (%llu MB, %llu evicted)\n",
                          static_cast<unsigned long long>(frame), static_cast<unsigned long long>(s.serial),
                          static_cast<unsigned long long>(s.write_backs), static_cast<unsigned long long>(s.reloads),
-                         static_cast<unsigned long long>(s.decodes), s.owned.size(), s.textures.size());
+                         static_cast<unsigned long long>(s.decodes), s.owned.size(), s.textures.size(),
+                         static_cast<unsigned long long>(s.texture_bytes >> 20), static_cast<unsigned long long>(s.evictions));
         // PS2HOST_PERF=1: a tablet's report on any machine.
         static const bool perf_report = platform::kMobile || std::getenv("PS2HOST_PERF") != nullptr;
         if (perf_report) {
