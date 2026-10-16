@@ -376,7 +376,8 @@ bool Skipped(u32 address) {
             s.heap_at_start = platform::HeapInUse();
             s.heap_seen = t;
             if (s.now)
-                std::fprintf(stderr, "[skip] now skipping 0x%08X (%zu of %zu)\n", unsigned(s.now), s.at, s.cycle.size());
+                std::fprintf(stderr, "[skip] now skipping 0x%08X (%zu of %zu) at frame %llu\n", unsigned(s.now), s.at,
+                             s.cycle.size(), static_cast<unsigned long long>(LastFrame()));
             else
                 std::fprintf(stderr, "[skip] the cycle is over: nothing skipped in turn\n");
         }

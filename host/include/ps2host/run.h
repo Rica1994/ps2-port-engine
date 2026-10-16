@@ -294,6 +294,8 @@ bool WindowClosed();
 void PresentFrame();
 /* The window's events alone (PresentFrame without the picture, which the GS
    thread presents): false once it has been closed. */
+/* The last frame (vertical blank) the run ended. */
+u64 LastFrame();
 /* Frame skipping (a port's): a frame's drawing was left out. For a second
    after, the window shows a frame only when the GPU drew in it - a frame
    whose drawing was left out keeps the last picture, not a frame buffer

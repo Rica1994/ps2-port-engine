@@ -531,7 +531,12 @@ void FinishCapture(u64 frame) {
 
 void RequestCapture() { g_capture_request = true; }
 
+std::atomic<u64> g_last_frame{0};
+
+u64 LastFrame() { return g_last_frame.load(std::memory_order_relaxed); }
+
 void FrameDone(u64 frame) {
+    g_last_frame.store(frame, std::memory_order_relaxed);
     FrameTimes(frame);
     timeline::Frame(frame);
     SampleFrame(frame);
