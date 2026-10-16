@@ -309,6 +309,11 @@ struct Skips {
     double seconds = 10.0;
     std::chrono::steady_clock::time_point since;
     u32 now = 0;                            // the cycle's function skipped now
+    // The heap when `now` began, looked at twice a second: a function the
+    // game cannot do without (its packets then grow without end - 500 MB in
+    // seconds on an iPad, which iOS ends the app for) is given up at once.
+    std::uint64_t heap_at_start = 0;
+    std::chrono::steady_clock::time_point heap_seen;
 };
 
 std::vector<u32> HexList(const char* text) {
@@ -350,10 +355,22 @@ bool Skipped(u32 address) {
     Skips& s = TheSkips();
     if (address == s.trigger && s.at <= s.cycle.size()) {
         const auto t = std::chrono::steady_clock::now();
-        if (s.at == 0 || std::chrono::duration<double>(t - s.since).count() >= s.seconds) {
+        bool runaway = false;
+        if (s.now && std::chrono::duration<double>(t - s.heap_seen).count() >= 0.5) {
+            s.heap_seen = t;
+            const std::uint64_t heap = platform::HeapInUse();
+            if (heap > s.heap_at_start + (std::uint64_t(150) << 20)) {
+                runaway = true;
+                std::fprintf(stderr, "[skip] 0x%08X given up: the heap grew %llu MB with it skipped\n",
+                             unsigned(s.now), static_cast<unsigned long long>((heap - s.heap_at_start) >> 20));
+            }
+        }
+        if (s.at == 0 || runaway || std::chrono::duration<double>(t - s.since).count() >= s.seconds) {
             ++s.at;
             s.since = t;
             s.now = s.at <= s.cycle.size() ? s.cycle[s.at - 1] : 0;
+            s.heap_at_start = platform::HeapInUse();
+            s.heap_seen = t;
             if (s.now)
                 std::fprintf(stderr, "[skip] now skipping 0x%08X (%zu of %zu)\n", unsigned(s.now), s.at, s.cycle.size());
             else
