@@ -152,6 +152,9 @@ std::uint64_t g_batches = 0, g_blend_batches = 0, g_date_batches = 0;
 // before those that read what their pass had drawn (each a Metal pass's end).
 std::uint64_t g_local_reads = 0, g_local_barriers = 0;
 std::uint64_t g_pass_pixels = 0;                   // the render areas of the passes begun, in all
+// Reordered passes: passes set aside for a batch into another target, and of
+// them those taken up again (each one a pass's end and begin the less).
+std::uint64_t g_set_aside = 0, g_taken_up = 0;
 
 void Transition(VkCommandBuffer cmd, Image& t, VkImageLayout to, VkAccessFlags dst_access,
                 VkPipelineStageFlags dst_stage) {
@@ -530,6 +533,8 @@ private:
        whether it had to come after the open pass. */
     WorkKind work_ = kWorkOther;
     bool work_conflicts_ = true;
+    std::vector<const Image*> work_touched_;        // (Work's, for the passes set aside)
+    bool work_writes_clut_ = false;
     /* Before recording work: its kind; the images it reads or writes, and
        of those the ones it writes; whether it writes the CLUT. It conflicts
        with the open pass if it touches its target or depth buffer, or an
@@ -538,6 +543,8 @@ private:
     void Work(WorkKind kind, std::initializer_list<const Image*> touched = {},
               std::initializer_list<const Image*> written = {}, bool writes_clut = false) {
         work_ = kind;
+        work_touched_.assign(touched.begin(), touched.end());
+        work_writes_clut_ = writes_clut;
         bool conflicts = writes_clut && pass_reads_clut_;
         auto read_by_pass = [&](const Image* image) {
             return std::find(pass_reads_.begin(), pass_reads_.end(), image) != pass_reads_.end();
@@ -573,6 +580,21 @@ private:
         const bool conflicts = work_conflicts_;
         work_ = kWorkOther;
         work_conflicts_ = true;
+        // The passes set aside (reordered): all of them go before a
+        // submission, a read-back or work not described; before other work,
+        // those it touches.
+        if (!parked_.empty() && (why == kBreakWork || why == kBreakSubmit)) {
+            const bool all = why == kBreakSubmit || work == kWorkReadback || work == kWorkOther;
+            for (std::size_t i = 0; i < parked_.size();) {
+                if (all || Meets(parked_[i], work_touched_.data(), work_touched_.size(), nullptr, 0,
+                                 work_writes_clut_))
+                    EmitParked(cmd, i, why, work);
+                else
+                    ++i;
+            }
+        }
+        work_touched_.clear();
+        work_writes_clut_ = false;
         if (!open_target_) return;
         if (why == kBreakWork && !conflicts && defer_passes_) {
             ++g_work_hoisted[work];                 // recorded before the pass, which goes on
@@ -588,22 +610,7 @@ private:
                          kBreakNames[why], why == kBreakWork ? " - " : "", why == kBreakWork ? kWorkNames[work] : "",
                          why == kBreakWork && !conflicts ? " (could go before the pass)" : "");
         if (defer_passes_) {
-            vkEndCommandBuffer(pass_cmd_);
-            VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-            ri.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
-            const std::int32_t x0 = std::min(pass_area_[0], pass_area_[2]), y0 = std::min(pass_area_[1], pass_area_[3]);
-            ri.renderArea = {{x0, y0},
-                             {std::uint32_t(std::max(1, pass_area_[2] - x0)), std::uint32_t(std::max(1, pass_area_[3] - y0))}};
-            ri.layerCount = 1;
-            ri.colorAttachmentCount = 1;
-            ri.pColorAttachments = &pass_colour_;
-            ri.pDepthAttachment = &pass_depth_;
-            ri.pStencilAttachment = &pass_stencil_;
-            g_pass_pixels += std::uint64_t(ri.renderArea.extent.width) * ri.renderArea.extent.height;
-            vkCmdBeginRendering(cmd, &ri);
-            vkCmdExecuteCommands(cmd, 1, &pass_cmd_);
-            vkCmdEndRendering(cmd);
-            g_.Mark(cmd, kProfDraw);
+            EmitPass(cmd, pass_cmd_, pass_colour_, pass_depth_, pass_stencil_, pass_area_);
             pass_cmd_ = VK_NULL_HANDLE;
         } else {
             vkCmdEndRendering(cmd);
@@ -611,6 +618,27 @@ private:
         open_target_ = open_depth_ = nullptr;
         pass_reads_.clear();
         pass_reads_clut_ = false;
+    }
+    /* A deferred pass into the frame's command buffer: its begin, its draws
+       (the secondary command buffer), its end. */
+    void EmitPass(VkCommandBuffer cmd, VkCommandBuffer pass, const VkRenderingAttachmentInfo& colour,
+                  const VkRenderingAttachmentInfo& z, const VkRenderingAttachmentInfo& stencil,
+                  const std::int32_t area[4]) {
+        vkEndCommandBuffer(pass);
+        VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        ri.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+        const std::int32_t x0 = std::min(area[0], area[2]), y0 = std::min(area[1], area[3]);
+        ri.renderArea = {{x0, y0}, {std::uint32_t(std::max(1, area[2] - x0)), std::uint32_t(std::max(1, area[3] - y0))}};
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &colour;
+        ri.pDepthAttachment = &z;
+        ri.pStencilAttachment = &stencil;
+        g_pass_pixels += std::uint64_t(ri.renderArea.extent.width) * ri.renderArea.extent.height;
+        vkCmdBeginRendering(cmd, &ri);
+        vkCmdExecuteCommands(cmd, 1, &pass);
+        vkCmdEndRendering(cmd);
+        g_.Mark(cmd, kProfDraw);
     }
     /* PS2GPU_PASS_TRACE=N: each pass of the N-th frame (Kick) on stderr -
        what it drew into, how many batches, and what ended it. */
@@ -748,6 +776,118 @@ private:
         float size[2] = {-1, -1};
         VkBuffer vertices = VK_NULL_HANDLE;
     } drawn_;
+    /* REORDERED PASSES (PS2GPU_REORDER=1): a
+       deferred pass that a batch into another target would end is set aside
+       instead - its draws stay in their secondary command buffer - and is
+       taken up again when a batch comes back to its target and depth buffer.
+       Burnout 3 draws its track object by object into the race's view and
+       into the reflection map's three small views, the same texture each:
+       ~110 passes a picture of one batch each, and each of the race view's a
+       store and reload of a 640x512 target on a tile-based GPU (an iPad's).
+       Set aside, each target's draws become one pass.
+       What makes it right: the passes set aside and the open one never meet -
+       none draws into or reads what another draws into, nor reads what
+       another writes (Meets) - so their order among themselves is free, and
+       work recorded meanwhile goes before them all (it touches none of them).
+       A batch, work (Work's images) or a pass that would meet one first ends
+       it (EmitParked): its begin, draws and end into the frame's command
+       buffer then. A submission ends them all. Not with local read (its
+       barriers are the pass's own). */
+    struct ParkedPass {
+        Image* target = nullptr;
+        Image* depth = nullptr;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkRenderingAttachmentInfo colour{}, z{}, stencil{};
+        std::int32_t area[4] = {};
+        std::vector<const Image*> reads;
+        bool reads_clut = false;
+        std::uint32_t batches = 0;
+        char label[96] = {};
+        DrawState drawn;
+    };
+    bool reorder_ = false;
+    std::vector<ParkedPass> parked_;
+    static constexpr std::size_t kMostParked = 8;
+    /* Whether a pass (its target, depth buffer and what its draws read) meets
+       what writes `writes` and reads `reads` - images, null ones skipped - or
+       writes the CLUT it reads. */
+    static bool Meets(const Image* target, const Image* depth, const std::vector<const Image*>& pass_reads,
+                      bool pass_reads_clut, const Image* const* writes, std::size_t n_writes, const Image* const* reads,
+                      std::size_t n_reads, bool writes_clut) {
+        if (writes_clut && pass_reads_clut) return true;
+        for (std::size_t i = 0; i < n_writes; ++i) {
+            const Image* w = writes[i];
+            if (!w) continue;
+            if (w == target || w == depth) return true;
+            if (std::find(pass_reads.begin(), pass_reads.end(), w) != pass_reads.end()) return true;
+        }
+        for (std::size_t i = 0; i < n_reads; ++i)
+            if (reads[i] && (reads[i] == target || reads[i] == depth)) return true;
+        return false;
+    }
+    static bool Meets(const ParkedPass& p, const Image* const* writes, std::size_t n_writes, const Image* const* reads,
+                      std::size_t n_reads, bool writes_clut) {
+        return Meets(p.target, p.depth, p.reads, p.reads_clut, writes, n_writes, reads, n_reads, writes_clut);
+    }
+    void EmitParked(VkCommandBuffer cmd, std::size_t i, int why, WorkKind work = kWorkOther) {
+        ParkedPass& p = parked_[i];
+        ++g_breaks[why];
+        if (why == kBreakWork) ++g_work_breaks[work];
+        if (Tracing())
+            std::fprintf(stderr, "[pass] %s: %u batches (set aside), ended by %s%s%s\n", p.label, p.batches,
+                         kBreakNames[why], why == kBreakWork ? " - " : "", why == kBreakWork ? kWorkNames[work] : "");
+        EmitPass(cmd, p.cmd, p.colour, p.z, p.stencil, p.area);
+        parked_.erase(parked_.begin() + std::ptrdiff_t(i));
+    }
+    /* The open pass set aside (a batch into another target that it does not meet). */
+    void SetAside(VkCommandBuffer cmd) {
+        if (parked_.size() >= kMostParked) EmitParked(cmd, 0, kBreakTarget);
+        ParkedPass p;
+        p.target = open_target_;
+        p.depth = open_depth_;
+        p.cmd = pass_cmd_;
+        p.colour = pass_colour_;
+        p.z = pass_depth_;
+        p.stencil = pass_stencil_;
+        std::copy(pass_area_, pass_area_ + 4, p.area);
+        p.reads.swap(pass_reads_);
+        p.reads_clut = pass_reads_clut_;
+        p.batches = pass_batches_;
+        std::memcpy(p.label, pass_label_, sizeof p.label);
+        p.drawn = drawn_;
+        if (Tracing()) std::fprintf(stderr, "[pass] %s: %u batches, set aside\n", pass_label_, pass_batches_);
+        parked_.push_back(std::move(p));
+        ++g_set_aside;
+        open_target_ = open_depth_ = nullptr;
+        pass_cmd_ = VK_NULL_HANDLE;
+        pass_reads_.clear();
+        pass_reads_clut_ = false;
+    }
+    /* The pass set aside for this target and depth buffer, open again. */
+    bool TakeUp(Image* t, Image* depth) {
+        for (std::size_t i = 0; i < parked_.size(); ++i) {
+            ParkedPass& p = parked_[i];
+            if (p.target != t || p.depth != depth) continue;
+            open_target_ = p.target;
+            open_depth_ = p.depth;
+            pass_cmd_ = p.cmd;
+            pass_colour_ = p.colour;
+            pass_depth_ = p.z;
+            pass_stencil_ = p.stencil;
+            std::copy(p.area, p.area + 4, pass_area_);
+            pass_reads_.swap(p.reads);
+            pass_reads_clut_ = p.reads_clut;
+            pass_batches_ = p.batches;
+            std::memcpy(pass_label_, p.label, sizeof pass_label_);
+            drawn_ = p.drawn;
+            pass_drawn_any_ = false;
+            parked_.erase(parked_.begin() + std::ptrdiff_t(i));
+            ++g_taken_up;
+            if (Tracing()) std::fprintf(stderr, "[pass] %s: taken up again\n", pass_label_);
+            return true;
+        }
+        return false;
+    }
     // The CLUT for the draws (gs.frag's set 1): a target read as PSMT8H.
     VkDescriptorSetLayout clut_set_layout_ = VK_NULL_HANDLE;
     VkDescriptorSet clut_set_ = VK_NULL_HANDLE;
@@ -1085,8 +1225,15 @@ bool VulkanGsRenderer::Init(std::string* error) {
         emulate_tbdr_ = emulate[0] && emulate[0] != '0' && !g_.local_read;
     if (emulate_tbdr_) std::fprintf(stderr, "[gpu] local read emulated as a tile-based GPU reads (a copy at each pass)\n");
     if (const char* defer = std::getenv("PS2GPU_DEFER_PASSES")) defer_passes_ = defer[0] != '0';
-    std::fprintf(stderr, "[gpu] tile-based GPU ways: local read %s, tile hints %s, deferred passes %s\n",
-                 g_.local_read ? "on" : "off", tile_hints_ ? "on" : "off", defer_passes_ ? "on" : "off");
+    // Reordered passes (ParkedPass): with MoltenVK by default; they need the
+    // passes deferred, and not local read.
+    reorder_ = false;           // (to be on with MoltenVK once measured on an iPad)
+    if (const char* reorder = std::getenv("PS2GPU_REORDER")) reorder_ = reorder[0] && reorder[0] != '0';
+    if (InPlaceReads()) reorder_ = false;
+    if (reorder_) defer_passes_ = true;
+    std::fprintf(stderr, "[gpu] tile-based GPU ways: local read %s, tile hints %s, deferred passes %s, reordered passes %s\n",
+                 g_.local_read ? "on" : "off", tile_hints_ ? "on" : "off", defer_passes_ ? "on" : "off",
+                 reorder_ ? "on" : "off");
     return InitMemory(error);
 }
 
@@ -1655,6 +1802,7 @@ void VulkanGsRenderer::SetScale(std::uint32_t scale) {
     }
     drawn_ = DrawState{};
     open_target_ = open_depth_ = nullptr;
+    parked_.clear();            // (the submission ended them)
     feedback_ = nullptr;
     auto drop = [&](Image& image) {
         if (image.sampled) vkFreeDescriptorSets(g_.device, pool_, 1, &image.sampled);
@@ -2779,7 +2927,32 @@ void VulkanGsRenderer::Flush() {
                 why = kBreakSource;
             else if (open_target_ != t) why = kBreakTarget;
             else if (open_depth_ != depth) why = kBreakDepth;
-            if (why >= 0) EndPass(cmd, why);
+            if (reorder_ && defer_passes_) {
+                // What this batch draws into and reads: the passes set aside
+                // that meet it end first; one for its own target and depth
+                // buffer is taken up again (below), and the open pass, if it
+                // only draws elsewhere, is set aside.
+                const Image* writes[3] = {t, depth, copy_first ? feedback_ : nullptr};
+                const Image* reads[3] = {source ? (texture_copy ? feedback_ : source)
+                                                : (state_.textured ? &texture->image : nullptr),
+                                         shader_blend ? feedback_ : nullptr, nullptr};
+                const bool may_take_up = why < 0 || why == kBreakTarget || why == kBreakDepth;
+                for (std::size_t i = 0; i < parked_.size();) {
+                    const ParkedPass& p = parked_[i];
+                    const bool own = may_take_up && p.target == t && p.depth == depth;
+                    if (!own && Meets(p, writes, 3, reads, 3, false)) EmitParked(cmd, i, kBreakTarget);
+                    else ++i;
+                }
+                if (why == kBreakTarget && open_target_ &&
+                    !Meets(open_target_, open_depth_, pass_reads_, pass_reads_clut_, writes, 3, reads, 3, false)) {
+                    SetAside(cmd);
+                    why = -1;
+                }
+                if (why >= 0) EndPass(cmd, why);
+                if (!open_target_ && may_take_up) TakeUp(t, depth);
+            } else if (why >= 0) {
+                EndPass(cmd, why);
+            }
             // Local read: a batch reading what the open pass drew since its last
             // barrier needs one first (MoltenVK: the Metal pass stored and begun
             // again). Emulated, the pass ends and the next takes a fresh copy.

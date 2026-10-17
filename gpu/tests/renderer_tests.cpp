@@ -454,6 +454,7 @@ void PathsAgree() {
         const char* emulate;
         const char* defer;
         const char* hints;
+        const char* reorder = "0";
     };
     std::vector<Setup> setups = {{"as before", "0", "0", "0", "0"},
                                  {"tile hints", "0", "0", "0", "1"},
@@ -461,25 +462,28 @@ void PathsAgree() {
                                  {"emulated tile-based local read", "0", "1", "0", "1"},
                                  {"emulated tile-based local read, deferred", "0", "1", "1", "1"},
                                  {"local read", "1", "0", "0", "1"},
-                                 {"local read, deferred", "1", "0", "1", "1"}};
-    // PS2GPU_TEST_PATHS="LEDH,LEDH,...": the ways compared instead (each four
-    // digits: local read, its emulation, deferred passes, tile hints), the
-    // first the reference.
+                                 {"local read, deferred", "1", "0", "1", "1"},
+                                 {"reordered passes", "0", "0", "1", "1", "1"},
+                                 {"reordered passes, no tile hints", "0", "0", "1", "0", "1"}};
+    // PS2GPU_TEST_PATHS="LEDHR,LEDHR,...": the ways compared instead (each
+    // five digits: local read, its emulation, deferred passes, tile hints,
+    // reordered passes), the first the reference.
     std::vector<std::string> custom;
     if (const char* paths = std::getenv("PS2GPU_TEST_PATHS")) {
         setups.clear();
         std::string list = paths;
-        for (std::size_t at = 0; at + 4 <= list.size(); at += 5) custom.push_back(list.substr(at, 4));
+        for (std::size_t at = 0; at + 5 <= list.size(); at += 6) custom.push_back(list.substr(at, 5));
         static const char* const kDigit[2] = {"0", "1"};
         for (const std::string& c : custom)
-            setups.push_back({c.c_str(), kDigit[c[0] == '1'], kDigit[c[1] == '1'], kDigit[c[2] == '1'], kDigit[c[3] == '1']});
+            setups.push_back({c.c_str(), kDigit[c[0] == '1'], kDigit[c[1] == '1'], kDigit[c[2] == '1'], kDigit[c[3] == '1'],
+                              kDigit[c[4] == '1']});
     }
     std::vector<std::unique_ptr<ps2gpu::Gpu>> gpus;
     std::vector<std::unique_ptr<ps2gpu::GsRenderer>> renderers;
     std::vector<const char*> names;
     // The variables as the run had them, back after (the other tests' renderer).
     static const char* const kWays[] = {"PS2GPU_LOCAL_READ", "PS2GPU_LOCAL_READ_EMULATE", "PS2GPU_DEFER_PASSES",
-                                        "PS2GPU_TILE_HINTS"};
+                                        "PS2GPU_TILE_HINTS", "PS2GPU_REORDER"};
     std::vector<std::pair<bool, std::string>> before;
     for (const char* name : kWays) {
         const char* value = std::getenv(name);
@@ -490,6 +494,7 @@ void PathsAgree() {
         SetEnv("PS2GPU_LOCAL_READ_EMULATE", setup.emulate);
         SetEnv("PS2GPU_DEFER_PASSES", setup.defer);
         SetEnv("PS2GPU_TILE_HINTS", setup.hints);
+        SetEnv("PS2GPU_REORDER", setup.reorder);
         std::string error;
         auto gpu = ps2gpu::CreateGpu(&error);
         if (!gpu) continue;
