@@ -263,6 +263,11 @@ struct Bridge {
     u64 patched_words = 0, patches = 0;
     std::map<u32, u64> texture_downloads;   // by the texture's TEX0 PSM << 16 | TBW
     u64 write_backs = 0, reloads = 0, decodes = 0;
+    // Why images went back to memory (WriteBack's `why`, kWb*) and came back
+    // (Owned::why), colour/depth apart; and, by what asked it, which image
+    // went back for what - the [perf] report's "write-backs by why" lines.
+    u64 write_backs_by[8][2] = {}, reloads_by[4][2] = {};
+    std::map<std::string, u64> write_back_pairs;
     u64 unchanged = 0;              // textures invalidated whose texels proved the same
     u64 gpu_decodes = 0;            // textures decoded on the GPU from its copy of local memory
     u64 replacements = 0;           // a texture pack's in their place (texture_pack.h)
@@ -395,8 +400,23 @@ struct TimelineStep {
 
 /* What the GPU drew into an image, swizzled into the GPU's local memory - on
    the GPU, nothing waiting. */
-void WriteBack(Bridge& b, Owned& o) {
+enum WriteBackWhy { kWbCpu, kWbTransfer, kWbOtherImage, kWbOwnReload, kWbClut, kWbTexture, kWbRescale, kWbOther };
+const char* const kWriteBackWhy[8] = {"the GS model", "a transfer", "an image over it", "its own reload",
+                                       "a CLUT load", "a texture decode", "a new scale", "other"};
+
+std::string ImageName(const Owned& o) {
+    char text[48];
+    std::snprintf(text, sizeof text, "%s %X/%u/%02X", o.depth ? "Z" : "C", unsigned(o.fbp), unsigned(o.fbw),
+                  unsigned(o.psm));
+    return text;
+}
+
+void WriteBack(Bridge& b, Owned& o, int why = kWbOther, const std::string& for_what = std::string()) {
     ++g_mutations;
+    if (o.dirty_end > o.dirty_begin) {
+        ++b.write_backs_by[why][o.depth ? 1 : 0];
+        ++b.write_back_pairs[ImageName(o) + " for " + kWriteBackWhy[why] + (for_what.empty() ? "" : " " + for_what)];
+    }
     Timed timed(Section::GpuSync);
     const TimelineStep step("sync: a write-back");
     o.gpu_newer = false;
@@ -435,7 +455,11 @@ void Sync(Bridge& b, u32 begin, u32 end, bool write, const Owned* except = nullp
     ++g_mutations;
     ApplyPatch(b);
     for (auto& [key, o] : b.owned)
-        if (&o != except && o.gpu_newer && o.dirty_begin < end && begin < o.dirty_end) WriteBack(b, o);
+        if (&o != except && o.gpu_newer && o.dirty_begin < end && begin < o.dirty_end) {
+            char range[40];
+            std::snprintf(range, sizeof range, "%s %X-%X", b.cause == 2 ? "writing" : "reading", unsigned(begin), unsigned(end));
+            WriteBack(b, o, kWbCpu, range);
+        }
     {
         Timed timed(Section::GpuSync);
         const TimelineStep step("sync: memory for the CPU");
@@ -475,7 +499,11 @@ void SyncWrite(Bridge& b, u32 begin, u32 end, const u8* cover) {
     // What the GPU images drew over them into the GPU's memory first (on the
     // GPU, nothing waiting): written back later, it would land over these.
     for (auto& [key, o] : b.owned)
-        if (o.gpu_newer && o.dirty_begin < last && first < o.dirty_end) WriteBack(b, o);
+        if (o.gpu_newer && o.dirty_begin < last && first < o.dirty_end) {
+            char range[40];
+            std::snprintf(range, sizeof range, "to %X-%X", unsigned(first), unsigned(last));
+            WriteBack(b, o, kWbTransfer, range);
+        }
     // Blocks written in part where the GPU's are newer: the transfer's pixels
     // patched into the GPU's when it is done, the blocks still the GPU's.
     b.patch.transfer = gs::TheGs().last_transfer;
@@ -573,7 +601,7 @@ Owned& Use(Bridge& b, u32 fbp, u32 fbw, u32 psm, bool depth, u32 width, u32 heig
     for (auto& [key, other] : b.owned)
         if (&other != &o && other.gpu_newer && other.dirty_begin < o.end && o.begin < other.dirty_end) {
             const u32 b0 = other.dirty_begin, b1 = other.dirty_end;
-            WriteBack(b, other);
+            WriteBack(b, other, kWbOtherImage, ImageName(o));
             MarkStale(o, 3, b0, b1, nullptr, Is16(other.psm));
         }
     o.checked = b.newer_epoch;
@@ -581,9 +609,10 @@ Owned& Use(Bridge& b, u32 fbp, u32 fbw, u32 psm, bool depth, u32 width, u32 heig
         // Loaded from the GPU's local memory, the CPU's writes there first -
         // and its own drawing not yet there: an image goes stale for rows
         // another drew over while newer than memory in rows of its own.
-        if (o.gpu_newer) WriteBack(b, o);
+        if (o.gpu_newer) WriteBack(b, o, kWbOwnReload);
         Timed timed(Section::GpuSync);
         const TimelineStep step("sync: an image reloaded");
+        ++b.reloads_by[std::min(o.why, 3)][depth ? 1 : 0];
         ++b.reloads;
         Coherent(b, o.begin, o.full_end, true);
         const u32 r0 = std::min(o.stale_row0, o.height), r1 = std::min(o.stale_row1, o.height);
@@ -810,7 +839,7 @@ bool LoadClut(Bridge& b, u64 tex0, u64 texa) {
     Timed timed(Section::GpuSync);
     const TimelineStep step("sync: a CLUT load");
     for (auto& [key, o] : b.owned)
-        if (o.gpu_newer && o.dirty_begin < cbp + 8 && cbp < o.dirty_end) WriteBack(b, o);
+        if (o.gpu_newer && o.dirty_begin < cbp + 8 && cbp < o.dirty_end) WriteBack(b, o, kWbClut);
     Coherent(b, cbp, cbp + 8, true);
     ps2gpu::GsClutLoad load;
     load.cbp = cbp;
@@ -934,7 +963,11 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
     bool gpu_holds_now = false;
     auto gpu_decode = [&] {
         for (auto& [okey, o] : b.owned)
-            if (o.gpu_newer && o.dirty_begin < t.end && t.begin < o.dirty_end) WriteBack(b, o);
+            if (o.gpu_newer && o.dirty_begin < t.end && t.begin < o.dirty_end) {
+                char tex[40];
+                std::snprintf(tex, sizeof tex, "T %X/%u/%02X", unsigned(tbp), unsigned(tbw), unsigned(psm));
+                WriteBack(b, o, kWbTexture, tex);
+            }
         Coherent(b, t.begin, t.end, true);
         ps2gpu::GsTextureDecode d;
         d.tbp = tbp;
@@ -1557,7 +1590,7 @@ u32 WantedScale(const ps2gpu::Display* display) {
    comes back from memory at the new size as it is next used. */
 void Rescale(Bridge& b, u32 scale) {
     for (auto& [key, o] : b.owned)
-        if (o.gpu_newer) WriteBack(b, o);
+        if (o.gpu_newer) WriteBack(b, o, kWbRescale);
     b.renderer->SetScale(scale);
     for (auto& [key, o] : b.owned) {
         o.stale = true;
@@ -1798,6 +1831,46 @@ std::string GpuCaptureScreen(const std::string& dir) {
     return text;
 }
 
+/* The [perf] report's write-back lines: the interval's write-backs (images
+   swizzled into GPU memory) and reloads (images back from it) a frame, by why
+   and colour/depth, and the images that went back most, with what asked it -
+   two images over the same blocks used in turn pay one of each per turn. */
+std::string WriteBackReport(Bridge& b, u64 frames) {
+    static u64 last_wb[8][2] = {}, last_rl[4][2] = {};
+    std::string text = "[perf]   write-backs a frame by why:";
+    char part[96];
+    for (int w = 0; w < 8; ++w) {
+        const u64 c = b.write_backs_by[w][0] - last_wb[w][0], z = b.write_backs_by[w][1] - last_wb[w][1];
+        if (c || z) {
+            std::snprintf(part, sizeof part, " %s %.1f (Z %.1f)", kWriteBackWhy[w], double(c + z) / double(frames),
+                          double(z) / double(frames));
+            text += part;
+        }
+    }
+    text += "; reloads a frame by why:";
+    static const char* const kReloadWhy[4] = {"new", "memory written", "a draw over it", "another's write-back"};
+    for (int w = 0; w < 4; ++w) {
+        const u64 c = b.reloads_by[w][0] - last_rl[w][0], z = b.reloads_by[w][1] - last_rl[w][1];
+        if (c || z) {
+            std::snprintf(part, sizeof part, " %s %.1f (Z %.1f)", kReloadWhy[w], double(c + z) / double(frames),
+                          double(z) / double(frames));
+            text += part;
+        }
+    }
+    text += "\n";
+    std::memcpy(last_wb, b.write_backs_by, sizeof last_wb);
+    std::memcpy(last_rl, b.reloads_by, sizeof last_rl);
+    std::vector<std::pair<u64, std::string>> top;
+    for (const auto& [what, n] : b.write_back_pairs) top.push_back({n, what});
+    std::sort(top.begin(), top.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+    for (std::size_t i = 0; i < top.size() && i < 8; ++i) {
+        std::snprintf(part, sizeof part, "[perf]     %.1f a frame: ", double(top[i].first) / double(frames));
+        text += part + top[i].second + "\n";
+    }
+    b.write_back_pairs.clear();
+    return text;
+}
+
 void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
     if (!g_bridge) return;
     Bridge& s = *g_bridge;
@@ -1863,6 +1936,7 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                 last_pairs = vu1.pairs();
                 last_compiled = vu1.compiled_pairs();
                 last_gpu_ns = gpu_ns;
+                std::fputs(WriteBackReport(s, frames).c_str(), stderr);
                 std::fflush(stderr);
                 last = Clock::now();
                 last_frame = frame;
