@@ -746,11 +746,122 @@ bool SampledPages(const Owned& o, u64 clamp, u32 tw, u32 th, const ps2gpu::GsVer
 /* Target `o` about to be sampled as a texture, over `pages`: brought up to
    date (Use) only if what it lacks lies there - changed under it since it
    was loaded, or drawn by another image the GPU has not written back. */
+/* The page rows of `o` (rows of pages, FBW wide) that `pages` touch, as
+   [first, last) - false when none do. */
+bool PageRowsOf(const Owned& o, const Pages& pages, u32* first, u32* last) {
+    const u32 fbw = std::max(1u, o.fbw), base = o.begin / 32, end = std::min(512u, (o.full_end + 31) / 32);
+    u32 lo = ~0u, hi = 0;
+    for (u32 p = base; p < end; ++p)
+        if (pages.test(p)) {
+            lo = std::min(lo, (p - base) / fbw);
+            hi = std::max(hi, (p - base) / fbw + 1);
+        }
+    *first = lo;
+    *last = hi;
+    return lo < hi;
+}
+
+/* Every page of `o` in page rows [first, last). */
+Pages PageRows(const Owned& o, u32 first, u32 last) {
+    Pages pages;
+    const u32 fbw = std::max(1u, o.fbw), base = o.begin / 32;
+    for (u32 r = first; r < last; ++r)
+        for (u32 x = 0; x < fbw; ++x)
+            if (base + r * fbw + x < 512) pages.set(base + r * fbw + x);
+    return pages;
+}
+
+/* What `o` drew in the page rows over `pages`, into the GPU's memory - those
+   rows only; its other rows stay drawn but not yet there. */
+void WriteBackPages(Bridge& b, Owned& o, const Pages& pages, int why, const std::string& for_what) {
+    u32 pr0, pr1;
+    if (!o.gpu_newer || !PageRowsOf(o, pages & o.dirty_pages, &pr0, &pr1)) return;
+    ++g_mutations;
+    Timed timed(Section::GpuSync);
+    const TimelineStep step("sync: a write-back of a few rows");
+    const u32 page_rows = Is16(o.psm) ? 64 : 32, row_blocks = std::max(1u, o.fbw) * 32;
+    const u32 first = pr0 * page_rows, last = std::min(o.y1, pr1 * page_rows);
+    const u32 b0 = o.begin + pr0 * row_blocks, b1 = o.begin + pr1 * row_blocks;
+    ++b.write_backs_by[why][o.depth ? 1 : 0];
+    ++b.write_back_pairs[ImageName(o) + " rows for " + kWriteBackWhy[why] + (for_what.empty() ? "" : " " + for_what)];
+    Coherent(b, b0, b1, true);
+    if (gs::TheGs().trace)
+        std::fprintf(gs::TheGs().trace_out, "[gpu] write-back %s %X/%u/%02X rows %u-%u cols %u (for a sample)\n",
+                     o.depth ? "Z" : "C", unsigned(o.fbp), unsigned(o.fbw), unsigned(o.psm), unsigned(first),
+                     unsigned(last), unsigned(o.x1));
+    const bool done = first < last &&
+                      (o.depth ? b.renderer->DepthToMemory(o.fbp, o.width, o.height, o.fbw, o.psm, o.x1, last, first)
+                               : b.renderer->TargetToMemory(o.fbp, o.fbw, o.psm, o.x1, last, first));
+    if (done) {
+        ++b.write_backs;
+        std::fill(b.blocks.begin() + std::min(b0, 16384u), b.blocks.begin() + std::min(b1, 16384u), Bridge::kGpuNewer);
+    }
+    // Those rows are in memory now: no longer drawn-since for what samples
+    // them. (dirty_begin/dirty_end stay - a whole write-back still covers
+    // them, only writing them again.)
+    o.dirty_pages &= ~PageRows(o, pr0, pr1);
+    o.rect_dirty = false;
+    if (o.dirty_pages.none()) {
+        o.gpu_newer = false;
+        o.dirty_begin = ~0u;
+        o.dirty_end = 0;
+    }
+}
+
+/* Target `o` about to be sampled as a texture, over `pages`: brought up to
+   date only if what it lacks lies there - changed under it since it was
+   loaded, or drawn by another image the GPU has not written back - and then
+   only in the page rows over those pages, when nothing of its own is newer
+   than memory: the race reads ~16 texels of a 1024x256 view over its depth
+   buffer at a time, ~18 times a picture, between draws into that depth
+   buffer - each, before, the whole 640x448 depth buffer swizzled into
+   memory and the whole view reloaded (on an A12, a quarter of the GPU's
+   time in a race). PS2HOST_SAMPLE_WHOLE=1: the whole image, as before. */
 void Sample(Bridge& b, Owned& o, const Pages& pages) {
     bool needed = o.stale && (o.stale_pages & pages).any();
     for (auto it = b.owned.begin(); !needed && it != b.owned.end(); ++it)
         needed = &it->second != &o && it->second.gpu_newer && (it->second.dirty_pages & pages).any();
-    if (needed) Use(b, o.fbp, o.fbw, o.psm, false, o.width, o.height, 1);   // sampling grows nothing
+    if (!needed) return;
+    static const bool whole = [] {
+        const char* v = std::getenv("PS2HOST_SAMPLE_WHOLE");
+        return v && *v && *v != '0';
+    }();
+    u32 pr0, pr1;
+    if (whole || o.depth || o.gpu_newer || !o.width || !PageRowsOf(o, pages, &pr0, &pr1)) {
+        Use(b, o.fbp, o.fbw, o.psm, false, o.width, o.height, 1);   // sampling grows nothing
+        return;
+    }
+    ++g_mutations;
+    const Pages rows = PageRows(o, pr0, pr1);
+    // The others' drawing over those rows, into memory; the rows stale.
+    for (auto& [key, other] : b.owned)
+        if (&other != &o && other.gpu_newer && (other.dirty_pages & rows).any()) {
+            const Pages theirs = other.dirty_pages & rows;
+            WriteBackPages(b, other, rows, kWbOtherImage, ImageName(o) + " sampled");
+            MarkStale(o, 3, 0, ~0u, &theirs, Is16(other.psm));
+        }
+    if (!(o.stale && (o.stale_pages & rows).any())) return;
+    // Those rows from memory (the CPU's writes there first).
+    const u32 page_rows = Is16(o.psm) ? 64 : 32, row_blocks = std::max(1u, o.fbw) * 32;
+    const u32 r0 = std::min(pr0 * page_rows, o.height), r1 = std::min(pr1 * page_rows, o.height);
+    Timed timed(Section::GpuSync);
+    const TimelineStep step("sync: a few rows reloaded");
+    ++b.reloads_by[std::min(o.why, 3)][0];
+    ++b.reloads;
+    Coherent(b, o.begin + pr0 * row_blocks, o.begin + pr1 * row_blocks, true);
+    if (gs::TheGs().trace)
+        std::fprintf(gs::TheGs().trace_out, "[gpu] reload C %X/%u/%02X why %d rows %u-%u (for a sample)\n",
+                     unsigned(o.fbp), unsigned(o.fbw), unsigned(o.psm), o.why, unsigned(r0), unsigned(r1));
+    b.renderer->ReloadKeepsColour(o.by16 && !Is16(o.psm));
+    if (r0 < r1) b.renderer->TargetRowsFromMemory(o.fbp, o.fbw, o.psm, o.width, o.height, r0, r1 - r0);
+    b.renderer->ReloadKeepsColour(false);
+    ++o.reloads[o.why];
+    o.stale_pages &= ~rows;
+    if (o.stale_pages.none()) {
+        o.stale = o.stale_beyond = false;
+        o.stale_row0 = 0;
+        o.stale_row1 = ~0u;
+    }
 }
 
 /* A 64-bit hash of `size` bytes (a multiple of 8). Four independent lanes,
