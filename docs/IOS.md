@@ -88,8 +88,9 @@ every time - and quits at its end; its log is its own (`burnout3-<date>-
 pictures a second, each thread's time by section, the GPU's busy time, the
 renderer's counts, memory and the thermal state, and every ten seconds where
 the GS thread was found (`[sample]`). Untick the variable to play again.
-Other variables read there: `PS2GPU_TILE=1` (the tile-based GPU's ways,
-`gpu/src/gpu_internal.h`), MoltenVK's own (`MVK_CONFIG_*`), and the host's
+Other variables read there: `PS2GPU_REORDER=0` (the renderer's reordered
+passes, on by default on an iPad: `gpu/src/gs_renderer.cpp`), `PS2GPU_TILE=1`
+(the tile-based GPU's other ways, `gpu/src/gpu_internal.h`), MoltenVK's own (`MVK_CONFIG_*`), and the host's
 (`docs/PORTING.md`).
 
 ### Reports and VU programs, without carrying files (a PC and a Mac)

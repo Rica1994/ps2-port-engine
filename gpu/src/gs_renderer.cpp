@@ -776,7 +776,7 @@ private:
         float size[2] = {-1, -1};
         VkBuffer vertices = VK_NULL_HANDLE;
     } drawn_;
-    /* REORDERED PASSES (PS2GPU_REORDER=1): a
+    /* REORDERED PASSES (PS2GPU_REORDER=1; on by default with MoltenVK): a
        deferred pass that a batch into another target would end is set aside
        instead - its draws stay in their secondary command buffer - and is
        taken up again when a batch comes back to its target and depth buffer.
@@ -784,7 +784,9 @@ private:
        into the reflection map's three small views, the same texture each:
        ~110 passes a picture of one batch each, and each of the race view's a
        store and reload of a 640x512 target on a tile-based GPU (an iPad's).
-       Set aside, each target's draws become one pass.
+       Set aside, each target's draws become one pass: race.args on
+       lavapipe, frames 17,700-18,290, 253 -> 130 passes a picture and their
+       area 37.7 -> 17.7 MP, every picture the same.
        What makes it right: the passes set aside and the open one never meet -
        none draws into or reads what another draws into, nor reads what
        another writes (Meets) - so their order among themselves is free, and
@@ -1227,7 +1229,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
     if (const char* defer = std::getenv("PS2GPU_DEFER_PASSES")) defer_passes_ = defer[0] != '0';
     // Reordered passes (ParkedPass): with MoltenVK by default; they need the
     // passes deferred, and not local read.
-    reorder_ = false;           // (to be on with MoltenVK once measured on an iPad)
+    reorder_ = g_.portability;
     if (const char* reorder = std::getenv("PS2GPU_REORDER")) reorder_ = reorder[0] && reorder[0] != '0';
     if (InPlaceReads()) reorder_ = false;
     if (reorder_) defer_passes_ = true;
