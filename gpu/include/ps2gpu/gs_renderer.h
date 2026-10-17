@@ -213,6 +213,10 @@ public:
        frame, say), so that the GPU draws while the CPU goes on rather than
        all at once when something next waits. */
     virtual void Kick() {}
+    /* Whether the GPU has finished all the work handed to it (Kick, and any
+       before) - asked without waiting; what has finished is retired. A
+       port's frame skipping draws again once its last drawn frame is done. */
+    virtual bool GpuCaughtUp() { return true; }
     /* GS local memory on the GPU: 4 MB, as the GS lays it out, which targets
        and depth buffers are swizzled into and out of without the CPU. Blocks
        are 256 bytes; [begin, end) in blocks. Nothing waits but MemoryRead. */

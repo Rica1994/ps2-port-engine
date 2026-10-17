@@ -367,6 +367,7 @@ public:
         ++frame_;
         EvictReplacements();
     }
+    bool GpuCaughtUp() override { return g_.CaughtUp(); }
     void TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t width,
                               std::uint32_t height, std::uint32_t first_row, std::uint32_t rows) override;
     void ReloadKeepsColour(bool keep) override { keep_colour_ = keep; }

@@ -143,6 +143,9 @@ public:
     static constexpr int kSlots = 3;
     /* The command buffer recording goes into (or will). */
     int slot() const { return current_; }
+    /* Without waiting: the command buffers handed over that have run,
+       retired (oldest first); whether none is still running. */
+    bool CaughtUp();
     /* Records with `record`, submits, and waits for it to finish. */
     template <typename F>
     bool Run(F&& record, const char* why = "other") {
@@ -221,6 +224,17 @@ void VulkanGpu::Record(F&& record) {
         if (end_pass) end_pass(c, false);
         record(c);
     });
+}
+
+inline bool VulkanGpu::CaughtUp() {
+    bool all = true;
+    for (int i = 1; i <= kSlots; ++i) {
+        const int slot = (current_ + i) % kSlots;
+        if (!in_flight_[slot]) continue;
+        if (all && vkGetFenceStatus(device, fences[slot]) == VK_SUCCESS) Retire(slot, "done");
+        else all = false;
+    }
+    return all;
 }
 
 inline bool VulkanGpu::Retire(int slot, const char* why) {

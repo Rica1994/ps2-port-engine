@@ -60,6 +60,8 @@ std::atomic<u64> g_frame_ended[256];
 // NoteFrameLeftOut: the frame being made had its picture's drawing left out
 // (frame skipping), recorded by its number as the EE ends it (GsFrame).
 std::atomic<bool> g_left_out_pending{false};
+// The last frame whose end the GS thread handled (GsFrameDone).
+std::atomic<u64> g_gs_frame_done{0};
 std::atomic<bool> g_frame_left_out[256];
 
 // PS2HOST_HITCH: each frame's way to the screen - when the EE ended it (and
@@ -286,6 +288,7 @@ struct Feed {
                                 const u64 frame = u64(e[1]) | u64(e[2]) << 32;
                                 const u64 took = g_hitch ? ClockNs() : 0;
                                 g_frame_handler(frame);
+                                g_gs_frame_done.store(frame, std::memory_order_release);
                                 if (g_hitch) HitchFrame(frame, took, ClockNs());
                             }
                             size = 3;
@@ -424,6 +427,8 @@ u64 FrameDue(u64 frame) {
     return std::max(now, ended + keep);
 }
 
+u64 GsFrameDone() { return g_gs_frame_done.load(std::memory_order_acquire); }
+
 u64 GsBusyMicroseconds() { return g_gs_busy_us.load(std::memory_order_relaxed); }
 
 bool GsFrame(u64 frame) {
@@ -450,6 +455,7 @@ bool GsFrame(u64 frame) {
     }
     if (!g_feed) {
         g_frame_handler(frame);
+        g_gs_frame_done.store(frame, std::memory_order_release);
         return true;
     }
     u32* e = g_feed->Reserve(3);

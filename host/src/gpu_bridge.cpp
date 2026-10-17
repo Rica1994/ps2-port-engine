@@ -1982,6 +1982,9 @@ std::string WriteBackReport(Bridge& b, u64 frames) {
     return text;
 }
 
+std::atomic<u64> g_gpu_frame_done{0};
+u64 GpuFrameDone() { return g_gpu_frame_done.load(std::memory_order_acquire); }
+
 void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
     if (!g_bridge) return;
     Bridge& s = *g_bridge;
@@ -1992,6 +1995,9 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
         // rather than when something next waits on the GPU.
         {
             Timed timed(Section::GpuRender);
+            // Before this frame's drawing goes: whether the GPU has run all
+            // the frames' before it (asked, not waited for) - GpuFrameDone.
+            if (s.renderer->GpuCaughtUp() && frame > 0) g_gpu_frame_done.store(frame - 1, std::memory_order_release);
             s.renderer->Kick();
         }
         if (frame % 100 == 0)
@@ -2178,6 +2184,7 @@ bool StartGpuRenderer(std::string* error, GpuMode, bool) {
 }
 void GpuSetScale(u32) {}
 void GpuShadowFrame(gs::u64, const std::string&) {}
+u64 GpuFrameDone() { return ~0ull; }
 std::string GpuShadowSummary() { return ""; }
 
 #endif

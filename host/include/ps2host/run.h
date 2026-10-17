@@ -262,6 +262,14 @@ u64 Vif1BusyMicroseconds();
    empty, for it to catch up a frame, for room in the queue. */
 void Vif1WaitMicroseconds(u64* join, u64* frame, u64* full);
 bool GsFrame(u64 frame);
+/* The last frame the GS thread has finished (its drawing handed to the GPU,
+   its picture on its way to the screen) - how far behind the EE the drawing
+   is: a port's frame skipping draws again once the last frame it drew is. */
+u64 GsFrameDone();
+/* The last frame whose drawing the GPU has finished, as the GS thread last
+   looked (at each frame's end, without waiting): with GsFrameDone, how far
+   behind the EE the pictures are. */
+u64 GpuFrameDone();
 /* When the EE ended frame `frame` (GsFrame; ClockNs), 0 if not known. */
 u64 FrameEndedNs(u64 frame);
 /* The frame being made had its picture's drawing left out (frame skipping:
