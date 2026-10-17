@@ -1587,7 +1587,9 @@ void Rescale(Bridge& b, u32 scale) {
    game drawing every other tick, shows the last picture again). Written to
    the log too every ten seconds. Not over the PC settings' menu, which uses
    the same overlay. */
-void ShowPictureRate(u64 frame) {
+/* `presented`: whether this frame's picture went to the screen - the
+   pictures counted are those (with frame skipping, the race's drawn ones). */
+void ShowPictureRate(u64 frame, bool presented) {
     static const bool shown = [] {
         const char* v = std::getenv("PS2HOST_FPS");
         if (v && *v) return *v != '0';
@@ -1600,7 +1602,7 @@ void ShowPictureRate(u64 frame) {
     static u64 last_serial = 0;
     static unsigned pictures = 0;
     static int logged = 0;
-    if (g_bridge && g_bridge->serial != last_serial) {
+    if (presented && g_bridge && g_bridge->serial != last_serial) {
         last_serial = g_bridge->serial;
         ++pictures;
     }
@@ -1738,11 +1740,19 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
                 const long long now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count();
                 const bool drawn_only = now_ns - g_left_out_at.load(std::memory_order_relaxed) < 1000000000LL;
-                if (!drawn_only || g_bridge->serial != presented_serial) {
+                // A frame whose race draw was left out (frame skipping) shows
+                // the last picture with a new HUD over it: not shown - each
+                // present is a copy and a scale of the whole screen on the
+                // GPU the race draws on, and its queue taken from the GS
+                // thread meanwhile (three of four frames, on an A12 iPad).
+                const bool left_out = FrameLeftOut(frame);
+                bool presented = false;
+                if (!(drawn_only && left_out) && (!drawn_only || g_bridge->serial != presented_serial)) {
                     presented_serial = g_bridge->serial;
                     PresentGpuPicture(*display, pace ? FrameDue(frame) : 0);
+                    presented = true;
                 }
-                ShowPictureRate(frame);
+                ShowPictureRate(frame, presented);
             }
         });
     }
@@ -1752,6 +1762,7 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
 }
 
 void NoteDrawLeftOut() {
+    NoteFrameLeftOut();
     g_left_out_at = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }

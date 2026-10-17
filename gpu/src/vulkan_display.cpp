@@ -375,7 +375,14 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     SDL_WindowFlags window_flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE;
 #if defined(__ANDROID__) || (defined(__APPLE__) && defined(PS2GPU_IOS))
     // A tablet's one window: the whole screen, landscape, under the notch too.
-    window_flags |= SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    // The screen's points, not its pixels: the game's 640x448 picture gains
+    // nothing from a 2160x1620 drawable (an iPad 8's), and every present
+    // clears, scales and overlays four times the pixels - with frame skipping
+    // three or four presents a race picture, on the GPU the race draws on.
+    // PS2GPU_RETINA=1: the full pixel density.
+    window_flags |= SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS;
+    if (const char* retina = std::getenv("PS2GPU_RETINA"); retina && *retina && *retina != '0')
+        window_flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
 #endif
     window_ = SDL_CreateWindow(title, width, height, window_flags);
@@ -1098,9 +1105,6 @@ bool VulkanDisplay::FinishPresent(std::uint32_t index, VkImage source, std::uint
     const VkImage target = images_[index];
     Barrier(cmd_, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    const VkClearColorValue black{};
-    const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdClearColorImage(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
     // 4:3 as a television shows it, 16:9, or the window's own shape (SetAspect),
     // centred in the window.
     std::int32_t w = std::int32_t(extent_.width), h = std::int32_t(extent_.height);
@@ -1111,6 +1115,13 @@ bool VulkanDisplay::FinishPresent(std::uint32_t index, VkImage source, std::uint
         else dh = std::int32_t(float(w) / aspect + 0.5f);
     }
     const std::int32_t x0 = (w - dw) / 2, y0 = (h - dh) / 2;
+    // Black bars where the picture leaves some (none on a 4:3 iPad's screen:
+    // the blit covers it all).
+    if (dw < w || dh < h) {
+        const VkClearColorValue black{};
+        const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+    }
     shown_x0_.store(x0);
     shown_y0_.store(y0);
     shown_w_.store(std::max(dw, 1));

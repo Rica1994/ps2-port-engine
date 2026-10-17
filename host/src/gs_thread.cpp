@@ -57,6 +57,10 @@ std::function<void(u64)> g_frame_handler;
 
 // When the EE ended each of the last frames (GsFrame), by frame number.
 std::atomic<u64> g_frame_ended[256];
+// NoteFrameLeftOut: the frame being made had its picture's drawing left out
+// (frame skipping), recorded by its number as the EE ends it (GsFrame).
+std::atomic<bool> g_left_out_pending{false};
+std::atomic<bool> g_frame_left_out[256];
 
 // PS2HOST_HITCH: each frame's way to the screen - when the EE ended it (and
 // its idle time and VIF1's worker's busy time then), when the worker passed
@@ -387,6 +391,9 @@ void SetGsFrameHandler(std::function<void(u64)> handler) { g_frame_handler = std
 
 u64 FrameEndedNs(u64 frame) { return g_frame_ended[frame & 255].load(std::memory_order_relaxed); }
 
+void NoteFrameLeftOut() { g_left_out_pending.store(true, std::memory_order_relaxed); }
+bool FrameLeftOut(u64 frame) { return g_frame_left_out[frame & 255].load(std::memory_order_relaxed); }
+
 /* The steady clock, as the vertical blank's timer and the display keep time
    (ClockNs goes on from a virtual clock's time after --real-time-from). */
 u64 SteadyNowNs() {
@@ -427,6 +434,8 @@ bool GsFrame(u64 frame) {
         // next loop head first).
         const u64 blank = VirtualClock() ? 0 : LastVblankNs();
         g_frame_ended[frame & 255].store(blank ? blank : SteadyNowNs(), std::memory_order_relaxed);
+        g_frame_left_out[frame & 255].store(g_left_out_pending.exchange(false, std::memory_order_relaxed),
+                                            std::memory_order_relaxed);
         if (g_hitch) {
             g_way[frame & 255].ee.store(ClockNs(), std::memory_order_relaxed);
             g_way[frame & 255].idle.store(IdleNanoseconds(), std::memory_order_relaxed);

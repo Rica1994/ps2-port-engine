@@ -264,6 +264,10 @@ void Vif1WaitMicroseconds(u64* join, u64* frame, u64* full);
 bool GsFrame(u64 frame);
 /* When the EE ended frame `frame` (GsFrame; ClockNs), 0 if not known. */
 u64 FrameEndedNs(u64 frame);
+/* The frame being made had its picture's drawing left out (frame skipping:
+   NoteDrawLeftOut); whether frame `frame` had, once the EE ended it. */
+void NoteFrameLeftOut();
+bool FrameLeftOut(u64 frame);
 /* On the GS thread, as frame `frame` is finished (real time): when it should
    be shown (ClockNs) so frames reach the screen evenly spaced - each the
    same time after the EE ended it, the longest delay of the last few -
