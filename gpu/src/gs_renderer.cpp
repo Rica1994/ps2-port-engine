@@ -544,6 +544,8 @@ private:
     void Work(WorkKind kind, std::initializer_list<const Image*> touched = {},
               std::initializer_list<const Image*> written = {}, bool writes_clut = false) {
         work_ = kind;
+        std::snprintf(work_label_, sizeof work_label_, "%s", kWorkNames[kind]);
+        g_.next_label = work_label_;        // a frame capture's name for it (WorkLabel adds what)
         work_touched_.assign(touched.begin(), touched.end());
         work_writes_clut_ = writes_clut;
         bool conflicts = writes_clut && pass_reads_clut_;
@@ -611,10 +613,11 @@ private:
                          kBreakNames[why], why == kBreakWork ? " - " : "", why == kBreakWork ? kWorkNames[work] : "",
                          why == kBreakWork && !conflicts ? " (could go before the pass)" : "");
         if (defer_passes_) {
-            EmitPass(cmd, pass_cmd_, pass_colour_, pass_depth_, pass_stencil_, pass_area_);
+            EmitPass(cmd, pass_cmd_, pass_colour_, pass_depth_, pass_stencil_, pass_area_, pass_label_);
             pass_cmd_ = VK_NULL_HANDLE;
         } else {
             vkCmdEndRendering(cmd);
+            EndLabel(cmd);
         }
         open_target_ = open_depth_ = nullptr;
         pass_reads_.clear();
@@ -624,7 +627,7 @@ private:
        (the secondary command buffer), its end. */
     void EmitPass(VkCommandBuffer cmd, VkCommandBuffer pass, const VkRenderingAttachmentInfo& colour,
                   const VkRenderingAttachmentInfo& z, const VkRenderingAttachmentInfo& stencil,
-                  const std::int32_t area[4]) {
+                  const std::int32_t area[4], const char* label) {
         vkEndCommandBuffer(pass);
         VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
         ri.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
@@ -636,9 +639,11 @@ private:
         ri.pDepthAttachment = &z;
         ri.pStencilAttachment = &stencil;
         g_pass_pixels += std::uint64_t(ri.renderArea.extent.width) * ri.renderArea.extent.height;
+        BeginLabel(cmd, label, 0.3f, 0.6f, 0.9f);
         vkCmdBeginRendering(cmd, &ri);
         vkCmdExecuteCommands(cmd, 1, &pass);
         vkCmdEndRendering(cmd);
+        EndLabel(cmd);
         g_.Mark(cmd, kProfDraw);
     }
     /* PS2GPU_PASS_TRACE=N: each pass of the N-th frame (Kick) on stderr -
@@ -647,6 +652,12 @@ private:
     bool Tracing() const { return trace_frame_ >= 0 && std::uint64_t(trace_frame_) == frame_; }
     std::uint32_t pass_batches_ = 0;
     char pass_label_[96] = {};
+    /* The work's debug label (Work; WorkLabel: what it is about). */
+    char work_label_[96] = {};
+    template <typename... A>
+    void WorkLabel(const char* format, A... args) {
+        if (g_debug_labels) std::snprintf(work_label_, sizeof work_label_, format, args...);
+    }
     VkPipeline date_pipeline_ = VK_NULL_HANDLE;
     VkDescriptorSet SetFor(Texture& texture, int sampler);
     bool Buffer(VkDeviceSize bytes, VkBufferUsageFlags usage, VkBuffer* buffer, VkDeviceMemory* memory, void** mapped);
@@ -839,7 +850,7 @@ private:
         if (Tracing())
             std::fprintf(stderr, "[pass] %s: %u batches (set aside), ended by %s%s%s\n", p.label, p.batches,
                          kBreakNames[why], why == kBreakWork ? " - " : "", why == kBreakWork ? kWorkNames[work] : "");
-        EmitPass(cmd, p.cmd, p.colour, p.z, p.stencil, p.area);
+        EmitPass(cmd, p.cmd, p.colour, p.z, p.stencil, p.area, p.label);
         parked_.erase(parked_.begin() + std::ptrdiff_t(i));
     }
     /* The open pass set aside (a batch into another target that it does not meet). */
@@ -1687,6 +1698,8 @@ bool VulkanGsRenderer::TargetToMemory(std::uint32_t fbp, std::uint32_t fbw, std:
     rows -= first_row;
     if (!cols) return true;
     Work(kWorkToMemory, {&t});
+    WorkLabel("to memory: C %X/%u/%02X rows %u-%u", unsigned(fbp), unsigned(fbw), unsigned(psm), unsigned(first_row),
+              unsigned(first_row + rows));
     g_.Record([&](VkCommandBuffer cmd) {
         SwizzleImage(cmd, SwizzleParams{fbp * 32, fbw, psm, cols, rows, t.pw(), 1, 0, first_row, t.scale}, t);
         MemoryBarrier(cmd);
@@ -1708,6 +1721,7 @@ void VulkanGsRenderer::TargetFromMemory(std::uint32_t fbp, std::uint32_t fbw, st
     SwizzleParams params{fbp * 32, fbw, psm, t->width, t->height, t->pw(), 0, 0, 0, t->scale};
     params.keep_colour = existed && keep_colour_ && t->scale > 1;
     Work(kWorkFromMemory, {t}, {t});
+    WorkLabel("from memory: C %X/%u/%02X", unsigned(fbp), unsigned(fbw), unsigned(psm));
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         SwizzleImage(cmd, params, *t);
@@ -1728,6 +1742,8 @@ bool VulkanGsRenderer::DepthToMemory(std::uint32_t zbp, std::uint32_t width, std
     rows -= first_row;
     if (!cols) return true;
     Work(kWorkDepthToMemory, {&d});
+    WorkLabel("depth to memory: Z %X/%u/%02X rows %u-%u", unsigned(zbp), unsigned(fbw), unsigned(zpsm),
+              unsigned(first_row), unsigned(first_row + rows));
     g_.Record([&](VkCommandBuffer cmd) {
         DepthOut(cmd, SwizzleParams{zbp * 32, fbw, zpsm, cols, rows, d.pw(), 1, 1, first_row, d.scale}, d);
         MemoryBarrier(cmd);
@@ -1753,6 +1769,7 @@ void VulkanGsRenderer::TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw
     SwizzleParams params{fbp * 32, fbw, psm, t->width, rows, t->pw(), 0, 0, first_row, t->scale};
     params.keep_colour = keep_colour_ && t->scale > 1;
     Work(kWorkFromMemory, {t}, {t});
+    WorkLabel("from memory: C %X/%u/%02X", unsigned(fbp), unsigned(fbw), unsigned(psm));
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         SwizzleImage(cmd, params, *t);
@@ -1771,6 +1788,7 @@ void VulkanGsRenderer::DepthRowsFromMemory(std::uint32_t zbp, std::uint32_t widt
     if (first_row >= d->height) return;
     rows = std::min(rows, d->height - first_row);
     Work(kWorkDepthFromMemory, {d}, {d});
+    WorkLabel("depth from memory: Z %X/%u/%02X", unsigned(zbp), unsigned(fbw), unsigned(zpsm));
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         DepthIn(cmd, SwizzleParams{zbp * 32, fbw, zpsm, d->width, rows, d->pw(), 0, 1, first_row, d->scale}, *d);
@@ -1783,6 +1801,7 @@ void VulkanGsRenderer::DepthFromMemory(std::uint32_t zbp, std::uint32_t width, s
     Flush();
     Image* d = DepthFor(zbp, width, height);
     Work(kWorkDepthFromMemory, {d}, {d});
+    WorkLabel("depth from memory: Z %X/%u/%02X", unsigned(zbp), unsigned(fbw), unsigned(zpsm));
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         DepthIn(cmd, SwizzleParams{zbp * 32, fbw, zpsm, d->width, d->height, d->pw(), 0, 1, 0, d->scale}, *d);
@@ -2260,6 +2279,7 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
     texture->replacement = 0;
     Image& t = texture->image;
     Work(kWorkDecode, {&t}, {&t}, d.clut != nullptr);
+    WorkLabel("decode: T %X/%u/%02X %ux%u", unsigned(d.tbp), unsigned(d.tbw), unsigned(d.psm), unsigned(d.tw), unsigned(d.th));
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         if (d.clut) vkCmdUpdateBuffer(cmd, clut_, 0, 1024, d.clut);
@@ -2994,8 +3014,10 @@ void VulkanGsRenderer::Flush() {
                     region.dstOffset = region.srcOffset;
                     region.extent = {std::uint32_t(x1 - x0), std::uint32_t(y1 - y0), 1};
                 }
+                BeginLabel(cmd, "feedback copy (destination read)", 0.9f, 0.3f, 0.3f);
                 vkCmdCopyImage(cmd, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, feedback_->image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+                EndLabel(cmd);
                 g_.Mark(cmd, kProfFeedback);
                 Transition(cmd, *feedback_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
@@ -3099,13 +3121,19 @@ void VulkanGsRenderer::Flush() {
                 drawn_ = DrawState{};           // a command buffer of its own: nothing bound yet
             } else {
                 g_pass_pixels += std::uint64_t(ri.renderArea.extent.width) * ri.renderArea.extent.height;
+                if (g_debug_labels) {
+                    char label[96];
+                    std::snprintf(label, sizeof label, "pass %X/%u/%02X, Z %X", unsigned(state_.fbp),
+                                  unsigned(state_.fbw), unsigned(state_.psm), unsigned(state_.depth ? state_.zbp : state_.fbp));
+                    BeginLabel(cmd, label, 0.3f, 0.6f, 0.9f);
+                }
                 vkCmdBeginRendering(cmd, &ri);
             }
             open_target_ = t;
             open_depth_ = depth;
             pass_batches_ = 0;
             pass_drawn_any_ = false;
-            if (Tracing())
+            if (Tracing() || g_debug_labels)
                 std::snprintf(pass_label_, sizeof pass_label_, "%X/%u/%02X %ux%u, Z %s%X", unsigned(state_.fbp),
                               unsigned(state_.fbw), unsigned(state_.psm), unsigned(ri.renderArea.extent.width),
                               unsigned(ri.renderArea.extent.height), state_.depth ? "" : "own ",

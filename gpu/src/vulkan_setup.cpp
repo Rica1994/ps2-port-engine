@@ -121,6 +121,14 @@ void AddInstancePortability(std::vector<const char*>* extensions, VkInstanceCrea
     }
     if (HasExtension(available, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME))
         AddOnce(extensions, VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+    // Debug labels (VK_EXT_debug_utils): each pass and piece of work named
+    // for a frame capture - Xcode's GPU capture and Instruments through
+    // MoltenVK (Metal debug groups), RenderDoc, Nsight. PS2GPU_LABELS=0: none.
+    const char* labels = std::getenv("PS2GPU_LABELS");
+    if (!(labels && *labels == '0') && HasExtension(available, VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+        AddOnce(extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        g_debug_labels = true;
+    }
 }
 
 bool DeviceRequirementsFor(VkPhysicalDevice gpu, bool swapchain, DeviceRequirements* out) {

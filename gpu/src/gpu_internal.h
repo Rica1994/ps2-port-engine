@@ -21,6 +21,22 @@ namespace ps2gpu {
 VkResult LoadVulkan();                      // volk, from the system's loader or the app's MoltenVK
 const char* MoltenVkPath();                 // where MoltenVK was found (Apple), else null
 void AddInstancePortability(std::vector<const char*>* extensions, VkInstanceCreateFlags* flags);
+/* Debug labels for frame captures (VK_EXT_debug_utils, AddInstancePortability
+   turns them on where the instance has it): a named group of commands. */
+inline bool g_debug_labels = false;
+inline void BeginLabel(VkCommandBuffer c, const char* name, float r = 0.5f, float g = 0.5f, float b = 0.5f) {
+    if (!g_debug_labels || !vkCmdBeginDebugUtilsLabelEXT) return;
+    VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+    label.pLabelName = name;
+    label.color[0] = r;
+    label.color[1] = g;
+    label.color[2] = b;
+    label.color[3] = 1.0f;
+    vkCmdBeginDebugUtilsLabelEXT(c, &label);
+}
+inline void EndLabel(VkCommandBuffer c) {
+    if (g_debug_labels && vkCmdEndDebugUtilsLabelEXT) vkCmdEndDebugUtilsLabelEXT(c);
+}
 /* What a device is created with for the renderer: dynamic rendering (Vulkan
    1.3's, or the extension's on a 1.2 device), the portability subset where
    listed. `chain` heads the features' pNext chain (pointing into this). */
@@ -106,6 +122,9 @@ public:
     template <typename F>
     void RecordInPass(F&& record);
     std::function<void(VkCommandBuffer, bool submit)> end_pass;
+    /* The next Record's debug label (a frame capture's name for that work):
+       taken by it. */
+    const char* next_label = nullptr;
     /* Runs what has been recorded and waits for it, and for everything
        Flush handed over before; then what was waiting for that (AfterSubmit:
        freeing staging buffers, say) runs. */
@@ -222,7 +241,11 @@ template <typename F>
 void VulkanGpu::Record(F&& record) {
     RecordInPass([&](VkCommandBuffer c) {
         if (end_pass) end_pass(c, false);
+        const char* label = next_label;
+        next_label = nullptr;
+        if (label) BeginLabel(c, label, 0.9f, 0.6f, 0.2f);
         record(c);
+        if (label) EndLabel(c);
     });
 }
 
