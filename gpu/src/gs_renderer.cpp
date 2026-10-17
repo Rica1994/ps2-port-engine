@@ -2947,6 +2947,12 @@ void VulkanGsRenderer::Flush() {
                                      nullptr, 0, nullptr);
                 pass_drawn_any_ = false;
             }
+            if (Tracing())
+                std::fprintf(stderr, "[batch] %X: %s%llX%s, area %d,%d-%d,%d%s%s\n", unsigned(state_.fbp),
+                             state_.textured ? (source ? "reads target " : "texture ") : "untextured ",
+                             (unsigned long long)(state_.textured ? (source ? std::uint64_t(state_.tex_fbp) : state_.texture) : 0u),
+                             copy_first ? " (its own: a copy)" : "", bx0, by0, bx1, by1,
+                             shader_blend ? ", shader blend" : "", state_.depth ? ", depth" : "");
             ++pass_batches_;
             if (in_place) ++g_local_reads;
             // What the pass has drawn since its last barrier (local read).
