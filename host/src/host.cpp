@@ -693,7 +693,14 @@ int Run(const Options& options) {
     if (!options.vu_record.empty()) Vu::RecordPrograms(options.vu_record);
     if (!options.memcard.empty()) mc2::SetCardDirectory(options.memcard);
     if (options.vu_interpret) Vu1().use_compiled = Vu0().use_compiled = false;
-    Vu1().fast = options.vu_fast;
+    // Fast VU1 (docs/PORTING.md "Fast mode": exact but for flags nothing
+    // reads; ~15% less VU1 time) by default on a tablet, whose VU1 is the
+    // race's wall; PS2HOST_VU_EXACT=1 turns it off there.
+    {
+        const char* exact = std::getenv("PS2HOST_VU_EXACT");
+        Vu1().fast = options.vu_fast || (platform::kMobile && !(exact && *exact && *exact != '0'));
+        if (Vu1().fast) std::fprintf(stderr, "[host] VU1 fast mode (the MAC and STATUS flags no program reads left out)\n");
+    }
     SetUntilFrame(options.until_frame);
     SetFrameTimes(options.frame_times);
     if (options.gpu || options.gpu_shadow) {
