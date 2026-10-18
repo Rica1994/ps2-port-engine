@@ -379,6 +379,33 @@ public:
         ++frame_;
         EvictReplacements();
         FastSamplingTurn();
+        HintsTurn();
+    }
+    /* PS2GPU_TILE_HINTS: 1 on, 0 off, "ab" (a tablet's default for now) each
+       in turn for 600 frames with the GPU's time a picture for each in the
+       log: the tile hints - stencil and unused depth neither loaded nor
+       stored at a pass's ends - measured in normal play. */
+    bool hints_ab_ = false;
+    std::uint64_t hints_frames_ = 0, hints_from_ns_ = 0, hints_pictures_ = 0, hints_last_draws_ = 0;
+    double hints_sum_[2] = {}, hints_count_[2] = {};
+    void HintsTurn() {
+        if (!hints_ab_) return;
+        if (g_draws - hints_last_draws_ > 300) ++hints_pictures_;
+        hints_last_draws_ = g_draws;
+        if (++hints_frames_ < 600) return;
+        const std::uint64_t ns = g_gpu_ns.load();
+        if (hints_pictures_ > 20) {
+            const double ms = double(ns - hints_from_ns_) / 1e6 / double(hints_pictures_);
+            hints_sum_[tile_hints_] += ms;
+            hints_count_[tile_hints_] += 1;
+            std::fprintf(stderr, "[gpu] tile hints %s: %.1f ms a picture over %llu pictures (on average %.1f on, %.1f off)\n",
+                         tile_hints_ ? "on" : "off", ms, (unsigned long long)hints_pictures_,
+                         hints_count_[1] ? hints_sum_[1] / hints_count_[1] : 0.0,
+                         hints_count_[0] ? hints_sum_[0] / hints_count_[0] : 0.0);
+        }
+        hints_from_ns_ = ns;
+        hints_frames_ = hints_pictures_ = 0;
+        tile_hints_ = !tile_hints_;
     }
     /* PS2GPU_FAST_SAMPLE: 1 on, 0 off, "ab" each in turn for 600 frames
        (~10 s) with the GPU's time a picture for each in the log - the
@@ -391,7 +418,8 @@ public:
     bool FastSampling() {
         if (fast_mode_ < 0) {
             const char* v = std::getenv("PS2GPU_FAST_SAMPLE");
-            const std::string mode = v ? v : (g_.portability ? "ab" : "0");
+            // (Measured on an A12, 18 Oct: 34.8 ms a picture on, 34.6 off - off by default.)
+            const std::string mode = v ? v : "0";
             fast_mode_ = mode == "ab" ? 2 : (mode == "1" ? 1 : 0);
             fast_now_ = fast_mode_ != 0;
             std::fprintf(stderr, "[gpu] fast sampling: %s\n", fast_mode_ == 2 ? "on and off in turn, 10 s each (measured)"
@@ -593,6 +621,21 @@ private:
        the CLUT), for the accounting of what ended it (PassBreak). */
     std::vector<const Image*> pass_reads_;
     bool pass_reads_clut_ = false;
+    /* THE CLUT RING (deferred passes; PS2GPU_CLUT_RING=0 off): the CLUT the
+       decodes and CLUT loads write is slot 0 of clut_; a batch reading the
+       CLUT in the shader (a target as PSMT8H) reads a copy of it in another
+       slot, taken when it last changed (ClutSnapshot). So a CLUT load never
+       writes what an open pass reads: it goes before the pass rather than
+       ending it (3-6 pass ends a race picture on an A12). The slots each pass
+       reads (open and set aside) stay untouched while it is. */
+    static constexpr std::uint32_t kClutSlots = 16;
+    bool clut_ring_ = false;
+    bool clut_dirty_ = true;                // slot 0 changed since the last copy
+    std::uint32_t clut_draw_slot_ = 0;      // the slot the draws read (0: slot 0 itself, no ring)
+    std::uint32_t pass_clut_slots_ = 0;     // the slots the open pass's draws read, a bit each
+    VkDescriptorSet clut_sets_[kClutSlots] = {};
+    std::uint64_t g_clut_copies_ = 0;
+    bool ClutSnapshot(VkCommandBuffer cmd);
     void PassReads(const Image* image) {
         if (image && (pass_reads_.empty() || pass_reads_.back() != image)) pass_reads_.push_back(image);
     }
@@ -688,6 +731,7 @@ private:
         open_target_ = open_depth_ = nullptr;
         pass_reads_.clear();
         pass_reads_clut_ = false;
+        pass_clut_slots_ = 0;
     }
     /* A deferred pass into the frame's command buffer: its begin, its draws
        (the secondary command buffer), its end. */
@@ -889,6 +933,7 @@ private:
         std::int32_t area[4] = {};
         std::vector<const Image*> reads;
         bool reads_clut = false;
+        std::uint32_t clut_slots = 0;
         std::uint32_t batches = 0;
         char label[96] = {};
         DrawState drawn;
@@ -940,6 +985,7 @@ private:
         std::copy(pass_area_, pass_area_ + 4, p.area);
         p.reads.swap(pass_reads_);
         p.reads_clut = pass_reads_clut_;
+        p.clut_slots = pass_clut_slots_;
         p.batches = pass_batches_;
         std::memcpy(p.label, pass_label_, sizeof p.label);
         p.drawn = drawn_;
@@ -950,6 +996,7 @@ private:
         pass_cmd_ = VK_NULL_HANDLE;
         pass_reads_.clear();
         pass_reads_clut_ = false;
+        pass_clut_slots_ = 0;
     }
     /* The pass set aside for this target and depth buffer, open again. */
     bool TakeUp(Image* t, Image* depth) {
@@ -965,6 +1012,7 @@ private:
             std::copy(p.area, p.area + 4, pass_area_);
             pass_reads_.swap(p.reads);
             pass_reads_clut_ = p.reads_clut;
+            pass_clut_slots_ = p.clut_slots;
             pass_batches_ = p.batches;
             std::memcpy(pass_label_, p.label, sizeof pass_label_);
             drawn_ = p.drawn;
@@ -1277,11 +1325,11 @@ bool VulkanGsRenderer::Init(std::string* error) {
     cli.pBindings = &clut_binding;
     vkCreateDescriptorSetLayout(g_.device, &cli, nullptr, &clut_set_layout_);
     VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192},
-                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4},
+                                     {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 + kClutSlots},
                                      {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1024}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpi.maxSets = 8192 + 4 + (g_.local_read ? 1024 : 0);
+    dpi.maxSets = 8192 + 4 + kClutSlots + (g_.local_read ? 1024 : 0);
     dpi.poolSizeCount = g_.local_read ? 3 : 2;
     dpi.pPoolSizes = sizes;
     vkCreateDescriptorPool(g_.device, &dpi, nullptr, &pool_);
@@ -1326,6 +1374,11 @@ bool VulkanGsRenderer::Init(std::string* error) {
     tile_hints_ = defer_passes_ = TileWays(g_.portability);
     if (g_.portability) pool_limit_ = 128;
     if (const char* hints = std::getenv("PS2GPU_TILE_HINTS")) tile_hints_ = hints[0] != '0';
+    {
+        const char* hints = std::getenv("PS2GPU_TILE_HINTS");
+        hints_ab_ = hints ? std::string(hints) == "ab" : g_.portability;
+        if (hints_ab_) tile_hints_ = true;
+    }
     if (const char* emulate = std::getenv("PS2GPU_LOCAL_READ_EMULATE"))
         emulate_tbdr_ = emulate[0] && emulate[0] != '0' && !g_.local_read;
     if (emulate_tbdr_) std::fprintf(stderr, "[gpu] local read emulated as a tile-based GPU reads (a copy at each pass)\n");
@@ -1336,8 +1389,8 @@ bool VulkanGsRenderer::Init(std::string* error) {
     if (const char* reorder = std::getenv("PS2GPU_REORDER")) reorder_ = reorder[0] && reorder[0] != '0';
     if (InPlaceReads()) reorder_ = false;
     if (reorder_) defer_passes_ = true;
-    std::fprintf(stderr, "[gpu] tile-based GPU ways: local read %s, tile hints %s, deferred passes %s, reordered passes %s\n",
-                 g_.local_read ? "on" : "off", tile_hints_ ? "on" : "off", defer_passes_ ? "on" : "off",
+    std::fprintf(stderr, "[gpu] tile-based GPU ways: local read %s, tile hints %s%s, deferred passes %s, reordered passes %s\n",
+                 g_.local_read ? "on" : "off", tile_hints_ ? "on" : "off", hints_ab_ ? " (and off in turn, measured)" : "", defer_passes_ ? "on" : "off",
                  reorder_ ? "on" : "off");
     return InitMemory(error);
 }
@@ -1362,7 +1415,7 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (!DeviceBuffer(kLocalMemory, usage, &gsmem_, &gsmem_memory_) ||
         !DeviceBuffer(kLinear, usage, &linear_, &linear_memory_) ||
-        !DeviceBuffer(1024, usage, &clut_, &clut_memory_)) {
+        !DeviceBuffer(1024 * kClutSlots, usage, &clut_, &clut_memory_)) {
         if (error) *error = "no GPU memory for GS local memory";
         return false;
     }
@@ -1375,13 +1428,28 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
             if (error) *error = "no descriptor set for the CLUT";
             return false;
         }
-        const VkDescriptorBufferInfo info{clut_, 0, VK_WHOLE_SIZE};
+        const VkDescriptorBufferInfo info{clut_, 0, 1024};
         VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         write.dstSet = clut_set_;
         write.descriptorCount = 1;
         write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         write.pBufferInfo = &info;
         vkUpdateDescriptorSets(g_.device, 1, &write, 0, nullptr);
+        // The ring's slots (slot 0's set is clut_set_).
+        clut_sets_[0] = clut_set_;
+        clut_ring_ = defer_passes_;
+        if (const char* ring = std::getenv("PS2GPU_CLUT_RING")) clut_ring_ = clut_ring_ && ring[0] != '0';
+        for (std::uint32_t k = 1; clut_ring_ && k < kClutSlots; ++k) {
+            if (vkAllocateDescriptorSets(g_.device, &ai, &clut_sets_[k]) != VK_SUCCESS) {
+                clut_ring_ = false;
+                break;
+            }
+            const VkDescriptorBufferInfo slot{clut_, VkDeviceSize(k) * 1024, 1024};
+            write.dstSet = clut_sets_[k];
+            write.pBufferInfo = &slot;
+            vkUpdateDescriptorSets(g_.device, 1, &write, 0, nullptr);
+        }
+        std::fprintf(stderr, "[gpu] CLUT ring: %s\n", clut_ring_ ? "on" : "off");
     }
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     ci.codeSize = sizeof spirv_swizzle_comp;
@@ -1411,7 +1479,7 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         return false;
     }
     VkDescriptorBufferInfo infos[3] = {{gsmem_, 0, VK_WHOLE_SIZE}, {linear_, 0, VK_WHOLE_SIZE},
-                                       {clut_, 0, VK_WHOLE_SIZE}};
+                                       {clut_, 0, 1024}};
     VkWriteDescriptorSet writes[3] = {};
     for (int i = 0; i < 3; ++i) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2586,7 +2654,8 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
     if (!texture) return;
     texture->replacement = 0;
     Image& t = texture->image;
-    Work(kWorkDecode, {&t}, {&t}, d.clut != nullptr);
+    Work(kWorkDecode, {&t}, {&t}, d.clut != nullptr && !clut_ring_);
+    if (d.clut) clut_dirty_ = true;
     WorkLabel("decode: T %X/%u/%02X %ux%u", unsigned(d.tbp), unsigned(d.tbw), unsigned(d.psm), unsigned(d.tw), unsigned(d.th));
     g_.Record([&](VkCommandBuffer cmd) {
         g_.Mark(cmd, kProfDecode);   // before the work, so that its time is counted as it
@@ -2685,12 +2754,42 @@ VkDescriptorSet VulkanGsRenderer::DecodeSet(Image& image) {
     return set;
 }
 
+/* A copy of the CLUT (slot 0) into a slot no pass open or set aside reads,
+   for the batches reading it from here on (the CLUT ring). Recorded into the
+   frame's command buffer before the open pass, which is deferred. With every
+   slot read, the passes end first (as without the ring). */
+bool VulkanGsRenderer::ClutSnapshot(VkCommandBuffer cmd) {
+    std::uint32_t used = 1u | pass_clut_slots_;
+    for (const ParkedPass& p : parked_) used |= p.clut_slots;
+    std::uint32_t slot = 0;
+    for (std::uint32_t i = 1; i < kClutSlots && !slot; ++i) {
+        const std::uint32_t k = 1 + (clut_draw_slot_ + i - 1) % (kClutSlots - 1);
+        if (!(used >> k & 1)) slot = k;
+    }
+    if (!slot) {
+        work_ = kWorkClut;
+        work_conflicts_ = true;
+        EndPass(cmd, kBreakWork);
+        while (!parked_.empty()) EmitParked(cmd, 0, kBreakWork, kWorkClut);
+        slot = 1 + clut_draw_slot_ % (kClutSlots - 1);
+    }
+    MemoryBarrier(cmd);             // slot 0's writes before; the slot's last readers (earlier passes) done
+    const VkBufferCopy copy{0, VkDeviceSize(slot) * 1024, 1024};
+    vkCmdCopyBuffer(cmd, clut_, clut_, 1, &copy);
+    MemoryBarrier(cmd);
+    ++g_clut_copies_;
+    clut_draw_slot_ = slot;
+    clut_dirty_ = false;
+    return true;
+}
+
 void VulkanGsRenderer::ClutFromMemory(const GsClutLoad& load) {
     Flush();                        // what is pending may draw the CLUT, or sample through the old one
     DecodeParams params{load.cbp, 1, load.cpsm, load.eight ? 256u : 16u, 1, 0, 0, 0, 0, 0, 0,
                         load.texa_lo, load.ta1, load.csa};
     params.mode = 1;
-    Work(kWorkClut, {}, {}, true);
+    Work(kWorkClut, {}, {}, !clut_ring_);
+    clut_dirty_ = true;
     g_.Record([&](VkCommandBuffer cmd) {
         g_.Mark(cmd, kProfDecode);   // before the work, so that its time is counted as it
         MemoryBarrier(cmd);
@@ -2709,7 +2808,8 @@ void VulkanGsRenderer::ClutRows(const std::uint32_t* clut, std::uint32_t rows) {
     rows &= 0xFFFF;
     if (!rows) return;
     Flush();                        // what is pending samples through the old rows
-    Work(kWorkClutRows, {}, {}, true);
+    Work(kWorkClutRows, {}, {}, !clut_ring_);
+    clut_dirty_ = true;
     g_.Record([&](VkCommandBuffer cmd) {
         MemoryBarrier(cmd);
         for (std::uint32_t r = 0; r < 16;) {
@@ -3364,6 +3464,7 @@ void VulkanGsRenderer::Flush() {
             } else if (why >= 0) {
                 EndPass(cmd, why);
             }
+            if (clut_ring_ && source && state_.tex_format == 4 && clut_dirty_) ClutSnapshot(cmd);
             // Local read: a batch reading what the open pass drew since its last
             // barrier needs one first (MoltenVK: the Metal pass stored and begun
             // again). Emulated, the pass ends and the next takes a fresh copy.
@@ -3572,7 +3673,10 @@ void VulkanGsRenderer::Flush() {
             else if (state_.textured) PassReads(&texture->image);
             if (shader_blend && feedback_ && !in_place) PassReads(feedback_);
             if (snapshot) PassReads(snapshot);
-            pass_reads_clut_ = pass_reads_clut_ || (source && state_.tex_format == 4);
+            if (source && state_.tex_format == 4) {
+                if (clut_ring_) pass_clut_slots_ |= 1u << clut_draw_slot_;
+                else pass_reads_clut_ = true;
+            }
             // ZTST: NEVER, ALWAYS, GEQUAL, GREATER - the larger Z is nearer.
             static const VkCompareOp kCompare[4] = {VK_COMPARE_OP_NEVER, VK_COMPARE_OP_ALWAYS,
                                                     VK_COMPARE_OP_GREATER_OR_EQUAL, VK_COMPARE_OP_GREATER};
@@ -3583,9 +3687,9 @@ void VulkanGsRenderer::Flush() {
             if (d.depth_test != depth_test) vkCmdSetDepthTestEnable(dc, VkBool32(d.depth_test = depth_test));
             if (d.stencil_test != stencil_test) vkCmdSetStencilTestEnable(dc, VkBool32(d.stencil_test = stencil_test));
             if (d.compare != compare) vkCmdSetDepthCompareOp(dc, kCompare[d.compare = compare]);
-            if (d.sets[0] != set || d.sets[1] != clut_set_) {
+            if (d.sets[0] != set || d.sets[1] != clut_sets_[clut_draw_slot_]) {
                 d.sets[0] = set;
-                d.sets[1] = clut_set_;
+                d.sets[1] = clut_sets_[clut_draw_slot_];
                 vkCmdBindDescriptorSets(dc, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 2, d.sets, 0, nullptr);
             }
             if (destination_set)
