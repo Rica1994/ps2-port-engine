@@ -29,6 +29,13 @@ layout(set = 2, binding = 0) uniform sampler2D destination;
 // shading them only for pipelines that cannot discard - with discard merely
 // present in the shader, every pixel of every draw is shaded.
 layout(constant_id = 0) const bool kMayDiscard = true;
+// Which of the shader's ways this pipeline has (kShape, gs_renderer.cpp):
+// 0 all of them; 1 untextured; 2 a texture from memory as it is - level 0
+// only, no replacement, not a target drawn larger, no sprite snap, not
+// through the CLUT. The pixels are the same; a pipeline without the ways it
+// never takes is a smaller shader with fewer registers (Apple's GPUs run
+// more pixels at once with fewer: the whole shader's 96 on an A12).
+layout(constant_id = 1) const uint kShape = 0u;
 
 layout(location = 0) in vec4 shade;
 layout(location = 1) noperspective in vec3 coordinate;
@@ -227,6 +234,43 @@ vec4 Sample(vec2 uv) {
     return floor(c0 + (c1 - c0) * f + 0.5);
 }
 
+// kShape 2's texel: CLAMP's modes at level 0, a 32-, 24- or 16-bit texel.
+vec4 SimpleTexel(int u, int v, ivec2 size) {
+    ivec2 at = ivec2(Wrap(u, size.x, p.wms, p.minu, p.maxu, 1), Wrap(v, size.y, p.wmt, p.minv, p.maxv, 1)) & 2047;
+    at = min(at, textureSize(texture_image, 0) - 1);
+    vec4 t = floor(texelFetch(texture_image, at, 0) * 255.0 + 0.5);
+    bool black = t.r + t.g + t.b == 0.0;
+    if (p.tex_format == 1u) {
+        t.a = (p.aem != 0u && black) ? 0.0 : float(p.ta0);
+    } else if (p.tex_format == 2u) {
+        bool bit = t.a >= 128.0;
+        t.rgb = floor(t.rgb / 8.0) * 8.0;
+        black = t.r + t.g + t.b == 0.0;
+        t.a = bit ? float(p.ta1) : ((p.aem != 0u && black) ? 0.0 : float(p.ta0));
+    }
+    return t;
+}
+
+// TFX and TCC: the texel with the shade.
+vec4 TextureFunction(vec4 t, vec4 v) {
+    vec4 c;
+    vec3 product = floor(t.rgb * v.rgb / 128.0);
+    if (p.tfx == 0u) {
+        c.rgb = product;
+        c.a = p.tcc != 0u ? floor(t.a * v.a / 128.0) : v.a;
+    } else if (p.tfx == 1u) {
+        c.rgb = t.rgb;
+        c.a = p.tcc != 0u ? t.a : v.a;
+    } else if (p.tfx == 2u) {
+        c.rgb = product + v.a;
+        c.a = p.tcc != 0u ? t.a + v.a : v.a;
+    } else {
+        c.rgb = product + v.a;
+        c.a = p.tcc != 0u ? t.a : v.a;
+    }
+    return min(c, vec4(255.0));
+}
+
 #ifdef SINGLE_OUTPUT
 layout(location = 0) out vec4 colour;
 #else
@@ -237,7 +281,25 @@ layout(location = 0, index = 1) out vec4 factor;
 void main() {
     vec4 v = round(shade * 255.0);
     vec4 c = v;
-    if (p.textured != 0u) {
+    if (kShape == 2u) {
+        // A texture from memory as it is (kShape 2): the nearest texel or
+        // the four around, as Sample(uv, 0, linear) with nothing else.
+        const ivec2 size = TextureSize();
+        const vec2 uv = coordinate.xy / coordinate.z * vec2(size);
+        vec4 t;
+        if ((p.bilinear & 1u) == 0u) {
+            t = SimpleTexel(int(floor(uv.x)), int(floor(uv.y)), size);
+        } else {
+            const ivec2 xy = ivec2(floor((uv - 0.5) * 16.0));
+            const ivec2 i0 = xy >> 4;
+            const vec4 f = vec4(xy & 15, 0, 0);
+            const vec4 c00 = SimpleTexel(i0.x, i0.y, size), c10 = SimpleTexel(i0.x + 1, i0.y, size);
+            const vec4 c01 = SimpleTexel(i0.x, i0.y + 1, size), c11 = SimpleTexel(i0.x + 1, i0.y + 1, size);
+            const vec4 top = c00 + floor((c10 - c00) * f.x / 16.0), bottom = c01 + floor((c11 - c01) * f.x / 16.0);
+            t = top + floor((bottom - top) * f.y / 16.0);
+        }
+        c = TextureFunction(t, v);
+    } else if (kShape == 0u && p.textured != 0u) {
         vec2 uv = coordinate.xy / coordinate.z * vec2(TextureSize());
         // A sprite on a target drawn larger: sampled as finely as the target
         // is drawn, within the coordinates the GS reads at its first and last
@@ -268,21 +330,7 @@ void main() {
         } else {
             t = Sample(uv);
         }
-        vec3 product = floor(t.rgb * v.rgb / 128.0);
-        if (p.tfx == 0u) {
-            c.rgb = product;
-            c.a = p.tcc != 0u ? floor(t.a * v.a / 128.0) : v.a;
-        } else if (p.tfx == 1u) {
-            c.rgb = t.rgb;
-            c.a = p.tcc != 0u ? t.a : v.a;
-        } else if (p.tfx == 2u) {
-            c.rgb = product + v.a;
-            c.a = p.tcc != 0u ? t.a + v.a : v.a;
-        } else {
-            c.rgb = product + v.a;
-            c.a = p.tcc != 0u ? t.a : v.a;
-        }
-        c = min(c, vec4(255.0));
+        c = TextureFunction(t, v);
     }
 
     if (p.fge != 0u) {

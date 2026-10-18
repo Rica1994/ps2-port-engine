@@ -283,6 +283,11 @@ constexpr std::uint32_t kShaderBlend = 1u << 15;
    MoltenVK; PS2GPU_DISCARD_ALWAYS=1 every pipeline as before, =0 these
    pipelines anywhere. */
 constexpr std::uint32_t kNoDiscard = 1u << 16;
+/* Bits 17-18: gs.frag's kShape - 0 the whole shader, 1 untextured, 2 a
+   texture from memory as it is (Flush) - smaller shaders for what most
+   batches draw. PS2GPU_SHAPES=0 the whole shader always; "ab" (a tablet's
+   default for now) on and off in turn, measured. */
+constexpr std::uint32_t kShapeShift = 17;
 
 /* The pipeline a state needs: blending and its operands, and the write mask
    (bits 9-12, inverted so that 0 is the plain pipeline); bit 15 the blend
@@ -385,7 +390,8 @@ public:
        in turn for 600 frames with the GPU's time a picture for each in the
        log: the tile hints - stencil and unused depth neither loaded nor
        stored at a pass's ends - measured in normal play. */
-    bool hints_ab_ = false;
+    bool hints_ab_ = false;             // (now the shapes' turns: shapes_now_)
+    bool shapes_now_ = true;
     std::uint64_t hints_frames_ = 0, hints_from_ns_ = 0, hints_pictures_ = 0, hints_last_draws_ = 0;
     double hints_sum_[2] = {}, hints_count_[2] = {};
     void HintsTurn() {
@@ -396,16 +402,16 @@ public:
         const std::uint64_t ns = g_gpu_ns.load();
         if (hints_pictures_ > 20) {
             const double ms = double(ns - hints_from_ns_) / 1e6 / double(hints_pictures_);
-            hints_sum_[tile_hints_] += ms;
-            hints_count_[tile_hints_] += 1;
-            std::fprintf(stderr, "[gpu] tile hints %s: %.1f ms a picture over %llu pictures (on average %.1f on, %.1f off)\n",
-                         tile_hints_ ? "on" : "off", ms, (unsigned long long)hints_pictures_,
+            hints_sum_[shapes_now_] += ms;
+            hints_count_[shapes_now_] += 1;
+            std::fprintf(stderr, "[gpu] shader shapes %s: %.1f ms a picture over %llu pictures (on average %.1f on, %.1f off)\n",
+                         shapes_now_ ? "on" : "off", ms, (unsigned long long)hints_pictures_,
                          hints_count_[1] ? hints_sum_[1] / hints_count_[1] : 0.0,
                          hints_count_[0] ? hints_sum_[0] / hints_count_[0] : 0.0);
         }
         hints_from_ns_ = ns;
         hints_frames_ = hints_pictures_ = 0;
-        tile_hints_ = !tile_hints_;
+        shapes_now_ = !shapes_now_;
     }
     /* PS2GPU_FAST_SAMPLE: 1 on, 0 off, "ab" each in turn for 600 frames
        (~10 s) with the GPU's time a picture for each in the log - the
@@ -1375,9 +1381,10 @@ bool VulkanGsRenderer::Init(std::string* error) {
     if (g_.portability) pool_limit_ = 128;
     if (const char* hints = std::getenv("PS2GPU_TILE_HINTS")) tile_hints_ = hints[0] != '0';
     {
-        const char* hints = std::getenv("PS2GPU_TILE_HINTS");
-        hints_ab_ = hints ? std::string(hints) == "ab" : g_.portability;
-        if (hints_ab_) tile_hints_ = true;
+        // (Tile hints measured on an A12, 18 Oct: no difference - off.)
+        const char* shapes = std::getenv("PS2GPU_SHAPES");
+        hints_ab_ = shapes ? std::string(shapes) == "ab" : g_.portability;
+        shapes_now_ = !shapes || shapes[0] != '0';
     }
     if (const char* emulate = std::getenv("PS2GPU_LOCAL_READ_EMULATE"))
         emulate_tbdr_ = emulate[0] && emulate[0] != '0' && !g_.local_read;
@@ -1389,8 +1396,9 @@ bool VulkanGsRenderer::Init(std::string* error) {
     if (const char* reorder = std::getenv("PS2GPU_REORDER")) reorder_ = reorder[0] && reorder[0] != '0';
     if (InPlaceReads()) reorder_ = false;
     if (reorder_) defer_passes_ = true;
+    std::fprintf(stderr, "[gpu] shader shapes: %s\n", hints_ab_ ? "on and off in turn, 10 s each (measured)" : shapes_now_ ? "on" : "off");
     std::fprintf(stderr, "[gpu] tile-based GPU ways: local read %s, tile hints %s%s, deferred passes %s, reordered passes %s\n",
-                 g_.local_read ? "on" : "off", tile_hints_ ? "on" : "off", hints_ab_ ? " (and off in turn, measured)" : "", defer_passes_ ? "on" : "off",
+                 g_.local_read ? "on" : "off", tile_hints_ ? "on" : "off", "", defer_passes_ ? "on" : "off",
                  reorder_ ? "on" : "off");
     return InitMemory(error);
 }
@@ -2230,9 +2238,10 @@ VkPipeline VulkanGsRenderer::PipelineFor(std::uint32_t key) {
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = key & kShaderBlend ? frag_blend_ : frag_;
     stages[1].pName = "main";
-    const VkBool32 may_discard = (key & kNoDiscard) ? VK_FALSE : VK_TRUE;
-    const VkSpecializationMapEntry discard_entry{0, 0, sizeof(VkBool32)};
-    VkSpecializationInfo specialization{1, &discard_entry, sizeof may_discard, &may_discard};
+    const struct { VkBool32 may_discard; std::uint32_t shape; } constants{(key & kNoDiscard) ? VK_FALSE : VK_TRUE,
+                                                                           (key >> kShapeShift) & 3u};
+    const VkSpecializationMapEntry entries[2] = {{0, 0, sizeof(VkBool32)}, {1, sizeof(VkBool32), sizeof(std::uint32_t)}};
+    VkSpecializationInfo specialization{2, entries, sizeof constants, &constants};
     stages[1].pSpecializationInfo = &specialization;
     VkVertexInputBindingDescription binding{0, sizeof(PackedVertex), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attributes[6] = {
@@ -3420,6 +3429,14 @@ void VulkanGsRenderer::Flush() {
             params.bilinear |= 1u << 12;
         }
     }
+    // The shader's shape (kShapeShift): untextured, or a texture as it is.
+    std::uint32_t shape_bits = 0;
+    if (shapes_now_) {
+        if (!params.textured) shape_bits = 1u << kShapeShift;
+        else if (!(params.bilinear & ~1u) && params.scale <= 1 && params.tex_format <= 2 &&
+                 !(params.blend_ops & (0xFFu << 8)))
+            shape_bits = 2u << kShapeShift;
+    }
     const std::uint32_t count = std::uint32_t(pending_.size());
     static int complaints = 0;
     if ((!pipeline || !set) && complaints < 5) {
@@ -3752,7 +3769,7 @@ void VulkanGsRenderer::Flush() {
                     }();
                     const std::uint32_t no_discard = pass.mode == 2 && half == 0 && !discard_always ? kNoDiscard : 0u;
                     for (std::uint32_t op = logic ? 1 : 0; op <= (logic ? 2u : 0u); ++op) {
-                        const std::uint32_t op_key = (op ? ((key & (0xFu << 9)) | op << 13) : key) | no_discard;
+                        const std::uint32_t op_key = (op ? ((key & (0xFu << 9)) | op << 13) : key) | no_discard | shape_bits;
                         const VkPipeline chosen = op_key == PipelineKey(state_) ? pipeline : PipelineFor(op_key);
                         if (!chosen) continue;
                         if (d.pipeline != chosen) {
