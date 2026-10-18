@@ -87,6 +87,12 @@ inline std::atomic<VkPhysicalDevice> g_physical{VK_NULL_HANDLE};
 enum ProfileKind { kProfOther, kProfDraw, kProfSwizzle, kProfLinear, kProfMemory, kProfFeedback, kProfDecode,
                    kProfUpload, kProfClear, kProfDate, kProfReadback, kProfKinds };
 inline std::atomic<std::uint64_t> g_profile_ns[kProfKinds] = {};
+/* The profile by pass (VulkanGpu::PassEnd): each deferred pass's time under
+   its tag - what it drew into (the renderer's PassTag) - and how many. */
+constexpr int kPassTags = 256;
+inline std::atomic<std::uint64_t> g_pass_ns[kPassTags] = {};
+inline std::atomic<std::uint64_t> g_pass_count[kPassTags] = {};
+inline std::atomic<std::uint64_t> g_pass_batches[kPassTags] = {};
 /* Whether the command buffers begun from now on are profiled (SetGpuProfiling):
    on a tablet the profile is taken now and then, not all the time - on Apple's
    GPUs each of its timestamps ends a Metal pass. */
@@ -156,14 +162,31 @@ public:
         Stamp(c, run_kind_);
         run_kind_ = kind;
     }
-    /* A timestamp closing the work since the last one, counted as `kind`. */
-    void Stamp(VkCommandBuffer c, int kind) {
+    /* A timestamp closing the work since the last one, counted as `kind`
+       (and, a pass's, under its tag: -1 none). */
+    void Stamp(VkCommandBuffer c, int kind, int tag = -1) {
         if (!profiled_[current_]) return;
         std::vector<int>& marks = marks_[current_];
         if (marks.size() >= kMarks) return;
         vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profile_,
                             std::uint32_t(current_) * kMarks + std::uint32_t(marks.size()));
-        marks.push_back(kind);
+        marks.push_back(kind | (tag + 1) << 8);
+    }
+    /* Around a pass of draws: before it, the run before closed; after it,
+       its own time as draws under `tag` (g_pass_ns). */
+    void PassBegin(VkCommandBuffer c) {
+        if (!profile_ || !profiled_[current_]) return;
+        Stamp(c, run_kind_);
+        run_kind_ = kProfDraw;
+    }
+    void PassEnd(VkCommandBuffer c, int tag, std::uint32_t batches) {
+        if (!profile_ || !profiled_[current_]) return;
+        Stamp(c, kProfDraw, tag);
+        run_kind_ = kProfDraw;
+        if (tag >= 0 && tag < kPassTags) {
+            g_pass_count[tag] += 1;
+            g_pass_batches[tag] += batches;
+        }
     }
     /* Counts command buffers begun: what was set in one is not in the next. */
     std::uint64_t recording_id() const { return recordings_; }
@@ -296,8 +319,12 @@ inline bool VulkanGpu::Retire(int slot, const char* why) {
                                   ticks.size() * sizeof ticks[0], ticks.data(), sizeof ticks[0],
                                   VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
             for (std::size_t i = 1; i < ticks.size(); ++i)
-                if (ticks[i] > ticks[i - 1])
-                    g_profile_ns[marks_[slot][i]] += std::uint64_t(double(ticks[i] - ticks[i - 1]) * timestamp_ns_);
+                if (ticks[i] > ticks[i - 1]) {
+                    const std::uint64_t ns = std::uint64_t(double(ticks[i] - ticks[i - 1]) * timestamp_ns_);
+                    const int kind = marks_[slot][i] & 0xFF, tag = (marks_[slot][i] >> 8) - 1;
+                    g_profile_ns[kind] += ns;
+                    if (tag >= 0 && tag < kPassTags) g_pass_ns[tag] += ns;
+                }
         marks_[slot].clear();
     }
     std::vector<std::function<void()>> done;

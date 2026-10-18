@@ -2321,6 +2321,10 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                 last_pairs = vu1.pairs();
                 last_compiled = vu1.compiled_pairs();
                 last_gpu_ns = gpu_ns;
+                {
+                    const std::string passes = ps2gpu::GpuPassReport();
+                    if (!passes.empty()) std::fprintf(stderr, "[perf]   %s\n", passes.c_str());
+                }
                 std::fputs(WriteBackReport(s, frames).c_str(), stderr);
                 std::fflush(stderr);
                 last = Clock::now();

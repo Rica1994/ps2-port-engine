@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <tuple>
 #include <unordered_map>
 
@@ -728,7 +729,7 @@ private:
                          kBreakNames[why], why == kBreakWork ? " - " : "", why == kBreakWork ? kWorkNames[work] : "",
                          why == kBreakWork && !conflicts ? " (could go before the pass)" : "");
         if (defer_passes_) {
-            EmitPass(cmd, pass_cmd_, pass_colour_, pass_depth_, pass_stencil_, pass_area_, pass_label_);
+            EmitPass(cmd, pass_cmd_, pass_colour_, pass_depth_, pass_stencil_, pass_area_, pass_label_, pass_batches_);
             pass_cmd_ = VK_NULL_HANDLE;
         } else {
             vkCmdEndRendering(cmd);
@@ -743,7 +744,7 @@ private:
        (the secondary command buffer), its end. */
     void EmitPass(VkCommandBuffer cmd, VkCommandBuffer pass, const VkRenderingAttachmentInfo& colour,
                   const VkRenderingAttachmentInfo& z, const VkRenderingAttachmentInfo& stencil,
-                  const std::int32_t area[4], const char* label) {
+                  const std::int32_t area[4], const char* label, std::uint32_t batches = 0) {
         vkEndCommandBuffer(pass);
         VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
         ri.flags = VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
@@ -755,14 +756,17 @@ private:
         ri.pDepthAttachment = &z;
         ri.pStencilAttachment = &stencil;
         g_pass_pixels += std::uint64_t(ri.renderArea.extent.width) * ri.renderArea.extent.height;
-        g_.Mark(cmd, kProfDraw);           // (before the pass: its time is draws')
+        g_.PassBegin(cmd);                 // (before the pass: its time is draws', by pass)
         BeginLabel(cmd, label, 0.3f, 0.6f, 0.9f);
         vkCmdBeginRendering(cmd, &ri);
         vkCmdExecuteCommands(cmd, 1, &pass);
         vkCmdEndRendering(cmd);
         EndLabel(cmd);
-        g_.Mark(cmd, kProfDraw);
+        g_.PassEnd(cmd, PassTag(label), batches);
     }
+    /* A pass's tag in the profile by pass: what it drew into (its label up
+       to the depth buffer), one tag each, the last for all the rest. */
+    static int PassTag(const char* label);
     /* PS2GPU_PASS_TRACE=N: each pass of the N-th frame (Kick) on stderr -
        what it drew into, how many batches, and what ended it. */
     long long trace_frame_ = -1;
@@ -975,7 +979,7 @@ private:
         if (Tracing())
             std::fprintf(stderr, "[pass] %s: %u batches (set aside), ended by %s%s%s\n", p.label, p.batches,
                          kBreakNames[why], why == kBreakWork ? " - " : "", why == kBreakWork ? kWorkNames[work] : "");
-        EmitPass(cmd, p.cmd, p.colour, p.z, p.stencil, p.area, p.label);
+        EmitPass(cmd, p.cmd, p.colour, p.z, p.stencil, p.area, p.label, p.batches);
         parked_.erase(parked_.begin() + std::ptrdiff_t(i));
     }
     /* The open pass set aside (a batch into another target that it does not meet). */
@@ -1383,7 +1387,8 @@ bool VulkanGsRenderer::Init(std::string* error) {
     {
         // (Tile hints measured on an A12, 18 Oct: no difference - off.)
         const char* shapes = std::getenv("PS2GPU_SHAPES");
-        hints_ab_ = shapes ? std::string(shapes) == "ab" : g_.portability;
+        // (Measured on an A12, 18 Oct: ~33.5 ms a race picture on, ~36 off - on.)
+        hints_ab_ = shapes && std::string(shapes) == "ab";
         shapes_now_ = !shapes || shapes[0] != '0';
     }
     if (const char* emulate = std::getenv("PS2GPU_LOCAL_READ_EMULATE"))
@@ -4038,6 +4043,49 @@ std::uint64_t GpuMemoryInUse() {
 
 void SetGpuProfiling(bool on) { g_profiling = on; }
 bool GpuProfiling() { return g_profiling.load(); }
+
+std::vector<std::string> g_pass_names;
+std::mutex g_pass_names_lock;
+
+int VulkanGsRenderer::PassTag(const char* label) {
+    std::string key(label);
+    const std::size_t z = key.find(", Z");
+    if (z != std::string::npos) key.resize(z);
+    std::lock_guard<std::mutex> hold(g_pass_names_lock);
+    for (int i = 0; i < int(g_pass_names.size()); ++i)
+        if (g_pass_names[i] == key) return i;
+    if (g_pass_names.size() + 1 >= std::size_t(kPassTags)) return kPassTags - 1;
+    g_pass_names.push_back(key);
+    return int(g_pass_names.size()) - 1;
+}
+
+/* The profile by pass since the last: the passes that took the most GPU
+   time, with their share, count and batches. */
+std::string GpuPassReport() {
+    struct Row { int tag; std::uint64_t ns, count, batches; };
+    std::vector<Row> rows;
+    std::uint64_t total = 0;
+    for (int i = 0; i < kPassTags; ++i) {
+        const std::uint64_t ns = g_pass_ns[i].exchange(0), n = g_pass_count[i].exchange(0), b = g_pass_batches[i].exchange(0);
+        if (!ns) continue;
+        total += ns;
+        rows.push_back({i, ns, n, b});
+    }
+    if (!total) return "";
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.ns > b.ns; });
+    std::string out = "GPU by pass (" + std::to_string(total / 1000000) + " ms of passes):";
+    std::lock_guard<std::mutex> hold(g_pass_names_lock);
+    for (std::size_t i = 0; i < rows.size() && i < 10; ++i) {
+        const Row& r = rows[i];
+        const std::string name = r.tag < int(g_pass_names.size()) ? g_pass_names[r.tag] : "other";
+        char text[192];
+        std::snprintf(text, sizeof text, "\n[perf]     %5.1f%%  %-26s %6llu passes %8llu batches  %.2f ms a pass",
+                      100.0 * double(r.ns) / double(total), name.c_str(), (unsigned long long)r.count,
+                      (unsigned long long)r.batches, r.count ? double(r.ns) / 1e6 / double(r.count) : 0.0);
+        out += text;
+    }
+    return out;
+}
 
 std::string GpuProfileReport() {
     static const char* const kNames[kProfKinds] = {"other", "draws", "swizzle", "image<->linear", "memory copies",

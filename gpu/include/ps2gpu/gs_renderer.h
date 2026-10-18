@@ -347,6 +347,8 @@ std::uint64_t GpuBusyNanoseconds();
 std::uint64_t GpuMemoryInUse();
 /* PS2HOST_GPU_PROFILE: the GPU's time since the last call, by what it did. */
 std::string GpuProfileReport();
+/* The profile's GPU time by pass (what each drew into), the ten largest. */
+std::string GpuPassReport();
 /* Whether the GPU's work from the next command buffer on is profiled (where
    a profile pool was made: PS2HOST_GPU_PROFILE, or a tablet's default). */
 void SetGpuProfiling(bool on);
