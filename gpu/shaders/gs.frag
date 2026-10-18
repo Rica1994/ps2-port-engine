@@ -32,7 +32,9 @@ layout(constant_id = 0) const bool kMayDiscard = true;
 // Which of the shader's ways this pipeline has (kShape, gs_renderer.cpp):
 // 0 all of them; 1 untextured; 2 a texture from memory as it is - level 0
 // only, no replacement, not a target drawn larger, no sprite snap, not
-// through the CLUT. The pixels are the same; a pipeline without the ways it
+// through the CLUT; 3 as 2 with mipmapping, or a target as the texture
+// (at the GS's size, not through the CLUT); 4 as 2 for a target read as
+// PSMT8H (through the CLUT). The pixels are the same; a pipeline without the ways it
 // never takes is a smaller shader with fewer registers (Apple's GPUs run
 // more pixels at once with fewer: the whole shader's 96 on an A12).
 layout(constant_id = 1) const uint kShape = 0u;
@@ -84,7 +86,7 @@ int Wrap(int i, int size, uint mode, uint lo, uint hi, int k) {
 }
 
 // Whether the texture is a target drawn larger, addressed in its own pixels.
-bool Fine() { return p.scale > 1u && p.wms != 3u && p.wmt != 3u; }
+bool Fine() { return kShape == 0u && p.scale > 1u && p.wms != 3u && p.wmt != 3u; }
 
 ivec2 TextureSize() {
     return p.tw != 0u ? ivec2(int(p.tw), int(p.th)) : textureSize(texture_image, 0);
@@ -93,7 +95,7 @@ ivec2 TextureSize() {
 // A texel as the GS expands it: TEXA's alpha for 24- and 16-bit texels, a
 // target read as PSMT8H through the CLUT.
 vec4 Expand(vec4 t) {
-    if (p.tex_format == 4u) {                       // PSMT8H: the alpha byte indexes the CLUT
+    if (kShape == 0u && p.tex_format == 4u) {       // PSMT8H: the alpha byte indexes the CLUT
         const uint c = clut[uint(t.a) & 255u];
         return vec4(float(c & 255u), float((c >> 8) & 255u), float((c >> 16) & 255u), float(c >> 24));
     }
@@ -118,7 +120,7 @@ vec4 Texel(int u, int v) {
     if (k == 1) at &= 2047;
     // A target drawn larger with REGION_REPEAT: the GS texel, and the middle
     // of its square.
-    if (k == 1 && p.scale > 1u) at = at * int(p.scale) + int(p.scale / 2u);
+    if (k == 1 && kShape == 0u && p.scale > 1u) at = at * int(p.scale) + int(p.scale / 2u);
     // A target may be smaller than TEX0 says: what lies beyond is not drawn here.
     at = min(at, textureSize(texture_image, 0) - 1);
     return Fetch(at);
@@ -163,7 +165,7 @@ vec4 Sample(vec2 uv, int n, bool linear) {
 // texels to one; filtered as the game filters, with the level the pixel's
 // footprint in the replacement's texels asks for (the GS's LOD knows only its
 // own texels).
-bool Replaced() { return (p.tex_format & 0x100u) != 0u; }
+bool Replaced() { return kShape == 0u && (p.tex_format & 0x100u) != 0u; }
 
 ivec2 ReplacedSize(int n) { return textureSize(texture_image, n); }
 
@@ -239,6 +241,10 @@ vec4 SimpleTexel(int u, int v, ivec2 size) {
     ivec2 at = ivec2(Wrap(u, size.x, p.wms, p.minu, p.maxu, 1), Wrap(v, size.y, p.wmt, p.minv, p.maxv, 1)) & 2047;
     at = min(at, textureSize(texture_image, 0) - 1);
     vec4 t = floor(texelFetch(texture_image, at, 0) * 255.0 + 0.5);
+    if (kShape == 4u) {                             // a target as PSMT8H: its alpha byte through the CLUT
+        const uint c = clut[uint(t.a) & 255u];
+        return vec4(float(c & 255u), float((c >> 8) & 255u), float((c >> 16) & 255u), float(c >> 24));
+    }
     bool black = t.r + t.g + t.b == 0.0;
     if (p.tex_format == 1u) {
         t.a = (p.aem != 0u && black) ? 0.0 : float(p.ta0);
@@ -281,7 +287,7 @@ layout(location = 0, index = 1) out vec4 factor;
 void main() {
     vec4 v = round(shade * 255.0);
     vec4 c = v;
-    if (kShape == 2u) {
+    if (kShape == 2u || kShape == 4u) {
         // A texture from memory as it is (kShape 2): the nearest texel or
         // the four around, as Sample(uv, 0, linear) with nothing else.
         const ivec2 size = TextureSize();
@@ -299,14 +305,14 @@ void main() {
             t = top + floor((bottom - top) * f.y / 16.0);
         }
         c = TextureFunction(t, v);
-    } else if (kShape == 0u && p.textured != 0u) {
+    } else if ((kShape == 0u || kShape == 3u) && p.textured != 0u) {
         vec2 uv = coordinate.xy / coordinate.z * vec2(TextureSize());
         // A sprite on a target drawn larger: sampled as finely as the target
         // is drawn, within the coordinates the GS reads at its first and last
         // pixels (gs_renderer.cpp's DrawTriangles: further, where it meets
         // another), and - REPEAT, the sprite within one copy of the texture -
         // not wrapping round to its far side (a tile's edge: seams).
-        const uint snap = (p.blend_ops >> 8) & 255u;
+        const uint snap = kShape == 0u ? (p.blend_ops >> 8) & 255u : 0u;
         if (snap > 1u) {
             const vec2 size = vec2(TextureSize());
             const vec2 lo = min(range.xy, range.zw), hi = max(range.xy, range.zw);
@@ -318,7 +324,7 @@ void main() {
         // The footprint in a replacement's texels, from the coordinates before
         // the sprite's clamp above (whose edges would read as a large one).
         vec4 t;
-        if (((p.bilinear >> 12) & 1u) != 0u) {
+        if (kShape == 0u && ((p.bilinear >> 12) & 1u) != 0u) {
             // FAST SAMPLING (gs_renderer.cpp): the GPU's sampler, REPEAT or
             // CLAMP and the filter set by it; the texel's levels as the GS's.
             t = floor(texture(texture_image, coordinate.xy / coordinate.z) * 255.0 + 0.5);

@@ -153,6 +153,9 @@ std::uint64_t g_work_hoistable[kWorks] = {};
 std::uint64_t g_work_hoisted[kWorks] = {};
 std::uint64_t g_blend_copies[kBlendWhys] = {};     // copies for the destination, by why
 std::uint64_t g_batches = 0, g_blend_batches = 0, g_date_batches = 0;
+// Batches by shader shape: untextured, plain texture, and the whole shader's
+// for a mipmapped texture, a target as the texture, anything else.
+std::uint64_t g_shapes[5] = {};
 // Local read: batches that read their target in place, and the barriers
 // before those that read what their pass had drawn (each a Metal pass's end).
 std::uint64_t g_local_reads = 0, g_local_barriers = 0;
@@ -284,8 +287,8 @@ constexpr std::uint32_t kShaderBlend = 1u << 15;
    MoltenVK; PS2GPU_DISCARD_ALWAYS=1 every pipeline as before, =0 these
    pipelines anywhere. */
 constexpr std::uint32_t kNoDiscard = 1u << 16;
-/* Bits 17-18: gs.frag's kShape - 0 the whole shader, 1 untextured, 2 a
-   texture from memory as it is (Flush) - smaller shaders for what most
+/* Bits 17-19: gs.frag's kShape - 0 the whole shader, 1 untextured, 2 a
+   texture as it is, 3 mipmapped, 4 a target through the CLUT (Flush) - smaller shaders for what most
    batches draw. PS2GPU_SHAPES=0 the whole shader always; "ab" (a tablet's
    default for now) on and off in turn, measured. */
 constexpr std::uint32_t kShapeShift = 17;
@@ -2244,7 +2247,7 @@ VkPipeline VulkanGsRenderer::PipelineFor(std::uint32_t key) {
     stages[1].module = key & kShaderBlend ? frag_blend_ : frag_;
     stages[1].pName = "main";
     const struct { VkBool32 may_discard; std::uint32_t shape; } constants{(key & kNoDiscard) ? VK_FALSE : VK_TRUE,
-                                                                           (key >> kShapeShift) & 3u};
+                                                                           (key >> kShapeShift) & 7u};
     const VkSpecializationMapEntry entries[2] = {{0, 0, sizeof(VkBool32)}, {1, sizeof(VkBool32), sizeof(std::uint32_t)}};
     VkSpecializationInfo specialization{2, entries, sizeof constants, &constants};
     stages[1].pSpecializationInfo = &specialization;
@@ -3438,9 +3441,18 @@ void VulkanGsRenderer::Flush() {
     std::uint32_t shape_bits = 0;
     if (shapes_now_) {
         if (!params.textured) shape_bits = 1u << kShapeShift;
-        else if (!(params.bilinear & ~1u) && params.scale <= 1 && params.tex_format <= 2 &&
-                 !(params.blend_ops & (0xFFu << 8)))
-            shape_bits = 2u << kShapeShift;
+        else if (params.scale <= 1 && params.tex_format <= 2 && !(params.blend_ops & (0xFFu << 8)) &&
+                 !(params.bilinear & (1u << 12)))
+            shape_bits = (params.bilinear & ~1u ? 3u : 2u) << kShapeShift;
+        else if (source && params.scale <= 1 && params.tex_format == 4 && !(params.blend_ops & (0xFFu << 8)) &&
+                 !(params.bilinear & ~1u))
+            shape_bits = 4u << kShapeShift;
+    }
+    // Counted (RendererBreakdown): untextured, a texture as it is, the whole
+    // shader, through the CLUT, mipmapped.
+    {
+        const std::uint32_t shape = shape_bits >> kShapeShift;
+        ++g_shapes[shape == 1 ? 0 : shape == 2 ? 1 : shape == 0 ? 2 : shape == 4 ? 3 : 4];
     }
     const std::uint32_t count = std::uint32_t(pending_.size());
     static int complaints = 0;
@@ -4175,6 +4187,11 @@ std::string RendererBreakdown(const char* prefix) {
                   delta(g_batches, &last_more[0]), delta(g_blend_batches, &last_more[1]),
                   delta(g_date_batches, &last_more[2]), delta(g_aux_passes, &last_more[3]),
                   double(delta(g_pass_pixels, &last_more[4])) / 1e6);
+    out += text;
+    static std::uint64_t last_shapes[5] = {};
+    std::snprintf(text, sizeof text, "\n%sbatches by shader: untextured %llu, plain texture %llu; whole shader %llu; a target through the CLUT %llu; mipmapped %llu",
+                  prefix, delta(g_shapes[0], &last_shapes[0]), delta(g_shapes[1], &last_shapes[1]),
+                  delta(g_shapes[2], &last_shapes[2]), delta(g_shapes[3], &last_shapes[3]), delta(g_shapes[4], &last_shapes[4]));
     out += text;
     const unsigned long long local = delta(g_local_reads, &last_more[5]), barriers = delta(g_local_barriers, &last_more[6]);
     if (local) {
