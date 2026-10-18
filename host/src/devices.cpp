@@ -480,8 +480,13 @@ void StartCapture(u64 frame) {
     }
     g_capture_dir = dir.string();
     // Two frames: a game drawing a picture every other blank (Burnout 3)
-    // draws nothing in one of them.
-    g_capture_frame = (long long)frame + 2;
+    // draws nothing in one of them. PS2HOST_CAPTURE_FRAMES=N: N frames (a
+    // replay whose later frames run as the game's do, its images known).
+    static const long long frames = [] {
+        const char* v = std::getenv("PS2HOST_CAPTURE_FRAMES");
+        return v && *v ? std::max(2ll, std::atoll(v)) : 2ll;
+    }();
+    g_capture_frame = (long long)frame + frames;
     GpuCaptureBegin(frame + 1, (dir / "passes").string());
     gs::Gs& g = gs::TheGs();
     // The frames' GS stream (replay.bin), for --gs-replay: memory as it is

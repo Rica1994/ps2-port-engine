@@ -716,6 +716,125 @@ void PathsAgree() {
 
 }  // namespace
 
+/* ConvertImage and ConvertFromDepth against the way through memory they
+   replace: an image swizzled into GPU memory and the other loaded from it -
+   every pair of the formats made, and Z16 views of Z24 and Z32 depth
+   buffers. Each image starts from other contents than the source, so a pixel
+   the conversion missed shows. */
+void Converted(ps2gpu::GsRenderer& renderer) {
+    const std::uint32_t formats[6] = {0x00, 0x02, 0x0A, 0x30, 0x32, 0x3A};
+    auto is16 = [](std::uint32_t f) { return f == 0x02 || f == 0x0A || f == 0x32 || f == 0x3A; };
+    std::uint32_t seed = 12345;
+    auto random_bytes = [&](std::vector<std::uint8_t>& bytes) {
+        for (auto& b : bytes) {
+            seed = seed * 1664525u + 1013904223u;
+            b = std::uint8_t(seed >> 24);
+        }
+    };
+    // 128 pixels wide (FBW 2), two page rows of 32-bit pixels: 128 blocks.
+    const std::uint32_t fbw = 2, blocks = 128;
+    std::uint32_t fbp = 0x100;
+    auto read = [&](std::uint32_t at, std::uint32_t psm, std::vector<std::uint32_t>* pixels) {
+        std::uint32_t w = 0, h = 0;
+        return renderer.ReadTarget(at, fbw, psm, pixels, &w, &h);
+    };
+    for (std::uint32_t src : formats)
+        for (std::uint32_t dst : formats) {
+            if (src == dst) continue;
+            fbp += 4;                           // (four pages a pair: images of their own)
+            std::vector<std::uint8_t> a(blocks * 256), b(blocks * 256);
+            random_bytes(a);
+            random_bytes(b);
+            renderer.MemoryWrite(fbp * 32, fbp * 32 + blocks, a.data());
+            renderer.TargetFromMemory(fbp, fbw, src, 128, is16(src) ? 128 : 64);
+            renderer.MemoryWrite(fbp * 32, fbp * 32 + blocks, b.data());
+            renderer.TargetFromMemory(fbp, fbw, dst, 128, is16(dst) ? 128 : 64);
+            const bool made = renderer.ConvertImage(fbp, fbw, dst, is16(dst) ? 128 : 64, fbp, fbw, src);
+            std::vector<std::uint32_t> got, want;
+            read(fbp, dst, &got);
+            renderer.TargetToMemory(fbp, fbw, src, 128, is16(src) ? 128 : 64, 0);
+            renderer.TargetFromMemory(fbp, fbw, dst, 128, is16(dst) ? 128 : 64);
+            read(fbp, dst, &want);
+            char what[96];
+            std::snprintf(what, sizeof what, "an image in %02X made from one in %02X as through memory", unsigned(dst),
+                          unsigned(src));
+            Check(made && !got.empty() && got == want, what);
+        }
+    for (std::uint32_t zpsm : {0x31u, 0x30u})
+        for (std::uint32_t view : {0x32u, 0x3Au, 0x02u, 0x00u}) {
+            fbp += 4;
+            std::vector<std::uint8_t> a(blocks * 256), b(blocks * 256);
+            random_bytes(a);
+            if (zpsm == 0x31)                   // Z24: a word's top byte is memory's, Z within 24 bits
+                for (std::size_t i = 0; i < a.size(); i += 4) a[i + 2] &= 0x7F;
+            random_bytes(b);
+            renderer.MemoryWrite(fbp * 32, fbp * 32 + blocks, a.data());
+            renderer.DepthFromMemory(fbp, 128, 64, fbw, zpsm);
+            renderer.MemoryWrite(fbp * 32, fbp * 32 + blocks, b.data());
+            renderer.TargetFromMemory(fbp, fbw, view, 128, is16(view) ? 128 : 64);
+            renderer.MemoryWrite(fbp * 32, fbp * 32 + blocks, a.data());     // (the top bytes as the depth buffer's own)
+            const bool made = renderer.ConvertFromDepth(fbp, fbw, view, is16(view) ? 128 : 64, fbp, 128, 64, fbw, zpsm);
+            std::vector<std::uint32_t> got, want;
+            read(fbp, view, &got);
+            renderer.DepthToMemory(fbp, 128, 64, fbw, zpsm, 128, 64, 0);
+            renderer.TargetFromMemory(fbp, fbw, view, 128, is16(view) ? 128 : 64);
+            read(fbp, view, &want);
+            char what[96];
+            std::snprintf(what, sizeof what, "a %02X view made from a %02X depth buffer as through memory",
+                          unsigned(view), unsigned(zpsm));
+            Check(made && !got.empty() && got == want, what);
+        }
+}
+
+/* Write-backs of part of an image (Columns, and a rectangle not a multiple
+   of 16 wide - a 16-bit word's two pixels are x and x + 8): the pixels inside
+   reach memory, the ones beside them leave memory as it was. */
+void PartWrittenBack(ps2gpu::GsRenderer& renderer) {
+    std::uint32_t seed = 777;
+    auto random_bytes = [&](std::vector<std::uint8_t>& bytes) {
+        for (auto& b : bytes) {
+            seed = seed * 1664525u + 1013904223u;
+            b = std::uint8_t(seed >> 24);
+        }
+    };
+    const std::uint32_t fbw = 2, blocks = 128;
+    std::uint32_t fbp = 0x180;
+    for (std::uint32_t psm : {0x00u, 0x02u, 0x0Au, 0x32u})
+        for (int way = 0; way < 2; ++way) {
+            fbp += 4;
+            const bool is16 = psm != 0x00;
+            const std::uint32_t rows = is16 ? 128 : 64;
+            std::vector<std::uint8_t> a(blocks * 256), b(blocks * 256);
+            random_bytes(a);
+            random_bytes(b);
+            std::vector<std::uint32_t> pa, pb, got;
+            std::uint32_t w = 0, h = 0;
+            renderer.MemoryWrite(fbp * 32, fbp * 32 + blocks, b.data());
+            renderer.TargetFromMemory(fbp, fbw, psm, 128, rows);
+            renderer.ReadTarget(fbp, fbw, psm, &pb, &w, &h);
+            renderer.MemoryWrite(fbp * 32, fbp * 32 + blocks, a.data());
+            renderer.TargetFromMemory(fbp, fbw, psm, 128, rows);
+            renderer.ReadTarget(fbp, fbw, psm, &pa, &w, &h);
+            renderer.MemoryWrite(fbp * 32, fbp * 32 + blocks, b.data());
+            // Way 0: columns [64, 128) (a page column); way 1: columns [0, 72).
+            const std::uint32_t x0 = way == 0 ? 64 : 0, x1 = way == 0 ? 128 : 72;
+            renderer.Columns(x0, x1);
+            renderer.TargetToMemory(fbp, fbw, psm, 128, rows, 0);
+            renderer.Columns(0, ~0u);
+            renderer.TargetFromMemory(fbp, fbw, psm, 128, rows);
+            renderer.ReadTarget(fbp, fbw, psm, &got, &w, &h);
+            bool ok = got.size() == pa.size() && pa.size() == pb.size() && !got.empty();
+            for (std::size_t i = 0; ok && i < got.size(); ++i) {
+                const std::uint32_t x = std::uint32_t(i % w);
+                ok = got[i] == ((x >= x0 && x < x1) ? pa[i] : pb[i]);
+            }
+            char what[96];
+            std::snprintf(what, sizeof what, "%02X: columns %u-%u to memory, the rest left as it was", unsigned(psm),
+                          unsigned(x0), unsigned(x1));
+            Check(ok, what);
+        }
+}
+
 int main() {
     // The renderers that read their targets in place, against the copies,
     // first - each with a device of its own.
@@ -745,6 +864,8 @@ int main() {
     RenderToTexture(*renderer);
     TargetFromMemory(*renderer);
     PartlyMaskedChannels(*renderer);
+    Converted(*renderer);
+    PartWrittenBack(*renderer);
     if (g_failures) std::printf("gpu renderer tests: %d failed\n", g_failures);
     else std::printf("gpu renderer tests: all passed (%s)\n", gpu->Describe().c_str());
     return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;

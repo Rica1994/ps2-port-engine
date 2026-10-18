@@ -270,6 +270,13 @@ u64 GsFrameDone();
    looked (at each frame's end, without waiting): with GsFrameDone, how far
    behind the EE the pictures are. */
 u64 GpuFrameDone();
+/* The GPU's busy time in all (nanoseconds, from its timestamps, counted as
+   each frame's work is retired): a port's frame skipping paces the pictures
+   by what one costs the GPU. 0 without the GPU renderer. */
+u64 GpuBusyNs();
+/* Whether the GPU's work is being profiled now (a tablet's one interval a
+   minute): its busy time is a little high meanwhile - pacing leaves it out. */
+bool GpuProfilingNow();
 /* When the EE ended frame `frame` (GsFrame; ClockNs), 0 if not known. */
 u64 FrameEndedNs(u64 frame);
 /* The frame being made had its picture's drawing left out (frame skipping:

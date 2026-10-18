@@ -99,6 +99,8 @@ u32 PixelBits(u32 psm) {
 }
 
 bool Is16(u32 psm) { return psm == gs::PSMCT16 || psm == gs::PSMCT16S || psm == gs::PSMZ16 || psm == gs::PSMZ16S; }
+/* A 24-bit format: it never writes its words' top byte. */
+bool Is24(u32 psm) { return psm == gs::PSMCT24 || psm == gs::PSMZ24; }
 
 /* The blocks a buffer's first `rows` rows take: whole rows of pages (32 blocks
    each), FBW pages wide. */
@@ -155,6 +157,13 @@ struct Owned {
     // depth buffer, while drawing Z into other pages of it - 200 reloads,
     // each with the depth buffer's write-back, a picture).
     Pages stale_pages, dirty_pages;
+    // Of stale_pages, those changed in more than the low 24 bits of their
+    // words: a 24-bit image (Z24, CT24) drawn over others leaves each word's
+    // top byte as it was. A texture of the top bytes alone (PSMT8H: the
+    // race's sun glare reads ~16 texels of its depth buffer's memory that
+    // way, seven times a picture) has nothing to bring up to date unless
+    // these are among its pages.
+    Pages stale_full;
     // The page rectangle last drawn (x0, x1, y0, y1, inclusive), all of it
     // in dirty_pages while `rect_dirty`: most primitives land inside it.
     u32 rect[4] = {};
@@ -162,7 +171,18 @@ struct Owned {
     u64 reloads[4] = {};            // reloads, by why
     u64 drawn_serial = 0;           // when the GPU last drew into it (Bridge::serial)
     u64 checked = 0;                // Bridge::newer_epoch when Use last looked at the others
+    // Made from a twin to be sampled (ConvertFromTwin): the twin, still newer
+    // than memory, and how far it had drawn (its drawn_serial) - until it
+    // draws again, its drawing is in this image as well.
+    const Owned* synced_twin = nullptr;
+    u64 synced_serial = 0;
 };
+
+/* Whether `other`'s drawing, newer than memory, is in `o` already: `o` was
+   made from it to be sampled and it has not drawn since. */
+bool InStep(const Owned& o, const Owned& other) {
+    return o.synced_twin == &other && other.drawn_serial == o.synced_serial;
+}
 
 /* A texture decoded into the renderer (--gpu). */
 struct Cached {
@@ -263,6 +283,7 @@ struct Bridge {
     u64 patched_words = 0, patches = 0;
     std::map<u32, u64> texture_downloads;   // by the texture's TEX0 PSM << 16 | TBW
     u64 write_backs = 0, reloads = 0, decodes = 0;
+    u64 converts = 0;               // images made from a twin without memory (ConvertFromTwin)
     // Why images went back to memory (WriteBack's `why`, kWb*) and came back
     // (Owned::why), colour/depth apart; and, by what asked it, which image
     // went back for what - the [perf] report's "write-backs by why" lines.
@@ -361,15 +382,19 @@ void Coherent(Bridge& b, u32 begin, u32 end, bool to_gpu) {
 
 /* `o` stale for `why`, in the rows over blocks [b0, b1) (all of it, past its
    blocks or by default). */
-void MarkStale(Owned& o, int why, u32 b0 = 0, u32 b1 = ~0u, const Pages* pages = nullptr, bool by16 = false) {
+void MarkStale(Owned& o, int why, u32 b0 = 0, u32 b1 = ~0u, const Pages* pages = nullptr, bool by16 = false,
+               bool by24 = false) {
     ++g_mutations;
+    Pages changed;
     if (pages) {
-        o.stale_pages |= *pages;
+        changed = *pages;
     } else if (b1 != ~0u && b0 < b1) {
-        for (u32 p = b0 / 32; p <= (b1 - 1) / 32 && p < 512; ++p) o.stale_pages.set(p);
+        for (u32 p = b0 / 32; p <= (b1 - 1) / 32 && p < 512; ++p) changed.set(p);
     } else {
-        o.stale_pages.set();
+        changed.set();
     }
+    o.stale_pages |= changed;
+    if (!by24) o.stale_full |= changed;
     u32 r0 = 0, r1 = ~0u;
     if (b1 != ~0u && b0 < b1 && b1 > o.begin) {
         const u32 page_rows = Is16(o.psm) ? 64 : 32, row_blocks = std::max(1u, o.fbw) * 32;
@@ -563,9 +588,130 @@ void ApplyPatch(Bridge& b) {
     ++b.patches;
 }
 
+/* Formats an image is made in from a twin (ConvertImage): the whole of each
+   word (a 24-bit format leaves a byte to memory). A colour image may be in
+   a Z format (the race draws Z as colour into views of its small buffers). */
+bool Colour(u32 psm) {
+    return psm == gs::PSMCT32 || psm == gs::PSMCT16 || psm == gs::PSMCT16S || psm == gs::PSMZ32 ||
+           psm == gs::PSMZ16 || psm == gs::PSMZ16S;
+}
+
+/* Target `o` about to be used while another image over the same memory -
+   its twin: the same FBP and FBW in another colour format, holding all of
+   `o`'s memory - has drawn there and memory has not: `o` made from the twin
+   on the GPU (ConvertImage), without the twin written back to memory and `o`
+   reloaded from it. The race's depth into the frame's alpha goes through a
+   16-bit view of its 640x448 frame twice a picture: each way, before, one
+   image swizzled into memory and the other back out of it - on an A12, most
+   of the GPU's swizzle time. `o` then holds the twin's drawing and takes
+   over taking it to memory (its dirty pages); the twin, as up to date as
+   `o`, holds nothing memory lacks. Only when the twin is the one image newer
+   than memory over `o`, and itself up to date; PS2HOST_CONVERT=0: through
+   memory, as before. */
+bool ConvertFromTwin(Bridge& b, Owned& o, bool for_draw) {
+    static const bool on = [] {
+        const char* v = std::getenv("PS2HOST_CONVERT");
+        return !(v && *v == '0');
+    }();
+    if (!on || o.depth || !Colour(o.psm) || o.end <= o.begin) return false;
+    // Made to be drawn into, `o` takes over the twin's drawing (its dirty
+    // pages: two images newer than memory over the same pages would leave
+    // memory to whichever went back last); made to be sampled, it takes over
+    // nothing and holds nothing of its own - the twin goes on standing for
+    // what memory lacks (a depth buffer's Z16 view, so that the depth buffer
+    // drawn into goes on as before).
+    // `o`'s rows in use (its blocks [begin, end)): the twin holds them all, as
+    // memory and its own drawing have them.
+    Pages used;
+    for (u32 p = o.begin / 32; p < std::min(512u, (o.end + 31) / 32); ++p) used.set(p);
+    // The twin a colour image (CT32, CT16, a 16-bit Z format's view) or a
+    // depth buffer (Z24, Z32: the race's PSMZ16 read of its depth buffer).
+    auto twin_of = [&](const Owned& t) {
+        const bool from_depth = t.depth && (t.psm == gs::PSMZ24 || t.psm == gs::PSMZ32);
+        return (t.depth ? from_depth : Colour(t.psm)) && t.fbp == o.fbp && t.fbw == o.fbw && t.begin <= o.begin &&
+               t.full_end >= o.end && !(t.stale && (t.stale_pages & used).any()) && !(t.stale_beyond && o.end > t.end);
+    };
+    Owned* twin = nullptr;
+    for (auto& [key, other] : b.owned)
+        if (&other != &o && other.gpu_newer && other.dirty_begin < o.end && o.begin < other.dirty_end) {
+            if (twin) return false;             // two: through memory
+            twin = &other;
+        }
+    if (twin && !twin_of(*twin)) return false;
+    // None newer than memory: memory has it all, and so does a twin up to
+    // date - made from that rather than reloaded, as cheap and with no
+    // memory read (and the same way, so that it is tried every picture).
+    if (!twin && o.stale)
+        for (auto& [key, other] : b.owned)
+            if (&other != &o && twin_of(other)) {
+                twin = &other;
+                break;
+            }
+    if (!twin) return false;
+    Owned& t = *twin;
+    const bool from_depth = t.depth;
+    const bool transfer = for_draw && t.gpu_newer;
+    if (from_depth && for_draw) return false;           // (drawn into: through memory, as before)
+    if (!for_draw && o.gpu_newer) return false;         // (its own drawing could go back over the twin's)
+    // (`o` newer than memory itself is no matter: the twin, up to date, has
+    // what `o` has - `o` drawing since would have made it stale.)
+    const u32 page_rows = Is16(o.psm) ? 64 : 32, row_blocks = std::max(1u, o.fbw) * 32;
+    const u32 rows = std::min(o.height, (o.end - o.begin + row_blocks - 1) / row_blocks * page_rows);
+    if (from_depth) {
+        // A Z24 word's top byte comes from GPU memory: the CPU's writes there first.
+        Coherent(b, o.begin, o.end, true);
+        if (!b.renderer->ConvertFromDepth(o.fbp, o.fbw, o.psm, rows, t.fbp, t.width, t.height, t.fbw, t.psm))
+            return false;
+    } else if (!b.renderer->ConvertImage(o.fbp, o.fbw, o.psm, rows, t.fbp, t.fbw, t.psm)) {
+        return false;
+    }
+    ++g_mutations;
+    ++b.newer_epoch;
+    ++b.converts;
+    ++b.write_back_pairs[ImageName(o) + " made from " + ImageName(t) + " (no memory)"];
+    if (gs::TheGs().trace)
+        std::fprintf(gs::TheGs().trace_out, "[gpu] convert %s rows 0-%u from %s\n", ImageName(o).c_str(),
+                     unsigned(rows), ImageName(t).c_str());
+    o.synced_twin = transfer ? nullptr : &t;
+    o.synced_serial = t.drawn_serial;
+    if (transfer) {
+        o.dirty_begin = o.gpu_newer ? std::min(o.dirty_begin, t.dirty_begin) : t.dirty_begin;
+        o.dirty_end = o.gpu_newer ? std::max(o.dirty_end, t.dirty_end) : t.dirty_end;
+        o.dirty_pages = o.gpu_newer ? (o.dirty_pages | t.dirty_pages) : t.dirty_pages;
+        o.gpu_newer = true;
+        o.rect_dirty = false;
+        // As far as the twin drew, in `o`'s rows (not all of `o`: the frame's
+        // last rows lie over the depth buffer, drawn into all the time).
+        const u32 drawn = std::min(t.drawn_end, o.end);
+        o.x1 = o.width;
+        if (drawn > o.begin)
+            o.y1 = std::max(o.y1, std::min(rows, (drawn - o.begin + row_blocks - 1) / row_blocks * page_rows));
+        o.drawn_end = std::max(o.drawn_end, drawn);
+        o.drawn_serial = std::max(o.drawn_serial, t.drawn_serial);
+        t.gpu_newer = false;
+        t.dirty_begin = ~0u;
+        t.dirty_end = 0;
+        t.dirty_pages.reset();
+        t.rect_dirty = false;
+    }
+    // Up to date in the rows made; what was stale past them stays so.
+    o.stale_pages &= ~used;
+    o.stale_full &= ~used;
+    if (o.stale_pages.none()) {
+        o.stale = false;
+        o.stale_row0 = 0;
+        o.stale_row1 = ~0u;
+        o.by16 = false;
+    } else {
+        o.stale_row0 = std::max(o.stale_row0, rows);
+    }
+    o.checked = b.newer_epoch;
+    return true;
+}
+
 /* A target or depth buffer about to be drawn into or sampled: up to date with
    memory and whatever else the GPU drew over its blocks. */
-Owned& Use(Bridge& b, u32 fbp, u32 fbw, u32 psm, bool depth, u32 width, u32 height, u32 rows) {
+Owned& Use(Bridge& b, u32 fbp, u32 fbw, u32 psm, bool depth, u32 width, u32 height, u32 rows, bool for_draw) {
     // Tens of thousands of draws a frame go to the same target as the one
     // before: that one, without the map (its elements stay put).
     static Owned* last = nullptr;
@@ -587,6 +733,7 @@ Owned& Use(Bridge& b, u32 fbp, u32 fbw, u32 psm, bool depth, u32 width, u32 heig
         o.full_end = Blocks(fbp, fbw, psm, height).second;
         o.drawn_end = o.begin;
         o.stale_pages.set();
+        o.stale_full.set();
     } else {
         const u32 end = Blocks(fbp, fbw, psm, rows).second;
         if (end > o.end) {
@@ -597,12 +744,24 @@ Owned& Use(Bridge& b, u32 fbp, u32 fbw, u32 psm, bool depth, u32 width, u32 heig
     }
     if (!o.stale && o.checked == b.newer_epoch) return o;
     ++g_mutations;
+    // Sampled, with the one image newer than memory over it its twin, whose
+    // drawing it has: nothing to do.
+    bool in_step = !for_draw && !o.stale;
+    for (auto& [key, other] : b.owned)
+        if (in_step && &other != &o && other.gpu_newer && other.dirty_begin < o.end && o.begin < other.dirty_end)
+            in_step = InStep(o, other);
+    if (in_step) {
+        o.checked = b.newer_epoch;
+        return o;
+    }
+    if (ConvertFromTwin(b, o, for_draw)) return o;
+    o.synced_twin = nullptr;
     // Another image's drawing over these blocks reaches this one through memory.
     for (auto& [key, other] : b.owned)
         if (&other != &o && other.gpu_newer && other.dirty_begin < o.end && o.begin < other.dirty_end) {
             const u32 b0 = other.dirty_begin, b1 = other.dirty_end;
             WriteBack(b, other, kWbOtherImage, ImageName(o));
-            MarkStale(o, 3, b0, b1, nullptr, Is16(other.psm));
+            MarkStale(o, 3, b0, b1, nullptr, Is16(other.psm), Is24(other.psm));
         }
     o.checked = b.newer_epoch;
     if (o.stale) {
@@ -637,6 +796,7 @@ Owned& Use(Bridge& b, u32 fbp, u32 fbw, u32 psm, bool depth, u32 width, u32 heig
         o.stale_row0 = 0;
         o.stale_row1 = ~0u;
         o.stale_pages.reset();
+        o.stale_full.reset();
         ++o.reloads[o.why];
         o.stale = o.stale_beyond = false;
     }
@@ -698,7 +858,7 @@ void Drew(Bridge& b, Owned& o, u32 x0, u32 x1, u32 y1, u32 y0) {
     for (auto& [key, other] : b.owned) {
         if (&other == &o || de <= other.begin || other.full_end <= db) continue;
         if (db < other.end) {
-            MarkStale(other, 2, db, de, &pages, Is16(o.psm));
+            MarkStale(other, 2, db, de, &pages, Is16(o.psm), Is24(o.psm));
         } else {
             other.stale_beyond = true;
         }
@@ -771,8 +931,41 @@ Pages PageRows(const Owned& o, u32 first, u32 last) {
     return pages;
 }
 
-/* What `o` drew in the page rows over `pages`, into the GPU's memory - those
-   rows only; its other rows stay drawn but not yet there. */
+/* Pages of `o` in `pages` as runs along its page rows: f(row, first page
+   column, end page column) for each. */
+template <typename F>
+void PageRuns(const Owned& o, const Pages& pages, F&& f) {
+    const u32 fbw = std::max(1u, o.fbw), base = o.begin / 32, end = std::min(512u, (o.full_end + 31) / 32);
+    for (u32 p = base; p < end;) {
+        if (!pages.test(p)) {
+            ++p;
+            continue;
+        }
+        const u32 row = (p - base) / fbw, c0 = (p - base) % fbw;
+        u32 c1 = c0 + 1;
+        while (c1 < fbw && base + row * fbw + c1 < end && pages.test(base + row * fbw + c1)) ++c1;
+        f(row, c0, c1);
+        p = base + row * fbw + c1;
+    }
+}
+
+/* Whole page rows moved for a sample (the default), or just the pages it
+   reads (PS2HOST_SAMPLE_PAGES=1, Columns). Measured on lavapipe (18 Oct,
+   race.args): by pages, the race's samples moved a third of the pixels but
+   took five times the write-backs and doubled a picture's passes - each
+   sample's few pages, where by rows one write-back served the next samples
+   too; on a tile-based GPU a pass's end costs more than the pixels. */
+bool ByRows() {
+    static const bool rows = [] {
+        const char* v = std::getenv("PS2HOST_SAMPLE_PAGES");
+        return !(v && *v && *v != '0');
+    }();
+    return rows;
+}
+
+/* What `o` drew in the page rows over `pages` (those pages alone with
+   PS2HOST_SAMPLE_PAGES=1), into the GPU's memory; its other pages stay drawn
+   but not yet there. */
 void WriteBackPages(Bridge& b, Owned& o, const Pages& pages, int why, const std::string& for_what) {
     u32 pr0, pr1;
     if (!o.gpu_newer || !PageRowsOf(o, pages & o.dirty_pages, &pr0, &pr1)) return;
@@ -780,26 +973,46 @@ void WriteBackPages(Bridge& b, Owned& o, const Pages& pages, int why, const std:
     Timed timed(Section::GpuSync);
     const TimelineStep step("sync: a write-back of a few rows");
     const u32 page_rows = Is16(o.psm) ? 64 : 32, row_blocks = std::max(1u, o.fbw) * 32;
-    const u32 first = pr0 * page_rows, last = std::min(o.y1, pr1 * page_rows);
-    const u32 b0 = o.begin + pr0 * row_blocks, b1 = o.begin + pr1 * row_blocks;
     ++b.write_backs_by[why][o.depth ? 1 : 0];
-    ++b.write_back_pairs[ImageName(o) + " rows for " + kWriteBackWhy[why] + (for_what.empty() ? "" : " " + for_what)];
-    Coherent(b, b0, b1, true);
-    if (gs::TheGs().trace)
-        std::fprintf(gs::TheGs().trace_out, "[gpu] write-back %s %X/%u/%02X rows %u-%u cols %u (for a sample)\n",
-                     o.depth ? "Z" : "C", unsigned(o.fbp), unsigned(o.fbw), unsigned(o.psm), unsigned(first),
-                     unsigned(last), unsigned(o.x1));
-    const bool done = first < last &&
-                      (o.depth ? b.renderer->DepthToMemory(o.fbp, o.width, o.height, o.fbw, o.psm, o.x1, last, first)
-                               : b.renderer->TargetToMemory(o.fbp, o.fbw, o.psm, o.x1, last, first));
-    if (done) {
-        ++b.write_backs;
-        std::fill(b.blocks.begin() + std::min(b0, 16384u), b.blocks.begin() + std::min(b1, 16384u), Bridge::kGpuNewer);
+    ++b.write_back_pairs[ImageName(o) + (ByRows() ? " rows for " : " pages for ") + kWriteBackWhy[why] +
+                         (for_what.empty() ? "" : " " + for_what)];
+    Pages written;
+    bool any = false;
+    // The rectangle [x0, x1) x [first, last) of `o`, over blocks [b0, b1).
+    auto move = [&](u32 x0, u32 x1, u32 first, u32 last, u32 b0, u32 b1) {
+        Coherent(b, b0, b1, true);
+        if (gs::TheGs().trace)
+            std::fprintf(gs::TheGs().trace_out, "[gpu] write-back %s %X/%u/%02X rows %u-%u cols %u-%u (for a sample)\n",
+                         o.depth ? "Z" : "C", unsigned(o.fbp), unsigned(o.fbw), unsigned(o.psm), unsigned(first),
+                         unsigned(last), unsigned(x0), unsigned(x1));
+        if (first >= last || x0 >= x1) return;
+        b.renderer->Columns(x0, x1);
+        const bool done = o.depth ? b.renderer->DepthToMemory(o.fbp, o.width, o.height, o.fbw, o.psm, x1, last, first)
+                                  : b.renderer->TargetToMemory(o.fbp, o.fbw, o.psm, x1, last, first);
+        b.renderer->Columns(0, ~0u);
+        if (done) {
+            any = true;
+            std::fill(b.blocks.begin() + std::min(b0, 16384u), b.blocks.begin() + std::min(b1, 16384u),
+                      Bridge::kGpuNewer);
+        }
+    };
+    if (ByRows()) {
+        move(0, o.x1, pr0 * page_rows, std::min(o.y1, pr1 * page_rows), o.begin + pr0 * row_blocks,
+             o.begin + pr1 * row_blocks);
+        written = PageRows(o, pr0, pr1);
+    } else {
+        const Pages todo = pages & o.dirty_pages;
+        PageRuns(o, todo, [&](u32 row, u32 c0, u32 c1) {
+            move(c0 * 64, std::min(o.x1, c1 * 64), row * page_rows, std::min(o.y1, (row + 1) * page_rows),
+                 o.begin + row * row_blocks + c0 * 32, o.begin + row * row_blocks + c1 * 32);
+        });
+        written = todo;
     }
-    // Those rows are in memory now: no longer drawn-since for what samples
+    if (any) ++b.write_backs;
+    // Those pages are in memory now: no longer drawn-since for what samples
     // them. (dirty_begin/dirty_end stay - a whole write-back still covers
     // them, only writing them again.)
-    o.dirty_pages &= ~PageRows(o, pr0, pr1);
+    o.dirty_pages &= ~written;
     o.rect_dirty = false;
     if (o.dirty_pages.none()) {
         o.gpu_newer = false;
@@ -811,52 +1024,78 @@ void WriteBackPages(Bridge& b, Owned& o, const Pages& pages, int why, const std:
 /* Target `o` about to be sampled as a texture, over `pages`: brought up to
    date only if what it lacks lies there - changed under it since it was
    loaded, or drawn by another image the GPU has not written back - and then
-   only in the page rows over those pages, when nothing of its own is newer
-   than memory: the race reads ~16 texels of a 1024x256 view over its depth
-   buffer at a time, ~18 times a picture, between draws into that depth
-   buffer - each, before, the whole 640x448 depth buffer swizzled into
-   memory and the whole view reloaded (on an A12, a quarter of the GPU's
-   time in a race). PS2HOST_SAMPLE_WHOLE=1: the whole image, as before. */
-void Sample(Bridge& b, Owned& o, const Pages& pages) {
-    bool needed = o.stale && (o.stale_pages & pages).any();
+   only in the page rows over them (those pages alone with PS2HOST_SAMPLE_PAGES=1),
+   when nothing of its own is newer than memory: the race reads ~16 texels of
+   a 1024x256 view over its depth buffer at a time, ~7 times a picture,
+   between draws into that depth buffer - each, before 17 Oct, the whole
+   640x448 depth buffer swizzled into memory and the whole view reloaded (on
+   an A12, a quarter of the GPU's time in a race). PS2HOST_SAMPLE_WHOLE=1:
+   the whole image, as before. */
+void Sample(Bridge& b, Owned& o, const Pages& pages, bool top_bytes = false) {
+    // `top_bytes`: only each word's top byte is read (PSMT8H) - what 24-bit
+    // images drew there, newer than memory or not, changed nothing it reads.
+    bool needed = o.stale && ((top_bytes ? o.stale_full : o.stale_pages) & pages).any();
     for (auto it = b.owned.begin(); !needed && it != b.owned.end(); ++it)
-        needed = &it->second != &o && it->second.gpu_newer && (it->second.dirty_pages & pages).any();
+        needed = &it->second != &o && it->second.gpu_newer && (it->second.dirty_pages & pages).any() &&
+                 !InStep(o, it->second) && !(top_bytes && Is24(it->second.psm));
     if (!needed) return;
+    if (ConvertFromTwin(b, o, false)) return;
+    o.synced_twin = nullptr;
     static const bool whole = [] {
         const char* v = std::getenv("PS2HOST_SAMPLE_WHOLE");
         return v && *v && *v != '0';
     }();
     u32 pr0, pr1;
     if (whole || o.depth || o.gpu_newer || !o.width || !PageRowsOf(o, pages, &pr0, &pr1)) {
-        Use(b, o.fbp, o.fbw, o.psm, false, o.width, o.height, 1);   // sampling grows nothing
+        Use(b, o.fbp, o.fbw, o.psm, false, o.width, o.height, 1, false);   // sampling grows nothing
         return;
     }
     ++g_mutations;
-    const Pages rows = PageRows(o, pr0, pr1);
-    // The others' drawing over those rows, into memory; the rows stale.
+    const Pages want = ByRows() ? PageRows(o, pr0, pr1) : pages;
+    // The others' drawing over those pages, into memory; the pages stale.
     for (auto& [key, other] : b.owned)
-        if (&other != &o && other.gpu_newer && (other.dirty_pages & rows).any()) {
-            const Pages theirs = other.dirty_pages & rows;
-            WriteBackPages(b, other, rows, kWbOtherImage, ImageName(o) + " sampled");
-            MarkStale(o, 3, 0, ~0u, &theirs, Is16(other.psm));
+        if (&other != &o && other.gpu_newer && (other.dirty_pages & want).any()) {
+            const Pages theirs = other.dirty_pages & want;
+            WriteBackPages(b, other, want, kWbOtherImage, ImageName(o) + " sampled");
+            MarkStale(o, 3, 0, ~0u, &theirs, Is16(other.psm), Is24(other.psm));
         }
-    if (!(o.stale && (o.stale_pages & rows).any())) return;
-    // Those rows from memory (the CPU's writes there first).
+    if (!(o.stale && (o.stale_pages & want).any())) return;
+    // Those pages from memory (the CPU's writes there first).
     const u32 page_rows = Is16(o.psm) ? 64 : 32, row_blocks = std::max(1u, o.fbw) * 32;
-    const u32 r0 = std::min(pr0 * page_rows, o.height), r1 = std::min(pr1 * page_rows, o.height);
     Timed timed(Section::GpuSync);
     const TimelineStep step("sync: a few rows reloaded");
     ++b.reloads_by[std::min(o.why, 3)][0];
     ++b.reloads;
-    Coherent(b, o.begin + pr0 * row_blocks, o.begin + pr1 * row_blocks, true);
-    if (gs::TheGs().trace)
-        std::fprintf(gs::TheGs().trace_out, "[gpu] reload C %X/%u/%02X why %d rows %u-%u (for a sample)\n",
-                     unsigned(o.fbp), unsigned(o.fbw), unsigned(o.psm), o.why, unsigned(r0), unsigned(r1));
     b.renderer->ReloadKeepsColour(o.by16 && !Is16(o.psm));
-    if (r0 < r1) b.renderer->TargetRowsFromMemory(o.fbp, o.fbw, o.psm, o.width, o.height, r0, r1 - r0);
+    auto load = [&](u32 x0, u32 x1, u32 r0, u32 r1, u32 b0, u32 b1) {
+        Coherent(b, b0, b1, true);
+        r0 = std::min(r0, o.height);
+        r1 = std::min(r1, o.height);
+        x1 = std::min(x1, o.width);
+        if (gs::TheGs().trace)
+            std::fprintf(gs::TheGs().trace_out, "[gpu] reload C %X/%u/%02X why %d rows %u-%u cols %u-%u (for a sample)\n",
+                         unsigned(o.fbp), unsigned(o.fbw), unsigned(o.psm), o.why, unsigned(r0), unsigned(r1),
+                         unsigned(x0), unsigned(x1));
+        if (r0 >= r1 || x0 >= x1) return;
+        b.renderer->Columns(x0, x1);
+        b.renderer->TargetRowsFromMemory(o.fbp, o.fbw, o.psm, o.width, o.height, r0, r1 - r0);
+        b.renderer->Columns(0, ~0u);
+    };
+    Pages loaded;
+    if (ByRows()) {
+        load(0, o.width, pr0 * page_rows, pr1 * page_rows, o.begin + pr0 * row_blocks, o.begin + pr1 * row_blocks);
+        loaded = want;
+    } else {
+        loaded = o.stale_pages & want;
+        PageRuns(o, loaded, [&](u32 row, u32 c0, u32 c1) {
+            load(c0 * 64, c1 * 64, row * page_rows, (row + 1) * page_rows, o.begin + row * row_blocks + c0 * 32,
+                 o.begin + row * row_blocks + c1 * 32);
+        });
+    }
     b.renderer->ReloadKeepsColour(false);
     ++o.reloads[o.why];
-    o.stale_pages &= ~rows;
+    o.stale_pages &= ~loaded;
+    o.stale_full &= ~loaded;
     if (o.stale_pages.none()) {
         o.stale = o.stale_beyond = false;
         o.stale_row0 = 0;
@@ -1418,18 +1657,42 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     }
     Owned* target = nullptr;
     Owned* tex_source = nullptr;
-    if (s.primary) target = &Use(s, state.fbp, state.fbw, state.psm, false, state.width, state.height, rows);
+    if (s.primary) target = &Use(s, state.fbp, state.fbw, state.psm, false, state.width, state.height, rows, true);
     if (state.textured) {
         const u32 tex_psm = Bits(c.tex0, 20, 6), tbp_blocks = Bits(c.tex0, 0, 14);
         // A target read as PSMT8H (Burnout 3's glow and blur passes, ~900 a
         // picture in a race) indexes the GPU's CLUT by its alpha byte in the
         // shader (4): it was swizzled into GPU memory and decoded again each
         // time.
+        // A depth buffer read as PSMZ16 (the race's haze, once a picture: the
+        // depth buffer written back to memory, then decoded as a 1024x1024
+        // texture) is a 16-bit view of it, made from it on the GPU
+        // (ConvertFromTwin) and sampled as a target. PS2HOST_Z16_VIEW=0: decoded.
+        static const bool z16_views = [] {
+            const char* v = std::getenv("PS2HOST_Z16_VIEW");
+            return !(v && *v == '0');
+        }();
+        const bool z16 = (tex_psm == gs::PSMZ16 || tex_psm == gs::PSMZ16S) && s.primary && z16_views;
         const u32 tex_format = tex_psm == gs::PSMCT32 ? 0 : tex_psm == gs::PSMCT24 ? 1
-                             : (tex_psm == gs::PSMCT16 || tex_psm == gs::PSMCT16S) ? 2
+                             : (tex_psm == gs::PSMCT16 || tex_psm == gs::PSMCT16S || z16) ? 2
                              : (tex_psm == gs::PSMT8H && s.primary) ? 4 : 3;
         state.tw = tw;
         state.th = th;
+        if (z16 && tbp_blocks % 32 == 0) {
+            const u32 tex_fbp = tbp_blocks / 32, tex_fbw = Bits(c.tex0, 14, 6);
+            if (!s.owned.count(std::make_tuple(tex_fbp, tex_fbw, tex_psm, false)))
+                for (u32 zpsm : {u32(gs::PSMZ24), u32(gs::PSMZ32)}) {
+                    auto found = s.owned.find(std::make_tuple(tex_fbp, tex_fbw, zpsm, true));
+                    if (found == s.owned.end() || !found->second.width) continue;
+                    const Owned& z = found->second;
+                    // The view: as wide as the depth buffer, twice its rows (16-bit);
+                    // in use, the rows it has drawn (the race keeps small buffers in
+                    // the depth buffer's last 64 rows).
+                    Use(s, tex_fbp, tex_fbw, tex_psm, false, z.width, 2 * z.height,
+                        std::max(1u, std::min(th, 2 * std::max(z.y1, 1u))), false);
+                    break;
+                }
+        }
         // A texture that is a target the GPU has drawn is sampled from it
         // (render to texture).
         if ((s.primary || s.targets_as_textures) && tex_format != 3 && tbp_blocks % 32 == 0) {
@@ -1443,8 +1706,9 @@ void OnDraw(const gs::Gs::DrawCall& call) {
                 if (s.primary) {
                     Owned& source = s.owned[std::make_tuple(tex_fbp, tex_fbw, psm, false)];
                     Pages sampled;
-                    if (SampledPages(source, c.clamp, tw, th, v, n, &sampled)) Sample(s, source, sampled);
-                    else Use(s, tex_fbp, tex_fbw, psm, false, source.width, source.height, 1);   // sampling grows nothing
+                    if (SampledPages(source, c.clamp, tw, th, v, n, &sampled))
+                        Sample(s, source, sampled, tex_format == 4 && !Is16(psm));
+                    else Use(s, tex_fbp, tex_fbw, psm, false, source.width, source.height, 1, false);   // sampling grows nothing
                     tex_source = &source;
                 }
                 if (tex_format == 4 && b_clut_rows_cpu_only(s)) {
@@ -1557,7 +1821,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     Owned* depth = nullptr;
     if (state.depth) {
         if (s.primary) {
-            depth = &Use(s, state.zbp, state.fbw, zpsm, true, state.width, 512, rows);   // (the renderer's kDepthRows)
+            depth = &Use(s, state.zbp, state.fbw, zpsm, true, state.width, 512, rows, true);   // (the renderer's kDepthRows)
         } else if (s.depth_seeded.insert(state.zbp).second) {
             // Each depth buffer starts the frame as local memory has it, so the
             // GPU tests against what the software GS drew.
@@ -1635,7 +1899,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
                 zv[i].b = u8(c >> 16);
                 zv[i].a = u8(c >> 24);
             }
-            Owned& view = Use(s, zs.fbp, zs.fbw, zs.psm, false, zs.width, zs.height, rows);
+            Owned& view = Use(s, zs.fbp, zs.fbw, zs.psm, false, zs.width, zs.height, rows, true);
             s.renderer->DrawTriangles(zs, zv, n);
             Drew(s, view, x0, x1, y1, y0);
         }
@@ -1711,6 +1975,7 @@ void Rescale(Bridge& b, u32 scale) {
         o.stale_row0 = 0;
         o.stale_row1 = ~0u;
         o.stale_pages.set();
+        o.stale_full.set();
         o.gpu_newer = false;
         o.dirty_begin = ~0u;
         o.dirty_end = 0;
@@ -1984,6 +2249,8 @@ std::string WriteBackReport(Bridge& b, u64 frames) {
 
 std::atomic<u64> g_gpu_frame_done{0};
 u64 GpuFrameDone() { return g_gpu_frame_done.load(std::memory_order_acquire); }
+u64 GpuBusyNs() { return g_bridge ? ps2gpu::GpuBusyNanoseconds() : 0; }
+bool GpuProfilingNow() { return g_bridge && ps2gpu::GpuProfiling() && platform::kMobile; }
 
 void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
     if (!g_bridge) return;
@@ -2001,9 +2268,10 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
             s.renderer->Kick();
         }
         if (frame % 100 == 0)
-            std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads, %llu decodes, %zu images, %zu textures (%llu MB, %llu evicted)\n",
+            std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads (%llu made from a twin), %llu decodes, %zu images, %zu textures (%llu MB, %llu evicted)\n",
                          static_cast<unsigned long long>(frame), static_cast<unsigned long long>(s.serial),
                          static_cast<unsigned long long>(s.write_backs), static_cast<unsigned long long>(s.reloads),
+                         static_cast<unsigned long long>(s.converts),
                          static_cast<unsigned long long>(s.decodes), s.owned.size(), s.textures.size(),
                          static_cast<unsigned long long>(s.texture_bytes >> 20), static_cast<unsigned long long>(s.evictions));
         // PS2HOST_PERF=1: a tablet's report on any machine.
@@ -2057,6 +2325,13 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                 std::fflush(stderr);
                 last = Clock::now();
                 last_frame = frame;
+                // A tablet's GPU profile (by default): one interval a minute -
+                // the next, after eleven without; its "GPU ... ms:" line is the
+                // report after it. The GPU's busy time is a little higher in it
+                // (each timestamp a Metal pass's end).
+                static const bool sampled = platform::kMobile && !std::getenv("PS2HOST_GPU_PROFILE");
+                static unsigned reports = 0;
+                if (sampled) ps2gpu::SetGpuProfiling(++reports % 12 == 11);
             }
         } else if (frame % 300 == 0 && std::getenv("PS2HOST_GPU_PROFILE"))
             std::fprintf(stderr, "[gpu] frame %llu: %s\n", static_cast<unsigned long long>(frame),
@@ -2185,6 +2460,8 @@ bool StartGpuRenderer(std::string* error, GpuMode, bool) {
 void GpuSetScale(u32) {}
 void GpuShadowFrame(gs::u64, const std::string&) {}
 u64 GpuFrameDone() { return ~0ull; }
+u64 GpuBusyNs() { return 0; }
+bool GpuProfilingNow() { return false; }
 std::string GpuShadowSummary() { return ""; }
 
 #endif

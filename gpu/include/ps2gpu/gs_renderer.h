@@ -273,6 +273,31 @@ public:
        as memory holds it (a GS pixel a square). Where the colour differs,
        memory's, as ever. */
     virtual void ReloadKeepsColour(bool keep) { (void)keep; }
+    /* For the ToMemory and RowsFromMemory calls that follow: columns
+       [first, end) of the rectangle alone (0, ~0u: all of it, as before) -
+       a few pages of an image moved, not its whole rows. A renderer that
+       cannot leaves it out: the whole rows, as before. */
+    virtual void Columns(std::uint32_t first, std::uint32_t end) { (void)first, (void)end; }
+    /* The target (fbp, fbw, psm), its rows [0, rows), made from target (src_fbp, src_fbw, src_psm)
+       over the same memory, as memory would have it, without memory: each
+       of its pixels from the source's pixels that lay its bytes out (CT32,
+       CT16, CT16S, at the PS2's resolution). False if the renderer cannot -
+       the caller goes through memory, as before. Pixels whose bytes the
+       source does not hold are left as they are. */
+    virtual bool ConvertImage(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t rows,
+                              std::uint32_t src_fbp, std::uint32_t src_fbw, std::uint32_t src_psm) {
+        (void)fbp, (void)fbw, (void)psm, (void)rows, (void)src_fbp, (void)src_fbw, (void)src_psm;
+        return false;
+    }
+    /* The same from the depth buffer at ZBP of this size (Z24, Z32, laid out
+       FBW pages wide): a Z16 view of it, say. A Z24 word's top byte, not the
+       depth buffer's, as GPU memory has it. */
+    virtual bool ConvertFromDepth(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t rows,
+                                  std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::uint32_t zfbw,
+                                  std::uint32_t zpsm) {
+        (void)fbp, (void)fbw, (void)psm, (void)rows, (void)zbp, (void)width, (void)height, (void)zfbw, (void)zpsm;
+        return false;
+    }
     /* TargetFromMemory / DepthFromMemory for rows [first_row, first_row +
        rows) alone (the rest of the image as it is). */
     virtual void TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t width,
@@ -322,6 +347,10 @@ std::uint64_t GpuBusyNanoseconds();
 std::uint64_t GpuMemoryInUse();
 /* PS2HOST_GPU_PROFILE: the GPU's time since the last call, by what it did. */
 std::string GpuProfileReport();
+/* Whether the GPU's work from the next command buffer on is profiled (where
+   a profile pool was made: PS2HOST_GPU_PROFILE, or a tablet's default). */
+void SetGpuProfiling(bool on);
+bool GpuProfiling();
 
 }  // namespace ps2gpu
 

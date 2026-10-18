@@ -87,6 +87,10 @@ inline std::atomic<VkPhysicalDevice> g_physical{VK_NULL_HANDLE};
 enum ProfileKind { kProfOther, kProfDraw, kProfSwizzle, kProfLinear, kProfMemory, kProfFeedback, kProfDecode,
                    kProfUpload, kProfClear, kProfDate, kProfReadback, kProfKinds };
 inline std::atomic<std::uint64_t> g_profile_ns[kProfKinds] = {};
+/* Whether the command buffers begun from now on are profiled (SetGpuProfiling):
+   on a tablet the profile is taken now and then, not all the time - on Apple's
+   GPUs each of its timestamps ends a Metal pass. */
+inline std::atomic<bool> g_profiling{true};
 struct WaitReason { const char* why; std::uint64_t count; double seconds; };
 inline WaitReason g_waits[16] = {};
 inline void CountWait(const char* why, double seconds) {
@@ -145,12 +149,13 @@ public:
        each timestamp at the end of the Metal pass it falls in (and adds a
        small pass for it): there the time is by pass, not by draw. */
     void Mark(VkCommandBuffer c, int kind) {
-        if (!profile_ || kind == run_kind_) return;
+        if (!profile_ || !profiled_[current_] || kind == run_kind_) return;
         Stamp(c, run_kind_);
         run_kind_ = kind;
     }
     /* A timestamp closing the work since the last one, counted as `kind`. */
     void Stamp(VkCommandBuffer c, int kind) {
+        if (!profiled_[current_]) return;
         std::vector<int>& marks = marks_[current_];
         if (marks.size() >= kMarks) return;
         vkCmdWriteTimestamp(c, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profile_,
@@ -204,6 +209,7 @@ private:
     static constexpr std::uint32_t kMarks = 1360;
     VkQueryPool profile_ = VK_NULL_HANDLE;
     std::vector<int> marks_[kSlots];
+    bool profiled_[kSlots] = {};            // whether the slot's command buffer is profiled (g_profiling)
     int run_kind_ = 0;                      // the kind of the work since the last timestamp (Mark)
     std::vector<std::function<void()>> after_submit_;
     int current_ = 0;
@@ -227,7 +233,8 @@ void VulkanGpu::RecordInPass(F&& record) {
             vkCmdResetQueryPool(cmd, timestamps_, 2 * std::uint32_t(current_), 2);
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps_, 2 * std::uint32_t(current_));
         }
-        if (profile_) {
+        profiled_[current_] = profile_ && g_profiling.load(std::memory_order_relaxed);
+        if (profiled_[current_]) {
             vkCmdResetQueryPool(cmd, profile_, std::uint32_t(current_) * kMarks, kMarks);
             marks_[current_].clear();
             Stamp(cmd, kProfOther);         // where the first run starts

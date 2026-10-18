@@ -150,7 +150,17 @@ void VulkanGpu::MakeTimestamps() {
         return;
     }
     timestamp_ns_ = properties.limits.timestampPeriod;
-    if (std::getenv("PS2HOST_GPU_PROFILE")) {
+    // PS2HOST_GPU_PROFILE=1: the GPU's time by what it did, all the time; on
+    // a tablet, by default, now and then (SetGpuProfiling: the bridge's [perf]
+    // report profiles one interval a minute); =0 never.
+    const char* wanted = std::getenv("PS2HOST_GPU_PROFILE");
+#if defined(PS2GPU_IOS)
+    const bool sampled = !wanted;
+#else
+    const bool sampled = false;
+#endif
+    if ((wanted && *wanted != '0') || sampled) {
+        if (sampled) g_profiling = false;
         qci.queryCount = kMarks * kSlots;
         if (vkCreateQueryPool(device, &qci, nullptr, &profile_) != VK_SUCCESS) profile_ = VK_NULL_HANDLE;
     }

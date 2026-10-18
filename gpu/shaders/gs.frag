@@ -23,6 +23,13 @@ layout(set = 2, binding = 0) uniform sampler2D destination;
 #endif
 #endif
 
+// Whether this pipeline's pixels can be dropped (the alpha test's passes,
+// PABE's halves): a pipeline made without (kNoDiscard, gs_renderer.cpp) has
+// no discard at all. A tile-based GPU (Apple's) removes hidden pixels before
+// shading them only for pipelines that cannot discard - with discard merely
+// present in the shader, every pixel of every draw is shaded.
+layout(constant_id = 0) const bool kMayDiscard = true;
+
 layout(location = 0) in vec4 shade;
 layout(location = 1) noperspective in vec3 coordinate;
 layout(location = 2) noperspective in float fog;
@@ -295,10 +302,12 @@ void main() {
     }
     // The renderer draws AFAIL as passes: 0 keeps the passing pixels, 1 the
     // failing ones (with only what AFAIL writes), 2 all of them.
-    if (p.afail == 0u && !pass) discard;
-    if (p.afail == 1u && pass) discard;
-    if (p.pabe == 1u && c.a < 128.0) discard;
-    if (p.pabe == 2u && c.a >= 128.0) discard;
+    if (kMayDiscard) {
+        if (p.afail == 0u && !pass) discard;
+        if (p.afail == 1u && pass) discard;
+        if (p.pabe == 1u && c.a < 128.0) discard;
+        if (p.pabe == 2u && c.a >= 128.0) discard;
+    }
 
 #ifdef SHADER_BLEND
     // Cv = ((A - B) * C >> 7) + D, clamped (COLCLAMP), as the software GS.

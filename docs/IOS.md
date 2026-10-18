@@ -91,7 +91,15 @@ the GS thread was found (`[sample]`). Untick the variable to play again.
 Other variables read there: `PS2GPU_REORDER=0` (the renderer's reordered
 passes, on by default on an iPad: `gpu/src/gs_renderer.cpp`), `PS2GPU_TILE=1`
 (the tile-based GPU's other ways, `gpu/src/gpu_internal.h`), MoltenVK's own (`MVK_CONFIG_*`), and the host's
-(`docs/PORTING.md`).
+(`docs/PORTING.md`). Each of the GPU work cuts of 18 Oct has its own, to
+put the old way back for a comparison: `PS2HOST_CONVERT=0` (images made
+from a twin over the same memory without going through it -
+`host/src/gpu_bridge.cpp`'s ConvertFromTwin), `PS2HOST_Z16_VIEW=0` (a
+depth buffer read as PSMZ16 decoded as a texture, not sampled as a view of
+it), `PS2HOST_SAMPLE_PAGES=1` (a sampled image's pages brought up to date,
+not their whole page rows: fewer pixels, more passes), `PS2GPU_DISCARD_ALWAYS=1` (every pipeline able to
+discard, as before: `gs.frag`'s kMayDiscard - pipelines that cannot discard
+let Apple's GPU skip hidden pixels; on by default only with MoltenVK).
 
 ### Reports and VU programs, without carrying files (a PC and a Mac)
 
@@ -130,7 +138,10 @@ the GPU drew in. A port can leave a step's drawing out while the iPad lags
 behind (Burnout 3: `port/frame_skip.cpp`, on by default on a tablet;
 `frame_skip` in pc_settings.ini, `PS2HOST_FRAMESKIP=0/1`, or `--frameskip=0/1`
 in a `PS2HOST_SCRIPT` line): the game keeps its speed and shows fewer
-pictures. `--skip-cycle=0xT:0xA,0xB,...` (and `--skip-seconds=N`) in a script
+pictures. Since 18 Oct a picture every N steps, N from what a picture costs
+the GPU (its timestamps): one in three for ~43 ms, one in two under ~29 ms;
+the log's `[frame skip]` line every ten seconds says which and the cost
+(`PS2HOST_FRAMESKIP_MODE=lag` for the lag alone, as before). `--skip-cycle=0xT:0xA,0xB,...` (and `--skip-seconds=N`) in a script
 line measures what each drawing function costs (`host/src/host.cpp`).
 
 ### Leaving a run

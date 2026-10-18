@@ -17,6 +17,8 @@ layout(push_constant) uniform Params {
     uint depth;         // (the swizzle's)
     uint row0;          // the first row
     uint scale;         // the image's pixels to a GS pixel, each way (the internal resolution)
+    uint keep_colour;   // (the swizzle's)
+    uint col0;          // the first column: columns [col0, cols)
 } p;
 
 #include "gs_address.glsl"
@@ -24,7 +26,7 @@ layout(push_constant) uniform Params {
 void main() {
     const uint k = max(p.scale, 1u);
     const uvec2 at = uvec2(gl_FragCoord.xy) / k;
-    if (at.x >= p.cols || at.y < p.row0 || at.y >= p.row0 + p.rows) discard;
+    if (at.x < p.col0 || at.x >= p.cols || at.y < p.row0 || at.y >= p.row0 + p.rows) discard;
     const uint a = Address(at.x, at.y);
     const uint w = mem[a >> 2];
     uint v;

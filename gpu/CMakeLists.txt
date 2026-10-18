@@ -75,7 +75,7 @@ else()
 endif()
 file(MAKE_DIRECTORY ${PS2GPU_SHADER_DIR})
 set(PS2GPU_SHADER_HEADERS)
-foreach(shader gs.vert gs.frag date.vert date.frag swizzle.comp decode.comp depth_load.frag patch.comp fxaa.comp downsample.comp touch.vert touch.frag)
+foreach(shader gs.vert gs.frag date.vert date.frag swizzle.comp decode.comp depth_load.frag patch.comp fxaa.comp downsample.comp touch.vert touch.frag reinterpret.comp)
     string(REPLACE "." "_" name ${shader})
     set(out ${PS2GPU_SHADER_DIR}/${name}.h)
     add_custom_command(OUTPUT ${out}
@@ -112,6 +112,15 @@ add_custom_command(OUTPUT ${out}
     DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
             ${PS2GPU_GLSLANG_DEP}
     COMMENT "glslang swizzle.comp (a depth buffer)")
+list(APPEND PS2GPU_SHADER_HEADERS ${out})
+# One image from a depth buffer over the same memory (a Z16 view of it).
+set(out ${PS2GPU_SHADER_DIR}/reinterpret_depth_comp.h)
+add_custom_command(OUTPUT ${out}
+    COMMAND ${PS2GPU_GLSLANG} -V --target-env ${PS2GPU_SPIRV_ENV} -DDEPTH_SOURCE --vn spirv_reinterpret_depth_comp
+            -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/reinterpret.comp
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/reinterpret.comp ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+            ${PS2GPU_GLSLANG_DEP}
+    COMMENT "glslang reinterpret.comp (from a depth buffer)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # ...and blending in the shader, from a copy of the target (a factor over 1).
 set(out ${PS2GPU_SHADER_DIR}/gs_frag_blend.h)

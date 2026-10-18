@@ -1,0 +1,116 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// One colour image made from another over the same GS local memory, as
+// memory would have it, without memory (gs_renderer.cpp's ConvertImage):
+// each pixel of the image made takes its bytes from the pixels of the other
+// that lay those bytes out - a 32-bit target and a 16-bit view of it (Burnout
+// 3's depth into the frame's alpha goes through one twice a picture: each
+// way, before, the image swizzled into memory and the other loaded from it).
+// CT32 and CT16/CT16S, either way, and Z16 views of a depth buffer
+// (DEPTH_SOURCE: the race reads its depth buffer as a PSMZ16 texture once a
+// picture, for the haze); one invocation a pixel of the image made.
+// Pixels whose bytes the other image does not hold are left as they are.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#ifdef DEPTH_SOURCE
+// Compiled a second time with DEPTH_SOURCE: the source a depth buffer (Z24,
+// Z32), its Z sampled (Z / 2^32, as the swizzle's), a Z24 word's top byte -
+// not the depth buffer's - from GPU memory.
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(std430, set = 2, binding = 0) readonly buffer Memory { uint mem[]; };
+#else
+layout(set = 0, binding = 0, rgba8) uniform readonly image2D source;
+#endif
+layout(set = 1, binding = 0, rgba8) uniform image2D made;
+
+layout(push_constant) uniform Params {
+    uint bp;            // the image made: base (256-byte blocks), width (64-pixel units), PSM
+    uint bw;
+    uint psm;
+    uint cols, rows;    // its pixels made: [0, cols) x [0, rows)
+    uint src_bp, src_bw, src_psm;
+    uint src_width, src_height;
+} p;
+
+#include "gs_address.glsl"
+
+// The layout tables inverted (gs_address.glsl's): a block's place in its page, a
+// 32-bit word's or a 16-bit half's in its block.
+const uint kBlock32Inv[32] = uint[](0, 1, 8, 9, 2, 3, 10, 11, 16, 17, 24, 25, 18, 19, 26, 27, 4, 5, 12, 13, 6, 7, 14, 15, 20, 21, 28, 29, 22, 23, 30, 31);
+const uint kBlockZ32Inv[32] = uint[](20, 21, 28, 29, 22, 23, 30, 31, 4, 5, 12, 13, 6, 7, 14, 15, 16, 17, 24, 25, 18, 19, 26, 27, 0, 1, 8, 9, 2, 3, 10, 11);
+const uint kBlockZ16Inv[32] = uint[](18, 22, 19, 23, 26, 30, 27, 31, 16, 20, 17, 21, 24, 28, 25, 29, 2, 6, 3, 7, 10, 14, 11, 15, 0, 4, 1, 5, 8, 12, 9, 13);
+const uint kBlockZ16SInv[32] = uint[](10, 14, 11, 15, 26, 30, 27, 31, 2, 6, 3, 7, 18, 22, 19, 23, 8, 12, 9, 13, 24, 28, 25, 29, 0, 4, 1, 5, 16, 20, 17, 21);
+const uint kBlock16Inv[32] = uint[](0, 4, 1, 5, 8, 12, 9, 13, 2, 6, 3, 7, 10, 14, 11, 15, 16, 20, 17, 21, 24, 28, 25, 29, 18, 22, 19, 23, 26, 30, 27, 31);
+const uint kBlock16SInv[32] = uint[](0, 4, 1, 5, 16, 20, 17, 21, 8, 12, 9, 13, 24, 28, 25, 29, 2, 6, 3, 7, 18, 22, 19, 23, 10, 14, 11, 15, 26, 30, 27, 31);
+const uint kColumn32Inv[64] = uint[](0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15, 16, 17, 24, 25, 18, 19, 26, 27, 20, 21, 28, 29, 22, 23, 30, 31, 32, 33, 40, 41, 34, 35, 42, 43, 36, 37, 44, 45, 38, 39, 46, 47, 48, 49, 56, 57, 50, 51, 58, 59, 52, 53, 60, 61, 54, 55, 62, 63);
+const uint kColumn16Inv[128] = uint[](0, 8, 1, 9, 16, 24, 17, 25, 2, 10, 3, 11, 18, 26, 19, 27, 4, 12, 5, 13, 20, 28, 21, 29, 6, 14, 7, 15, 22, 30, 23, 31, 32, 40, 33, 41, 48, 56, 49, 57, 34, 42, 35, 43, 50, 58, 51, 59, 36, 44, 37, 45, 52, 60, 53, 61, 38, 46, 39, 47, 54, 62, 55, 63, 64, 72, 65, 73, 80, 88, 81, 89, 66, 74, 67, 75, 82, 90, 83, 91, 68, 76, 69, 77, 84, 92, 85, 93, 70, 78, 71, 79, 86, 94, 87, 95, 96, 104, 97, 105, 112, 120, 113, 121, 98, 106, 99, 107, 114, 122, 115, 123, 100, 108, 101, 109, 116, 124, 117, 125, 102, 110, 103, 111, 118, 126, 119, 127);
+
+bool Is16Psm(uint psm) { return psm == PSMCT16 || psm == PSMCT16S || psm == PSMZ16 || psm == PSMZ16S; }
+
+// The source pixel holding byte address `a` (its 32-bit word, or its 16-bit
+// half); false outside the source image.
+bool SourcePixel(uint a, out ivec2 at) {
+    const uint page = a / 8192u, base = p.src_bp / 32u;
+    if (page < base) return false;
+    const uint bw = max(p.src_bw, 1u);
+    const uint px = (page - base) % bw, py = (page - base) / bw;
+    const uint block = (a % 8192u) / 256u;
+    uint x, y;
+    if (Is16Psm(p.src_psm)) {
+        const uint i = p.src_psm == PSMCT16 ? kBlock16Inv[block] : p.src_psm == PSMCT16S ? kBlock16SInv[block]
+                     : p.src_psm == PSMZ16 ? kBlockZ16Inv[block] : kBlockZ16SInv[block];
+        const uint j = kColumn16Inv[(a % 256u) / 2u];
+        x = px * 64u + (i % 4u) * 16u + j % 16u;
+        y = py * 64u + (i / 4u) * 8u + j / 16u;
+    } else {
+        const uint i = (p.src_psm == PSMZ32 || p.src_psm == PSMZ24) ? kBlockZ32Inv[block] : kBlock32Inv[block];
+        const uint j = kColumn32Inv[(a % 256u) / 4u];
+        x = px * 64u + (i % 8u) * 8u + j % 8u;
+        y = py * 32u + (i / 8u) * 8u + j / 8u;
+    }
+    if (x >= p.src_width || y >= p.src_height) return false;
+    at = ivec2(x, y);
+    return true;
+}
+
+uint To16(uint c) {
+    return ((c >> 3) & 31u) | (((c >> 11) & 31u) << 5) | (((c >> 19) & 31u) << 10) | ((c >> 31) << 15);
+}
+
+uint From16(uint c) {
+    return ((c & 31u) << 3) | (((c >> 5) & 31u) << 11) | (((c >> 10) & 31u) << 19) |
+           ((c & 0x8000u) != 0u ? 0x80000000u : 0u);
+}
+
+// The 16 bits at byte address `a` (even), from the source.
+bool Half(uint a, out uint h) {
+    ivec2 at;
+    if (!SourcePixel(a, at)) return false;
+#ifdef DEPTH_SOURCE
+    uint v = uint(clamp(texelFetch(source, at, 0).r * 4294967296.0, 0.0, 4294967040.0));
+    if (p.src_psm == PSMZ24) v = (mem[(a & kMask) >> 2] & 0xFF000000u) | (v & 0xFFFFFFu);
+    h = (v >> ((a & 2u) * 8u)) & 0xFFFFu;
+#else
+    const uint v = packUnorm4x8(imageLoad(source, at));
+    h = Is16Psm(p.src_psm) ? To16(v) : (v >> ((a & 2u) * 8u)) & 0xFFFFu;
+#endif
+    return true;
+}
+
+void main() {
+    const uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+    if (x >= p.cols || y >= p.rows) return;
+    const uint a = Address(x, y);
+    uint v;
+    if (Is16()) {
+        uint h;
+        if (!Half(a, h)) return;
+        v = From16(h);
+    } else {
+        uint lo, hi;
+        if (!Half(a, lo) || !Half(a + 2u, hi)) return;
+        v = lo | (hi << 16);
+    }
+    imageStore(made, ivec2(x, y), unpackUnorm4x8(v));
+}

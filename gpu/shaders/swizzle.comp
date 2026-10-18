@@ -26,13 +26,14 @@ layout(push_constant) uniform Params {
     uint bp;            // base, in 256-byte blocks
     uint bw;            // width, in 64-pixel units
     uint psm;
-    uint cols, rows;    // the rectangle moved, from (0, 0)
+    uint cols, rows;    // the rectangle moved, from (col0, 0)
     uint stride;        // the linear rows' length, in pixels
     uint to_memory;     // 1: linear -> memory; 0: memory -> linear
     uint depth;         // the linear side is depth (float)
     uint row0;          // the image's row that linear row 0 holds
     uint scale;         // the image's pixels to a GS pixel, each way (the internal resolution)
     uint keep_colour;   // memory -> image, 32-bit: the square's colour kept where memory differs in alpha alone
+    uint col0;          // the rectangle's first column: columns [col0, cols)
 } p;
 
 #include "gs_address.glsl"
@@ -46,8 +47,25 @@ uint From16(uint c) {
            ((c & 0x8000u) != 0u ? 0x80000000u : 0u);
 }
 
+// The value going to memory for the image pixel at `at` (an image's) or
+// linear index `li` (Linear's): its middle pixel's, depth as Z.
+uint Taken(ivec2 at, uint li) {
+    const uint k = max(p.scale, 1u);
+#ifdef IMAGE
+    uint v = packUnorm4x8(imageLoad(target, at + ivec2(k / 2u)));
+#elif defined(DEPTH_IMAGE)
+    uint v = floatBitsToUint(texelFetch(depth_image, at + ivec2(k / 2u), 0).r);
+#else
+    uint v = lin[li];
+#endif
+    if (p.depth == 1u) v = uint(clamp(uintBitsToFloat(v) * 4294967296.0, 0.0, 4294967040.0));
+    return v;
+}
+
+uint Half(uint v) { return p.depth == 1u ? (v & 0xFFFFu) : To16(v); }
+
 void main() {
-    const uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+    const uint x = gl_GlobalInvocationID.x + p.col0, y = gl_GlobalInvocationID.y;
     if (x >= p.cols || y >= p.rows) return;
     const uint a = Address(x, y + p.row0);
     const uint word = a >> 2;
@@ -59,25 +77,27 @@ void main() {
     const uint k = max(p.scale, 1u);
     const uint li = (y * k) * p.stride + x * k;
     const uint mid = li + (k / 2u) * p.stride + k / 2u;
-#if defined(IMAGE) || defined(DEPTH_IMAGE)
     const ivec2 at = ivec2(x * k, (y + p.row0) * k);
-#endif
     const bool z24 = p.psm == PSMCT24 || p.psm == PSMZ24;
     if (p.to_memory == 1u) {
-#ifdef IMAGE
-        uint v = packUnorm4x8(imageLoad(target, at + ivec2(k / 2u)));
-#elif defined(DEPTH_IMAGE)
-        uint v = floatBitsToUint(texelFetch(depth_image, at + ivec2(k / 2u), 0).r);
-#else
-        uint v = lin[mid];
-#endif
-        if (p.depth == 1u) v = uint(clamp(uintBitsToFloat(v) * 4294967296.0, 0.0, 4294967040.0));
+        uint v = Taken(at, mid);
         if (Is16()) {
-            const uint shift = (a & 2u) * 8u;
-            const uint h = p.depth == 1u ? (v & 0xFFFFu) : To16(v);
-            // Two pixels share the word: each changes only its own half.
-            atomicAnd(mem[word], ~(0xFFFFu << shift));
-            atomicOr(mem[word], h << shift);
+            // Two pixels share a word, x and x + 8 of a 16-pixel column
+            // (kColumn16: x % 16 below 8 the low half, the one 8 on the high
+            // half): the first of the two writes both halves with one store;
+            // atomics only for a pixel whose partner lies outside the
+            // rectangle (on an A12, two atomics a pixel for the race's
+            // 640x896 16-bit view, twice a picture).
+            if ((x % 16u) >= 8u) return;            // written with x - 8, which is inside
+            const uint h = Half(v);
+            if (x + 8u < p.cols) {
+                const uvec2 at8 = uvec2(at) + uvec2(8u * k, 0u);
+                mem[word] = h | (Half(Taken(ivec2(at8), mid + 8u * k)) << 16);
+            } else {
+                const uint shift = (a & 2u) * 8u;
+                atomicAnd(mem[word], ~(0xFFFFu << shift));
+                atomicOr(mem[word], h << shift);
+            }
         } else if (z24) {
             mem[word] = (mem[word] & 0xFF000000u) | (v & 0xFFFFFFu);    // the top byte is not the pixel's
         } else {
