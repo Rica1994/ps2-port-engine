@@ -37,6 +37,7 @@
 #include "swizzle_depth_comp.h"
 #include "depth_load_frag.h"
 #include "decode_comp.h"
+#include "decode_image_comp.h"
 #include "reinterpret_comp.h"
 #include "reinterpret_depth_comp.h"
 #include "patch_comp.h"
@@ -189,6 +190,7 @@ void MemoryBarrier(VkCommandBuffer cmd) {
 struct DecodeParams {
     std::uint32_t tbp, tbw, psm, tw, th, wms, wmt, minu, maxu, minv, maxv, texa_lo, ta1, csa;
     std::uint32_t mode = 0;     // 0 a texture, 1 a CLUT load
+    std::uint32_t y0 = 0;       // decode_image: the image's row the level starts at
 };
 
 /* swizzle.comp's push constants. */
@@ -658,6 +660,7 @@ private:
         ri.pDepthAttachment = &z;
         ri.pStencilAttachment = &stencil;
         g_pass_pixels += std::uint64_t(ri.renderArea.extent.width) * ri.renderArea.extent.height;
+        g_.Mark(cmd, kProfDraw);           // (before the pass: its time is draws')
         BeginLabel(cmd, label, 0.3f, 0.6f, 0.9f);
         vkCmdBeginRendering(cmd, &ri);
         vkCmdExecuteCommands(cmd, 1, &pass);
@@ -935,6 +938,15 @@ private:
     VkDeviceMemory gsmem_memory_ = VK_NULL_HANDLE, linear_memory_ = VK_NULL_HANDLE, clut_memory_ = VK_NULL_HANDLE;
     VkShaderModule decode_ = VK_NULL_HANDLE;
     VkPipeline decode_pipeline_ = VK_NULL_HANDLE;
+    /* The decode into the texture's image (decode.comp's IMAGE_OUT), its
+       storage descriptor from the slot's pool (reset when the slot's command
+       buffer is recorded again: the one before it has run). PS2GPU_DECODE_LINEAR=1:
+       through the linear buffer and a copy, as before. */
+    VkShaderModule decode_image_ = VK_NULL_HANDLE;
+    VkPipeline decode_image_pipeline_ = VK_NULL_HANDLE;
+    VkDescriptorPool decode_pools_[VulkanGpu::kSlots] = {};
+    std::uint64_t decode_pool_recording_[VulkanGpu::kSlots] = {};
+    VkDescriptorSet DecodeSet(Image& image);
     VkShaderModule swizzle_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout swizzle_set_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool swizzle_pool_ = VK_NULL_HANDLE;
@@ -1495,6 +1507,32 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         if (error) *error = "the texture decode shader did not load";
         return false;
     }
+    {
+        // ...and into the texture's image: the swizzle's image layout (set 0
+        // memory, the linear buffer and the CLUT; set 1 the image).
+        static const bool linear = [] {
+            const char* v = std::getenv("PS2GPU_DECODE_LINEAR");
+            return v && *v && *v != '0';
+        }();
+        VkShaderModuleCreateInfo di{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        di.codeSize = sizeof spirv_decode_image_comp;
+        di.pCode = spirv_decode_image_comp;
+        if (!linear && swizzle_image_layout_ && vkCreateShaderModule(g_.device, &di, nullptr, &decode_image_) == VK_SUCCESS) {
+            VkComputePipelineCreateInfo dp = cpi;
+            dp.stage.module = decode_image_;
+            dp.layout = swizzle_image_layout_;
+            if (vkCreateComputePipelines(g_.device, VK_NULL_HANDLE, 1, &dp, nullptr, &decode_image_pipeline_) !=
+                VK_SUCCESS)
+                decode_image_pipeline_ = VK_NULL_HANDLE;
+            VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256};
+            VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            pi.maxSets = 256;
+            pi.poolSizeCount = 1;
+            pi.pPoolSizes = &size;
+            for (VkDescriptorPool& pool : decode_pools_)
+                if (vkCreateDescriptorPool(g_.device, &pi, nullptr, &pool) != VK_SUCCESS) decode_image_pipeline_ = VK_NULL_HANDLE;
+        }
+    }
     // Local memory starts as zeros, the CPU's copy too.
     g_.Record([&](VkCommandBuffer cmd) {
         vkCmdFillBuffer(cmd, gsmem_, 0, kLocalMemory, 0);
@@ -1618,6 +1656,7 @@ VkDescriptorSet VulkanGsRenderer::DepthSampledSet(Image& image) {
 }
 
 void VulkanGsRenderer::DepthOut(VkCommandBuffer cmd, const SwizzleParams& params, Image& d) {
+    g_.Mark(cmd, kProfSwizzle);   // before the work, so that its time is counted as it
     drawn_ = DrawState{};
     Transition(cmd, d, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -1631,6 +1670,7 @@ void VulkanGsRenderer::DepthOut(VkCommandBuffer cmd, const SwizzleParams& params
 }
 
 void VulkanGsRenderer::DepthIn(VkCommandBuffer cmd, const SwizzleParams& params, Image& d) {
+    g_.Mark(cmd, kProfSwizzle);   // before the work, so that its time is counted as it
     drawn_ = DrawState{};
     Transition(cmd, d, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
@@ -1688,6 +1728,7 @@ VkDescriptorSet VulkanGsRenderer::StorageSet(Image& image) {
 
 /* The swizzle on a colour target's image itself (GENERAL, as storage). */
 void VulkanGsRenderer::SwizzleImage(VkCommandBuffer cmd, const SwizzleParams& params, Image& image) {
+    g_.Mark(cmd, kProfSwizzle);   // before the work, so that its time is counted as it
     drawn_ = DrawState{};
     Transition(cmd, image, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -1711,6 +1752,7 @@ void VulkanGsRenderer::MemoryWrite(std::uint32_t begin, std::uint32_t end, const
     std::memcpy(mapped, bytes, std::size_t(size));
     Work(kWorkMemoryWrite);
     g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfMemory);   // before the work, so that its time is counted as it
         MemoryBarrier(cmd);
         const VkBufferCopy copy{offset, VkDeviceSize(begin) * 256, size};
         vkCmdCopyBuffer(cmd, buffer, gsmem_, 1, &copy);
@@ -1724,6 +1766,7 @@ void VulkanGsRenderer::MemoryPatch(const std::uint32_t* words, std::size_t count
     Flush();
     Work(kWorkMemoryPatch);
     g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfMemory);   // before the work, so that its time is counted as it
         MemoryBarrier(cmd);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, patch_pipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, patch_layout_, 0, 1, &swizzle_set_, 0, nullptr);
@@ -1753,6 +1796,7 @@ void VulkanGsRenderer::MemoryRead(std::uint32_t begin, std::uint32_t end, std::u
     if (!Buffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped)) return;
     Work(kWorkReadback);
     g_.Run([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfMemory);   // before the work, so that its time is counted as it
         MemoryBarrier(cmd);
         const VkBufferCopy copy{VkDeviceSize(begin) * 256, 0, size};
         vkCmdCopyBuffer(cmd, gsmem_, buffer, 1, &copy);
@@ -1810,6 +1854,7 @@ bool VulkanGsRenderer::ConvertImage(std::uint32_t fbp, std::uint32_t fbw, std::u
     WorkLabel("convert: C %X/%u/%02X from C %X/%u/%02X", unsigned(fbp), unsigned(fbw), unsigned(psm),
               unsigned(src_fbp), unsigned(src_fbw), unsigned(src_psm));
     g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfSwizzle);   // before the work, so that its time is counted as it
         drawn_ = DrawState{};
         Transition(cmd, t, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
         Transition(cmd, d, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
@@ -1845,6 +1890,7 @@ bool VulkanGsRenderer::ConvertFromDepth(std::uint32_t fbp, std::uint32_t fbw, st
     WorkLabel("convert: C %X/%u/%02X from Z %X/%u/%02X", unsigned(fbp), unsigned(fbw), unsigned(psm), unsigned(zbp),
               unsigned(zfbw), unsigned(zpsm));
     g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfSwizzle);   // before the work, so that its time is counted as it
         drawn_ = DrawState{};
         Transition(cmd, z, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -1969,6 +2015,7 @@ void VulkanGsRenderer::DepthFromMemory(std::uint32_t zbp, std::uint32_t width, s
     Work(kWorkDepthFromMemory, {d}, {d});
     WorkLabel("depth from memory: Z %X/%u/%02X", unsigned(zbp), unsigned(fbw), unsigned(zpsm));
     g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfDate);   // before the work, so that its time is counted as it
         MemoryBarrier(cmd);
         DepthIn(cmd, SwizzleParams{zbp * 32, fbw, zpsm, d->width, d->height, d->pw(), 0, 1, 0, d->scale}, *d);
         MemoryBarrier(cmd);
@@ -2296,6 +2343,7 @@ void VulkanGsRenderer::Fill(Texture& texture, const std::uint32_t* pixels) {
     std::memcpy(mapped, pixels, bytes);
     Work(kWorkUpload, {&t}, {&t});
     g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfUpload);   // before the work, so that its time is counted as it
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
         VkBufferImageCopy copy{};
@@ -2367,6 +2415,7 @@ bool VulkanGsRenderer::UploadReplacement(std::uint64_t id, std::uint32_t format,
     Image& t = texture.image;
     Work(kWorkUpload, {&t}, {&t});
     g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfUpload);   // before the work, so that its time is counted as it
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
         vkCmdCopyBufferToImage(cmd, buffer, t.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -2432,7 +2481,8 @@ Texture* VulkanGsRenderer::TextureImage(std::uint64_t key, std::uint32_t width, 
             return &texture;
         }
         if (!MakeImage(texture.image, width, height,
-                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+                       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                           VK_IMAGE_USAGE_STORAGE_BIT))
             return nullptr;
     }
     return &texture;
@@ -2451,6 +2501,37 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
     Work(kWorkDecode, {&t}, {&t}, d.clut != nullptr);
     WorkLabel("decode: T %X/%u/%02X %ux%u", unsigned(d.tbp), unsigned(d.tbw), unsigned(d.psm), unsigned(d.tw), unsigned(d.th));
     g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfDecode);   // before the work, so that its time is counted as it
+        const VkDescriptorSet image_set = decode_image_pipeline_ ? DecodeSet(t) : VK_NULL_HANDLE;
+        if (image_set) {
+            // Straight into the image: one barrier before (memory and the
+            // CLUT written before it), the image's own after.
+            if (d.clut) {
+                MemoryBarrier(cmd);
+                vkCmdUpdateBuffer(cmd, clut_, 0, 1024, d.clut);
+            }
+            MemoryBarrier(cmd);
+            drawn_ = DrawState{};
+            Transition(cmd, t, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            const VkDescriptorSet sets[2] = {swizzle_set_, image_set};
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, decode_image_pipeline_);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, swizzle_image_layout_, 0, 2, sets, 0, nullptr);
+            std::uint32_t y = 0;
+            for (std::uint32_t n = 0; n < levels; ++n) {
+                const std::uint32_t w = std::max(1u, d.tw >> n), h = std::max(1u, d.th >> n);
+                DecodeParams params{n ? d.level_tbp[n] : d.tbp, n ? std::max(1u, d.level_tbw[n]) : d.tbw, d.psm,
+                                    w, h, d.wms, d.wmt, d.minu >> n, d.maxu >> n, d.minv >> n, d.maxv >> n,
+                                    d.texa_lo, d.ta1, d.csa};
+                params.y0 = y;
+                vkCmdPushConstants(cmd, swizzle_image_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
+                ++g_dispatches;
+                vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+                y += h;
+            }
+            Transition(cmd, t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                       VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+            return;
+        }
         MemoryBarrier(cmd);
         if (d.clut) vkCmdUpdateBuffer(cmd, clut_, 0, 1024, d.clut);
         MemoryBarrier(cmd);
@@ -2488,6 +2569,34 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
     });
 }
 
+/* A storage descriptor for a texture's image, for one decode: from the
+   current slot's pool, reset the first time the slot records again (its
+   command buffer before has run by then: Flush retires a slot before its
+   reuse). Null when the pool is full - the decode goes the old way. */
+VkDescriptorSet VulkanGsRenderer::DecodeSet(Image& image) {
+    const int slot = g_.slot();
+    VkDescriptorPool pool = decode_pools_[slot];
+    if (!pool) return VK_NULL_HANDLE;
+    if (decode_pool_recording_[slot] != g_.recording_id()) {
+        vkResetDescriptorPool(g_.device, pool, 0);
+        decode_pool_recording_[slot] = g_.recording_id();
+    }
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = pool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &image_set_layout_;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    if (vkAllocateDescriptorSets(g_.device, &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkDescriptorImageInfo info{VK_NULL_HANDLE, image.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = set;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.pImageInfo = &info;
+    vkUpdateDescriptorSets(g_.device, 1, &write, 0, nullptr);
+    return set;
+}
+
 void VulkanGsRenderer::ClutFromMemory(const GsClutLoad& load) {
     Flush();                        // what is pending may draw the CLUT, or sample through the old one
     DecodeParams params{load.cbp, 1, load.cpsm, load.eight ? 256u : 16u, 1, 0, 0, 0, 0, 0, 0,
@@ -2495,6 +2604,7 @@ void VulkanGsRenderer::ClutFromMemory(const GsClutLoad& load) {
     params.mode = 1;
     Work(kWorkClut, {}, {}, true);
     g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfDecode);   // before the work, so that its time is counted as it
         MemoryBarrier(cmd);
         drawn_ = DrawState{};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, decode_pipeline_);
@@ -2549,6 +2659,7 @@ void VulkanGsRenderer::UploadTarget(std::uint32_t fbp, std::uint32_t fbw, std::u
                     std::size_t(w) * 4);
     Work(kWorkUpload, {t}, {t});
     g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfUpload);   // before the work, so that its time is counted as it
         // (Made just now, it was cleared in this layout: the copy after the clear.)
         if (t->layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) MemoryBarrier(cmd);
         Transition(cmd, *t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -2602,6 +2713,7 @@ Image* VulkanGsRenderer::TargetFor(const GsDrawState& state) {
     // Local memory starts as zeros.
     Work(kWorkNewImage);
     g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfClear);   // before the work, so that its time is counted as it
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
         const VkClearColorValue zero{};
@@ -2622,6 +2734,7 @@ Image* VulkanGsRenderer::DepthFor(std::uint32_t key, std::uint32_t width, std::u
     // Local memory starts as zeros: the farthest Z.
     Work(kWorkNewImage);
     g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfClear);   // before the work, so that its time is counted as it
         Transition(cmd, d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
         const VkClearDepthStencilValue zero{0.0f, 0};
@@ -2645,6 +2758,7 @@ void VulkanGsRenderer::UploadDepth(std::uint32_t zbp, std::uint32_t width, std::
     for (std::size_t i = 0; i < std::size_t(width) * height; ++i) out[i] = float(double(z[i]) / 4294967296.0);
     Work(kWorkUpload, {d}, {d});
     g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfUpload);   // before the work, so that its time is counted as it
         if (d->layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) MemoryBarrier(cmd);   // (the copy after its clear)
         Transition(cmd, *d, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -3185,6 +3299,7 @@ void VulkanGsRenderer::Flush() {
                     region.extent = {std::uint32_t(x1 - x0), std::uint32_t(y1 - y0), 1};
                 }
                 BeginLabel(cmd, "feedback copy (destination read)", 0.9f, 0.3f, 0.3f);
+                g_.Mark(cmd, kProfFeedback);    // before the copy, so that its time is counted as it
                 vkCmdCopyImage(cmd, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, feedback_->image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
                 EndLabel(cmd);
@@ -3446,8 +3561,8 @@ void VulkanGsRenderer::Flush() {
                         vkCmdPushConstants(dc, layout_, VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset,
                                            sizeof params, &params);
                         ++g_draws;
+                        if (!defer_passes_) g_.Mark(cmd, kProfDraw);   // (before the draw: its time is a draw's)
                         vkCmdDraw(dc, count, 1, first, 0);
-                        if (!defer_passes_) g_.Mark(cmd, kProfDraw);
                     }
                 }
             }
@@ -3469,6 +3584,7 @@ bool VulkanGsRenderer::ReadDepth(std::uint32_t zbp, std::uint32_t width, std::ui
     if (!Buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped)) return false;
     Work(kWorkReadback);
     g_.Run([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfReadback);   // before the work, so that its time is counted as it
         Transition(cmd, d, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
         VkBufferImageCopy copy{};
@@ -3500,6 +3616,7 @@ bool VulkanGsRenderer::ReadImage(Image& t, std::vector<std::uint32_t>* pixels) {
     if (!Buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped)) return false;
     Work(kWorkReadback);
     g_.Run([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfReadback);   // before the work, so that its time is counted as it
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
         VkBufferImageCopy copy{};
@@ -3539,6 +3656,7 @@ bool VulkanGsRenderer::ReadTargetFull(std::uint32_t fbp, std::uint32_t fbw, std:
     if (!Buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped)) return false;
     Work(kWorkReadback);
     g_.Run([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfReadback);   // before the work, so that its time is counted as it
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
         VkBufferImageCopy copy{};
@@ -3570,6 +3688,7 @@ bool VulkanGsRenderer::ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uin
     if (!Buffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &buffer, &memory, &mapped)) return false;
     Work(kWorkReadback);
     g_.Run([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfReadback);   // before the work, so that its time is counted as it
         Transition(cmd, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
                    VK_PIPELINE_STAGE_TRANSFER_BIT);
         VkBufferImageCopy copy{};
@@ -3638,6 +3757,10 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (swizzle_set_layout_) vkDestroyDescriptorSetLayout(g_.device, swizzle_set_layout_, nullptr);
     if (swizzle_) vkDestroyShaderModule(g_.device, swizzle_, nullptr);
     if (decode_pipeline_) vkDestroyPipeline(g_.device, decode_pipeline_, nullptr);
+    if (decode_image_pipeline_) vkDestroyPipeline(g_.device, decode_image_pipeline_, nullptr);
+    if (decode_image_) vkDestroyShaderModule(g_.device, decode_image_, nullptr);
+    for (VkDescriptorPool pool : decode_pools_)
+        if (pool) vkDestroyDescriptorPool(g_.device, pool, nullptr);
     if (decode_) vkDestroyShaderModule(g_.device, decode_, nullptr);
     if (input_set_layout_) vkDestroyDescriptorSetLayout(g_.device, input_set_layout_, nullptr);
     // The swizzle on images and depth buffers, the memory patch, depth loads.

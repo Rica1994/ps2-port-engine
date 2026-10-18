@@ -113,6 +113,14 @@ add_custom_command(OUTPUT ${out}
             ${PS2GPU_GLSLANG_DEP}
     COMMENT "glslang swizzle.comp (a depth buffer)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
+# The texture decode straight into the texture's image.
+set(out ${PS2GPU_SHADER_DIR}/decode_image_comp.h)
+add_custom_command(OUTPUT ${out}
+    COMMAND ${PS2GPU_GLSLANG} -V --target-env ${PS2GPU_SPIRV_ENV} -DIMAGE_OUT --vn spirv_decode_image_comp
+            -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/decode.comp
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/decode.comp ${PS2GPU_GLSLANG_DEP}
+    COMMENT "glslang decode.comp (into the texture's image)")
+list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # One image from a depth buffer over the same memory (a Z16 view of it).
 set(out ${PS2GPU_SHADER_DIR}/reinterpret_depth_comp.h)
 add_custom_command(OUTPUT ${out}
