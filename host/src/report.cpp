@@ -260,6 +260,17 @@ void StartReports(const fs::path& log, const fs::path& folder, const std::string
 #endif
 }
 
+void AddReportFile(const fs::path& path, const std::string& name) {
+#ifdef PS2HOST_REPORTS
+    if (!g_reports) return;
+    std::lock_guard<std::mutex> hold(g_reports->lock);
+    g_reports->files.push_back({path, name});
+#else
+    (void)path;
+    (void)name;
+#endif
+}
+
 void SendReportsNow() {
     if (!g_reports) return;
     std::fflush(stderr);

@@ -189,3 +189,17 @@ runs as compiled arm64; the VUs without SIMD are slower than on a PC. An iPad
 with an M-series chip or an A14 or later should hold the game's 60 frames a
 second; older A-series iPads (A12, A13) may slow down in busy races. Keep the
 resolution at ORIGINAL or 2X and anti-aliasing off in PC SETTINGS on those.
+
+## Recording a played race and replaying it
+
+`PS2HOST_INPUT_RECORD=1` in the scheme's environment: the run's controller
+input, as the game reads it, goes into `inputs-<date>-<time>.rec` in the
+app's Documents folder (and to the report receiver with the log). Play the
+race through to its results, then stop the app.
+
+`PS2HOST_INPUT_REPLAY=1` (the newest recording; or a file name): the game
+plays the recording back in place of the controller - a played run, timed
+as one, with its usual log - and the app ends 10 s after the recording's last
+change. The frames count from each start of the race's drawing, so a
+loading time that differs from the recorded run's does not move the race's
+input. (`host/src/dbc.cpp`, INPUT RECORDING AND REPLAY.)

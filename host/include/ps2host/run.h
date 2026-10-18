@@ -329,6 +329,12 @@ void NoteDrawLeftOut();
 void StartReports(const std::filesystem::path& log, const std::filesystem::path& folder, const std::string& run_name);
 /* What changed, sent now (the run's end). */
 void SendReportsNow();
+/* Another file to send with the reports, as `name` (an input recording, dbc.cpp). */
+void AddReportFile(const std::filesystem::path& path, const std::string& name);
+/* An input recording's anchor (dbc.cpp's INPUT RECORDING AND REPLAY): called
+   by a game at each step of its main scene (Burnout 3: the race's draw); the
+   first call after two seconds without one starts a new anchor. */
+void InputAnchor();
 bool PumpWindow();
 /* Fullscreen on or off (saved as the "fullscreen" setting, settings.h, which
    the window opens with); and whether it is. */

@@ -39,12 +39,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
 #include <map>
 #include <string>
 #include <vector>
 
 #include "ps2host/host.h"
 #include "ps2host/memory.h"
+#include "ps2host/platform.h"
 #include "ps2host/run.h"
 
 namespace ps2host {
@@ -110,6 +113,122 @@ InputDevice g_last_device = InputDevice::kNone;
 u64 g_last_input_frame = 0;
 u16 g_keys_before = 0, g_controller_before = 0;
 bool g_sticks_before = false;
+
+/* INPUT RECORDING AND REPLAY (PS2HOST_INPUT_RECORD=1, PS2HOST_INPUT_REPLAY=1
+   or a file name): a played run's pad, recorded as the game read it - every
+   change, at its frame - into inputs-<date>-<time>.rec in the user's folder
+   (sent with the reports), and played back in a later run in place of the
+   player's, so that one played race can be run again and again for its
+   numbers. Frames count from an anchor: the run's start, then each start of
+   the race's drawing (InputAnchor, a game's - after loading, whose length
+   varies from run to run). A replay waits at an anchor it has not reached,
+   catches up one it is past, and ends the run 10 s after its last change.
+   A line: anchor, frames after it, the 18 bytes of the pad's report in hex. */
+struct InputEvent { u32 anchor; u64 after; u8 data[kDataBytes]; };
+struct InputTape {
+    bool init = false;
+    std::FILE* record = nullptr;
+    bool replay = false;
+    std::vector<InputEvent> events;
+    std::size_t next = 0;
+    u8 current[kDataBytes] = {0xFF, 0xFF, 0x80, 0x80, 0x80, 0x80};
+    u8 last[kDataBytes] = {};
+    bool any = false;
+    u64 last_frame = ~0ull;
+    u32 anchor = 0;
+    u64 anchor_frame = 0, last_call = 0;
+    u64 ended_at = 0;
+};
+InputTape& Tape() {
+    static InputTape t;
+    if (t.init) return t;
+    t.init = true;
+    const std::filesystem::path folder = platform::UserDirectory();
+    const char* replay = std::getenv("PS2HOST_INPUT_REPLAY");
+    const char* record = std::getenv("PS2HOST_INPUT_RECORD");
+    if (replay && *replay && *replay != '0') {
+        std::filesystem::path file;
+        if (std::string(replay) == "1") {
+            // The newest recording.
+            std::error_code ec;
+            for (const auto& e : std::filesystem::directory_iterator(folder, ec)) {
+                const std::string name = e.path().filename().string();
+                if (name.rfind("inputs-", 0) == 0 && e.path().extension() == ".rec" &&
+                    (file.empty() || name > file.filename().string()))
+                    file = e.path();
+            }
+        } else {
+            file = std::filesystem::path(replay).is_absolute() ? std::filesystem::path(replay) : folder / replay;
+        }
+        if (std::FILE* f = file.empty() ? nullptr : std::fopen(file.string().c_str(), "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof line, f)) {
+                InputEvent e{};
+                unsigned long long after = 0;
+                unsigned anchor = 0;
+                char hex[2 * kDataBytes + 1] = {};
+                if (std::sscanf(line, "%u %llu %36s", &anchor, &after, hex) != 3) continue;
+                e.anchor = anchor;
+                e.after = after;
+                for (u32 i = 0; i < kDataBytes; ++i) {
+                    unsigned byte = 0;
+                    std::sscanf(hex + 2 * i, "%2x", &byte);
+                    e.data[i] = u8(byte);
+                }
+                t.events.push_back(e);
+            }
+            std::fclose(f);
+            t.replay = !t.events.empty();
+            std::fprintf(stderr, "[input] replaying %s: %zu changes, %u race starts\n", file.filename().string().c_str(),
+                         t.events.size(), t.events.empty() ? 0u : t.events.back().anchor);
+        } else {
+            std::fprintf(stderr, "[input] nothing to replay (%s)\n", file.empty() ? "no inputs-*.rec" : file.string().c_str());
+        }
+    } else if (record && *record && *record != '0') {
+        char when[32] = "run";
+        std::tm tm{};
+        if (platform::LocalTime(std::time(nullptr), &tm)) std::strftime(when, sizeof when, "%Y%m%d-%H%M%S", &tm);
+        const std::filesystem::path file = folder / (std::string("inputs-") + when + ".rec");
+        t.record = std::fopen(file.string().c_str(), "w");
+        std::fprintf(stderr, "[input] recording into %s%s\n", file.filename().string().c_str(), t.record ? "" : " - could not open it");
+        if (t.record) AddReportFile(file, file.filename().string());
+    }
+    return t;
+}
+
+/* The pad's report as recorded or replayed (PadData's last step). */
+void Tape(u8* data) {
+    InputTape& t = Tape();
+    if (t.record) {
+        if (!t.any || std::memcmp(t.last, data, kDataBytes) != 0) {
+            std::fprintf(t.record, "%u %llu ", unsigned(t.anchor), (unsigned long long)(g_frame - t.anchor_frame));
+            for (u32 i = 0; i < kDataBytes; ++i) std::fprintf(t.record, "%02X", data[i]);
+            std::fputc('\n', t.record);
+            std::fflush(t.record);
+            std::memcpy(t.last, data, kDataBytes);
+            t.any = true;
+        }
+        return;
+    }
+    if (!t.replay) return;
+    while (t.next < t.events.size()) {
+        const InputEvent& e = t.events[t.next];
+        if (e.anchor > t.anchor) break;                                     // not there yet: wait
+        if (e.anchor == t.anchor && g_frame - t.anchor_frame < e.after) break;
+        std::memcpy(t.current, e.data, kDataBytes);
+        ++t.next;
+    }
+    std::memcpy(data, t.current, kDataBytes);
+    if (t.next >= t.events.size() && !t.ended_at) {
+        t.ended_at = g_frame;
+        std::fprintf(stderr, "[input] replay done at frame %llu; the run ends in 10 s\n", (unsigned long long)g_frame);
+    }
+    if (t.ended_at && g_frame > t.ended_at + 600) {
+        std::fprintf(stderr, "[input] replay over: the run ends\n");
+        SendReportsNow();
+        std::_Exit(0);
+    }
+}
 
 void PadData(u8* data) {
     u16 buttons = 0xFFFF;                                   // active low: nothing pressed
@@ -187,6 +306,7 @@ void PadData(u8* data) {
     for (u32 i = 2; i < 6; ++i) data[i] = controller ? pad.sticks[i - 2] : 0x80;
     static const int kPressure[12] = {5, 7, 4, 6, 12, 13, 14, 15, 10, 11, 8, 9};
     for (u32 i = 0; i < 12; ++i) data[6 + i] = (buttons >> kPressure[i]) & 1 ? 0 : pressure[kPressure[i]];
+    Tape(data);
 }
 
 std::vector<u8> Server(u32 procedure, const std::vector<u8>& request) {
@@ -428,6 +548,18 @@ void InstallDbc() {
 }
 
 u16 PadButtonsHeld() { return g_held; }
+
+void InputAnchor() {
+    InputTape& t = Tape();
+    // A start after two seconds without a call: a new anchor.
+    if (t.last_call == 0 || g_frame > t.last_call + 120) {
+        ++t.anchor;
+        t.anchor_frame = g_frame;
+        if (t.record || t.replay)
+            std::fprintf(stderr, "[input] race start %u at frame %llu\n", unsigned(t.anchor), (unsigned long long)g_frame);
+    }
+    t.last_call = g_frame;
+}
 
 InputDevice LastInputDevice(u64* frame) {
     if (frame) *frame = g_last_input_frame;
