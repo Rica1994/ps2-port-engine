@@ -378,11 +378,56 @@ public:
         g_.Flush();
         ++frame_;
         EvictReplacements();
+        FastSamplingTurn();
+    }
+    /* PS2GPU_FAST_SAMPLE: 1 on, 0 off, "ab" each in turn for 600 frames
+       (~10 s) with the GPU's time a picture for each in the log - the
+       default on a tablet for now, to measure it in normal play; elsewhere off. */
+    int fast_mode_ = -1;                // 0 off, 1 on, 2 in turn
+    bool fast_now_ = false;
+    std::uint64_t fast_frames_ = 0, fast_from_draws_ = 0, fast_from_ns_ = 0, fast_pictures_ = 0;
+    std::uint64_t fast_last_draws_ = 0;
+    double fast_sum_[2] = {}, fast_count_[2] = {};
+    bool FastSampling() {
+        if (fast_mode_ < 0) {
+            const char* v = std::getenv("PS2GPU_FAST_SAMPLE");
+            const std::string mode = v ? v : (g_.portability ? "ab" : "0");
+            fast_mode_ = mode == "ab" ? 2 : (mode == "1" ? 1 : 0);
+            fast_now_ = fast_mode_ != 0;
+            std::fprintf(stderr, "[gpu] fast sampling: %s\n", fast_mode_ == 2 ? "on and off in turn, 10 s each (measured)"
+                                                         : fast_mode_ ? "on" : "off");
+        }
+        return fast_now_;
+    }
+    void FastSamplingTurn() {
+        if (fast_mode_ != 2) return;
+        // A picture: a frame with a race's drawing (hundreds of draws).
+        if (g_draws - fast_last_draws_ > 300) ++fast_pictures_;
+        fast_last_draws_ = g_draws;
+        if (++fast_frames_ < 600) return;
+        const std::uint64_t ns = g_gpu_ns.load();
+        if (fast_pictures_ > 20) {
+            const double ms = double(ns - fast_from_ns_) / 1e6 / double(fast_pictures_);
+            fast_sum_[fast_now_] += ms;
+            fast_count_[fast_now_] += 1;
+            std::fprintf(stderr, "[gpu] fast sampling %s: %.1f ms a picture over %llu pictures (on average %.1f on, %.1f off)\n",
+                         fast_now_ ? "on" : "off", ms, (unsigned long long)fast_pictures_,
+                         fast_count_[1] ? fast_sum_[1] / fast_count_[1] : 0.0,
+                         fast_count_[0] ? fast_sum_[0] / fast_count_[0] : 0.0);
+        }
+        fast_from_ns_ = ns;
+        fast_frames_ = fast_pictures_ = 0;
+        fast_now_ = !fast_now_;
     }
     bool GpuCaughtUp() override { return g_.CaughtUp(); }
     void TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t width,
                               std::uint32_t height, std::uint32_t first_row, std::uint32_t rows) override;
     void ReloadKeepsColour(bool keep) override { keep_colour_ = keep; }
+    /* Memory writes held back (MemoryWrite, FlushWrites). */
+    std::vector<VkBufferCopy> held_writes_;
+    VkBuffer write_source_ = VK_NULL_HANDLE;
+    bool flushing_writes_ = false;
+    void FlushWrites();
     void Columns(std::uint32_t first, std::uint32_t end) override {
         col0_ = first;
         col1_ = end;
@@ -1274,6 +1319,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
     }
     Fill(blank_, &white);
     g_.end_pass = [this](VkCommandBuffer cmd, bool submit) { EndPass(cmd, submit ? kBreakSubmit : kBreakWork); };
+    g_.before_record = [this] { FlushWrites(); };
     if (const char* trace = std::getenv("PS2GPU_PASS_TRACE")) trace_frame_ = std::atoll(trace);
     // The ways for a tile-based GPU, by their variables (PS2GPU_TILE, all of
     // them) - the pictures are the same either way.
@@ -1741,6 +1787,13 @@ void VulkanGsRenderer::SwizzleImage(VkCommandBuffer cmd, const SwizzleParams& pa
     g_.Mark(cmd, kProfSwizzle);
 }
 
+/* Memory writes are held back and go to the GPU together, one copy of many
+   regions between two barriers, before the next other work is recorded or
+   the command buffer ends (VulkanGpu::before_record): an iPad's race wrote
+   memory ~57 times a picture (the textures it streams), each a copy between
+   two full barriers - a blit pass of its own. A write over one held back
+   (or from another staging buffer) sends those first. PS2GPU_WRITES_ONE_BY_ONE=1:
+   each at once, as before. */
 void VulkanGsRenderer::MemoryWrite(std::uint32_t begin, std::uint32_t end, const std::uint8_t* bytes) {
     if (end <= begin) return;
     Flush();
@@ -1750,15 +1803,50 @@ void VulkanGsRenderer::MemoryWrite(std::uint32_t begin, std::uint32_t end, const
     void* mapped = Staging(size, &buffer, &offset);
     if (!mapped) return;
     std::memcpy(mapped, bytes, std::size_t(size));
+    const VkDeviceSize dst = VkDeviceSize(begin) * 256;
+    bool overlaps = buffer != write_source_;
+    for (const VkBufferCopy& r : held_writes_)
+        overlaps = overlaps || (r.dstOffset < dst + size && dst < r.dstOffset + r.size);
+    if (overlaps) FlushWrites();
+    write_source_ = buffer;
+    held_writes_.push_back({offset, dst, size});
+    static const bool one_by_one = [] {
+        const char* v = std::getenv("PS2GPU_WRITES_ONE_BY_ONE");
+        return v && *v && *v != '0';
+    }();
+    if (one_by_one) FlushWrites();
+}
+
+void VulkanGsRenderer::FlushWrites() {
+    if (held_writes_.empty() || flushing_writes_) return;
+    flushing_writes_ = true;
+    // (Called from another work's Record, after its Work: that one's state
+    // back after these writes are recorded.)
+    const WorkKind work = work_;
+    const bool conflicts = work_conflicts_, writes_clut = work_writes_clut_;
+    std::vector<const Image*> touched = work_touched_;
+    char label[sizeof work_label_];
+    std::memcpy(label, work_label_, sizeof label);
+    const char* next_label = g_.next_label;
+    std::vector<VkBufferCopy> regions;
+    regions.swap(held_writes_);
+    const VkBuffer source = write_source_;
+    write_source_ = VK_NULL_HANDLE;
     Work(kWorkMemoryWrite);
     g_.Record([&](VkCommandBuffer cmd) {
         g_.Mark(cmd, kProfMemory);   // before the work, so that its time is counted as it
         MemoryBarrier(cmd);
-        const VkBufferCopy copy{offset, VkDeviceSize(begin) * 256, size};
-        vkCmdCopyBuffer(cmd, buffer, gsmem_, 1, &copy);
+        vkCmdCopyBuffer(cmd, source, gsmem_, std::uint32_t(regions.size()), regions.data());
         g_.Mark(cmd, kProfMemory);
         MemoryBarrier(cmd);
     });
+    work_ = work;
+    work_conflicts_ = conflicts;
+    work_writes_clut_ = writes_clut;
+    work_touched_ = touched;
+    std::memcpy(work_label_, label, sizeof label);
+    g_.next_label = next_label;
+    flushing_writes_ = false;
 }
 
 void VulkanGsRenderer::MemoryPatch(const std::uint32_t* words, std::size_t count) {
@@ -3216,6 +3304,22 @@ void VulkanGsRenderer::Flush() {
     if (!state_.blend) params.blend_ops = 0;    // (A - B) * C + D as Cs - Cs + Cs: the source as it is
     if (state_.textured && t->scale > 1) params.blend_ops |= (t->scale & 0xFFu) << 8;
     if (Is16Bit(state_.psm)) params.blend_ops |= 1u << 16;    // gs.frag: colour cut to five bits a channel
+    // FAST SAMPLING (a tablet's default, FastSampling): a texture decoded as it
+    // is - its image TW x TH, one level, no texture pack's - wrapped by REPEAT
+    // or CLAMP, sampled by the GPU's own sampler (gs.frag's bit 12 of
+    // bilinear) rather than four texelFetch and the GS's wrapping and
+    // rounding by hand. The GS's bilinear weights are in sixteenths, the
+    // GPU's finer: a level here and there differs.
+    if (state_.textured && !source && texture != &blank_ && !texture->replaced && !texture->replacement &&
+        !(params.bilinear & 2u) && state_.wms <= 1 && state_.wmt <= 1 && texture->image.width == state_.tw &&
+        texture->image.height == state_.th && texture->image.scale <= 1 && !(params.blend_ops & (0xFFu << 8)) &&
+        FastSampling()) {
+        const int fast = (state_.bilinear ? 4 : 0) | (state_.wms ? 2 : 0) | (state_.wmt ? 1 : 0);
+        if (VkDescriptorSet fast_set = SetFor(*texture, fast)) {
+            set = fast_set;
+            params.bilinear |= 1u << 12;
+        }
+    }
     const std::uint32_t count = std::uint32_t(pending_.size());
     static int complaints = 0;
     if ((!pipeline || !set) && complaints < 5) {
@@ -3713,7 +3817,9 @@ bool VulkanGsRenderer::ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uin
 }
 
 VulkanGsRenderer::~VulkanGsRenderer() {
-    g_.Submit();
+    g_.Submit();                    // (the writes held back go first)
+    g_.before_record = nullptr;
+    g_.end_pass = nullptr;
     {
         std::lock_guard<std::mutex> hold(g_queue_lock);
         vkDeviceWaitIdle(g_.device);

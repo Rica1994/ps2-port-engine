@@ -126,6 +126,9 @@ public:
     template <typename F>
     void RecordInPass(F&& record);
     std::function<void(VkCommandBuffer, bool submit)> end_pass;
+    /* Called before each Record and as Flush begins: what was held back to
+       record together goes in first (the renderer's memory writes). */
+    std::function<void()> before_record;
     /* The next Record's debug label (a frame capture's name for that work):
        taken by it. */
     const char* next_label = nullptr;
@@ -246,6 +249,7 @@ void VulkanGpu::RecordInPass(F&& record) {
 
 template <typename F>
 void VulkanGpu::Record(F&& record) {
+    if (before_record) before_record();
     RecordInPass([&](VkCommandBuffer c) {
         if (end_pass) end_pass(c, false);
         const char* label = next_label;
@@ -303,6 +307,7 @@ inline bool VulkanGpu::Retire(int slot, const char* why) {
 }
 
 inline bool VulkanGpu::Flush() {
+    if (before_record) before_record();
     if (!open_) return true;
     if (end_pass) end_pass(cmd, true);
     if (profile_) Stamp(cmd, run_kind_);    // the last run

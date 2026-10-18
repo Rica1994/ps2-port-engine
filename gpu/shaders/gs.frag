@@ -256,7 +256,11 @@ void main() {
         // The footprint in a replacement's texels, from the coordinates before
         // the sprite's clamp above (whose edges would read as a large one).
         vec4 t;
-        if (Replaced()) {
+        if (((p.bilinear >> 12) & 1u) != 0u) {
+            // FAST SAMPLING (gs_renderer.cpp): the GPU's sampler, REPEAT or
+            // CLAMP and the filter set by it; the texel's levels as the GS's.
+            t = floor(texture(texture_image, coordinate.xy / coordinate.z) * 255.0 + 0.5);
+        } else if (Replaced()) {
             const vec2 k = vec2(ReplacedSize(0)) / vec2(TextureSize());
             const vec2 r = coordinate.xy / coordinate.z * vec2(TextureSize()) * k;
             const vec2 dx = dFdx(r), dy = dFdy(r);
