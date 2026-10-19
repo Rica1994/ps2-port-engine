@@ -57,10 +57,15 @@ def lines_of(path: str) -> list:
 
 
 def stamp_of(manifest: str) -> str:
+    """The programs and the compiler that made them: a new vurecomp.py (an
+    engine update) compiles them again, as new programs do."""
     if not os.path.exists(manifest):
         return "none"
-    with open(manifest, "rb") as handle:
-        return hashlib.sha1(handle.read()).hexdigest()
+    digest = hashlib.sha1()
+    for path in (manifest, os.path.join(HERE, "vurecomp.py")):
+        with open(path, "rb") as handle:
+            digest.update(handle.read())
+    return digest.hexdigest()
 
 
 class Receiver:
@@ -105,6 +110,9 @@ class Receiver:
         with open(self.manifest, "w", encoding="utf-8", newline="\n") as handle:
             handle.write("\n".join(old + new) + "\n")
         say("vu_programs_new.txt: %d new program line(s); compiling ahead..." % len(new))
+        self.compile()
+
+    def compile(self) -> None:
         os.makedirs(self.generated, exist_ok=True)
         result = subprocess.run([sys.executable, os.path.join(HERE, "vurecomp.py"), "--manifest", self.manifest,
                                  "--out-dir", self.generated], capture_output=True, text=True)
@@ -199,6 +207,9 @@ def main() -> None:
     if not os.path.exists(os.path.join(args.game, "game.json")):
         sys.exit("no %s/game.json: run this from the game repository's root" % args.game)
     receiver = Receiver(args.game, args.out)
+    if os.path.exists(receiver.manifest) and receiver.stamp() != stamp_of(receiver.manifest):
+        say("the VU programs were compiled by another vurecomp (an engine update): compiling them again...")
+        receiver.compile()
     server = ThreadingHTTPServer(("0.0.0.0", args.port), handler_for(receiver))
     say("receiving the iPad's reports into %s" % os.path.abspath(args.out))
     for address in addresses():

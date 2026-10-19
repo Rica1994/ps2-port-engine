@@ -116,7 +116,9 @@ network, and the Mac takes the PC's results with one command:
    seconds, when the app leaves the front, and at its end), named after the
    run (`burnout3-20261016-151448-scripted.log`). `vu_programs_new.txt` - the
    VU programs the app started, in normal play and in scripted runs - is
-   merged into `build/vu_programs.txt` and compiled ahead at once.
+   merged into `build/vu_programs.txt` and compiled ahead at once (and all
+   of them again when the receiver starts after an engine update changed
+   `vurecomp.py`: pull the PC's repository too, then restart it).
 2. **On the Mac**, before each build, in the game repository:
    ```sh
    engine/tools/ipad_update.sh --pc http://<the PC's address>:8765    # the first time; then without --pc
