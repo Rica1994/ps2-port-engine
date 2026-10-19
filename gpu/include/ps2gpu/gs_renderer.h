@@ -211,6 +211,10 @@ public:
     virtual void UseReplacement(std::uint64_t key, std::uint64_t id) { (void)key, (void)id; }
     /* Whether block-compressed replacements can be uploaded as they are. */
     virtual bool BlockCompression() const { return false; }
+    /* The smallest piece of GPU memory a texture's image takes (images take
+       a power of two of bytes, no less): what a cache counting its memory
+       counts a small one as. */
+    virtual std::uint64_t ImagePiece() const { return 64 << 10; }
     /* A cooked texture (the asset cache's): the image TextureFromMemory
        would decode under `key` - the same size, its mipmap levels below
        level 0 the same way - in `format`: 0 RGBA8, 4 BC7, 5 ASTC 4x4

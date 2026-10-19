@@ -312,6 +312,7 @@ public:
         Drain(2);
         return inner_->HasReplacement(id);
     }
+    std::uint64_t ImagePiece() const override { return inner_->ImagePiece(); }   // (fixed at its start)
     bool BlockCompression() const override {
         Drain(3);
         return inner_->BlockCompression();

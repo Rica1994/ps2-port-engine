@@ -548,8 +548,8 @@ private:
     bool MakeImage(Image& image, std::uint32_t width, std::uint32_t height, VkImageUsageFlags usage,
                    VkFormat format = VK_FORMAT_R8G8B8A8_UNORM, std::uint32_t scale = 1, std::uint32_t levels = 1);
     void DestroyImage(Image& image);
-    /* Device-local memory for images: pieces of 64 MB blocks, a power of two
-       (64 KB to 16 MB) each, kept for reuse once freed - the textures that
+    /* Device-local memory for images: pieces of blocks, a power of two
+       (4 KB to 2 MB) each, kept for reuse once freed - the textures that
        come and go a frame (a full cache, a new area of a track) made no
        allocation of the driver's each (vkAllocateMemory goes to the system's
        kernel). Larger, an allocation of its own. */
@@ -557,6 +557,8 @@ private:
     void FreeImageMemory(VkDeviceMemory memory, VkDeviceSize offset, std::uint32_t piece_class, std::uint32_t type);
     std::map<std::uint64_t, std::vector<std::pair<VkDeviceMemory, VkDeviceSize>>> image_pieces_;   // (type, class) -> free
     std::vector<VkDeviceMemory> image_blocks_;
+    std::uint64_t image_piece_ = 4096;      // ImagePiece
+    std::uint64_t ImagePiece() const override { return image_piece_; }
     void Fill(Texture& texture, const std::uint32_t* pixels);
     VkPipeline PipelineFor(std::uint32_t key);
     /* The pipeline cache (SetPipelineCacheDir): every pipeline is made
@@ -1342,7 +1344,11 @@ bool VulkanGsRenderer::ImageMemory(const VkMemoryRequirements& req, std::uint32_
     // (an iPad has none of that to spare: iOS ends the app). Larger than 2
     // MB (a 1024x512 texture), an allocation of its own, freed with it.
     constexpr VkDeviceSize kLargest = VkDeviceSize(2) << 20;
-    std::uint32_t piece_class = 16;                 // 64 KB
+    // From 4 KB: the race's streamed textures are 64x64 and 128x64 - 16 KB
+    // as RGBA, 4 KB cooked to ASTC - and pieces of 64 KB at the least held
+    // four to sixteen times their memory, the tablet's texture budget full
+    // at ~3,200 textures, ~5 put out a frame and decoded again.
+    std::uint32_t piece_class = 12;                 // 4 KB
     while ((VkDeviceSize(1) << piece_class) < std::max(req.size, req.alignment)) ++piece_class;
     t.memory_type = type;
     if ((VkDeviceSize(1) << piece_class) > kLargest) {
@@ -1357,7 +1363,7 @@ bool VulkanGsRenderer::ImageMemory(const VkMemoryRequirements& req, std::uint32_
     if (free.empty()) {
         VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         const VkDeviceSize piece = VkDeviceSize(1) << piece_class;
-        const VkDeviceSize kBlock = piece * 16;
+        const VkDeviceSize kBlock = std::max(piece * 16, VkDeviceSize(1) << 20);   // (1 MB at the least)
         mai.allocationSize = kBlock;
         mai.memoryTypeIndex = type;
         VkDeviceMemory block = VK_NULL_HANDLE;
@@ -1476,8 +1482,15 @@ bool VulkanGsRenderer::Init(std::string* error) {
     // them) - the pictures are the same either way.
     tile_hints_ = defer_passes_ = TileWays(g_.portability);
     if (g_.portability) pool_limit_ = 128;
+    // Tile hints with MoltenVK by default since 20 Oct: measured on an A12 on
+    // 18 Oct they changed nothing, when a race picture cost the GPU ~45 ms
+    // of decodes, copies and swizzles; at ~20 ms the passes are most of it,
+    // and a pass that stores a depth buffer nothing will test (a target's
+    // own: ~a third of a picture's passes, the display copy's 640x1024 among
+    // them) is bandwidth for nothing. The pictures are the same either way
+    // (the scripted race, 29/29).
+    if (g_.portability) tile_hints_ = true;
     if (const char* hints = std::getenv("PS2GPU_TILE_HINTS")) tile_hints_ = hints[0] != '0';
-    // (Tile hints measured on an A12, 18 Oct: no difference - off.)
     if (const char* emulate = std::getenv("PS2GPU_LOCAL_READ_EMULATE"))
         emulate_tbdr_ = emulate[0] && emulate[0] != '0' && !g_.local_read;
     if (emulate_tbdr_) std::fprintf(stderr, "[gpu] local read emulated as a tile-based GPU reads (a copy at each pass)\n");
@@ -1492,6 +1505,26 @@ bool VulkanGsRenderer::Init(std::string* error) {
                  g_.local_read ? "on" : "off", tile_hints_ ? "on" : "off", "", defer_passes_ ? "on" : "off",
                  reorder_ ? "on" : "off");
     if (!InitMemory(error)) return false;
+    {
+        // The smallest piece a texture's image takes (ImagePiece): 4 KB, or
+        // the alignment a small sampled image asks for if more.
+        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+        ici.extent = {16, 16, 1};
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkImage probe = VK_NULL_HANDLE;
+        if (vkCreateImage(g_.device, &ici, nullptr, &probe) == VK_SUCCESS) {
+            VkMemoryRequirements req;
+            vkGetImageMemoryRequirements(g_.device, probe, &req);
+            while (image_piece_ < std::max(req.size, req.alignment)) image_piece_ <<= 1;
+            vkDestroyImage(g_.device, probe, nullptr);
+        }
+    }
     WarmPipelines();
     return true;
 }

@@ -164,7 +164,11 @@ the page past its last one as its own (a glow image drawn there every
 picture had one texture decoded again two or three times a picture, the
 glow image written back each time); a CLUT loaded from an image just drawn
 writes back one page of it; targets read as PSMT4HL/HH go through the CLUT
-in the shader (docs/GPU.md). On the
+in the shader (docs/GPU.md). Since 20 Oct: a texture's GPU memory comes in pieces from 4 KB
+(was 64 KB: the race's 64x64 textures, 4 KB cooked to ASTC, each took 64 KB,
+and the 320 MB budget filled at ~3,200 textures, ~5 a frame put out and
+decoded again), and the tile hints are on with MoltenVK (a pass stores no
+depth buffer nothing will test; `PS2GPU_TILE_HINTS=0` for the old way). On the
 CPU, VU0's macro mode no longer switches FPCR around each instruction on
 arm64 - a fifth of the EE thread on the A12 - and rounds toward zero by
 correcting the nearest result instead (`runtime/include/ps2rt/vu_rtz.h`,

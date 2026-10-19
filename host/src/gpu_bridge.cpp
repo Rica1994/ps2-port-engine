@@ -1313,9 +1313,9 @@ bool Replace(Bridge& b, Cached& t) {
 
 // ------------------------------------------------------------------ the asset cache
 
-// The GPU memory a cooked image takes, about (the renderer's pieces).
+// The GPU memory an image takes, about (the renderer's pieces).
 u64 PieceBytes(u64 bytes) {
-    u64 piece = 64 << 10;
+    u64 piece = std::max<u64>(1, g_bridge->renderer->ImagePiece());
     while (piece < bytes) piece <<= 1;
     return piece;
 }
@@ -1487,11 +1487,10 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         }
         b.IndexTexture(&t, true);
         // Its image's memory: RGBA texels, a third more for the levels, in
-        // pieces of a power of two no smaller than 64 KB (the renderer's).
+        // pieces of a power of two no smaller than the renderer's (ImagePiece).
         u64 texels = u64(tw) * th * 4;
         if (mips.count > 1) texels += texels / 3;
-        t.bytes = 64 << 10;
-        while (t.bytes < texels) t.bytes <<= 1;
+        t.bytes = PieceBytes(texels);
         t.rgba_bytes = t.bytes;
         t.texels = tw * th;
         b.texture_bytes += t.bytes;
