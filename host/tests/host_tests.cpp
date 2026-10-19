@@ -4,17 +4,22 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <vector>
 
 #include "ps2host/disc.h"
 #include "ps2host/dma.h"
 #include "ps2host/gs.h"
+#include "ps2host/host.h"
+#include "ps2host/run.h"
 #include "ps2host/ipu.h"
 #include "iop_vm_internal.h"
 #include "spu2.h"
@@ -232,6 +237,14 @@ void DmaChainsAreWalked() {
           words[8] == 0xE0u, "tags' upper halves, then each tag's data, in order");
     Check(((ch.chcr >> 28) & 7) == 7 && ((ch.chcr >> 4) & 3) == 0,
           "the TAG field and the call depth are left as at the end");
+    // The GIF takes no tags: with TTE set, only the data reaches it (Resident
+    // Evil Outbreak's PATH3 after a door, its register packet misaligned).
+    PutTag(chain, 1, 7, 0, 0, 0);                   // end, its one qword after it
+    for (u32 i = 0; i < 4; ++i) m.Write(chain + 16 + 4 * i, 0xF0 + i, 4);
+    ps2host::DmaChannelState gif{0x145u, 0, 0, chain, 0, 0};
+    std::vector<u32> gif_words;
+    ps2host::SendDma(gif, [&gif_words](u32 w) { gif_words.push_back(w); }, 1u << 16, false);
+    Check(gif_words.size() == 4 && gif_words[0] == 0xF0u, "a channel taking no tags ignores TTE");
     // A chain that never ends is stopped, not followed forever.
     PutTag(chain, 0, 2, chain, 0, 0);               // next -> itself
     ps2host::DmaChannelState loop{0x105u, 0, 0, chain, 0, 0};
@@ -291,6 +304,44 @@ void GsLayoutsArePermutations() {
             run->WriteRun(bp, bw, x, y, psm, values.data(), count);
         }
     Check(std::memcmp(one->data(), run->data(), 4u << 20) == 0, "GS row runs store as single pixels do");
+}
+
+void GsTakesRegisterPacketsInBlocks() {
+    using namespace ps2host::gs;
+    std::vector<u32> words;
+    auto quad = [&](u64 low, u64 high) {
+        words.insert(words.end(), {u32(low), u32(low >> 32), u32(high), u32(high >> 32)});
+    };
+    quad(3ull | 1ull << 60, 0xE); // PACKED A+D: configure a 64-pixel target.
+    quad(1ull << 16, 0x4C);
+    quad(63ull << 16 | 63ull << 48, 0x40);
+    quad(6, 0x00);
+    quad(1ull | 1ull << 58 | 3ull << 60, 0x551); // odd REGLIST, with padding.
+    quad(0x80402010, 4ull << 4 | (4ull << 4) << 16);
+    quad(8ull << 4 | (6ull << 4) << 16, ~0ull);
+    quad(0, 0); // empty tag, then another PACKED sprite.
+    quad(2ull | 2ull << 60, 0x51);
+    quad(0x10ull | 0x20ull << 32, 0x40ull | 0x80ull << 32);
+    quad(10ull << 4 | (10ull << 4) << 32, 0);
+    quad(0x10ull | 0x20ull << 32, 0x40ull | 0x80ull << 32);
+    quad(14ull << 4 | (12ull << 4) << 32, 0);
+    auto reference = std::make_unique<Gs>();
+    for (u32 word : words) reference->Word(3, word);
+    reference->Finish();
+    Check(reference->primitives() == 2, "mixed GIF fixture draws two sprites");
+    for (u32 chunk = 1; chunk <= 19; ++chunk) {
+        auto blocks = std::make_unique<Gs>();
+        for (u32 i = 0; i < words.size();) {
+            const u32 n = std::min(chunk, u32(words.size()) - i);
+            blocks->Words(3, words.data() + i, n);
+            i += n;
+        }
+        blocks->Finish();
+        Check(blocks->Summary() == reference->Summary() &&
+              blocks->primitives() == reference->primitives() &&
+              std::memcmp(blocks->memory.data(), reference->memory.data(), 4u << 20) == 0,
+              "batched and fragmented register packets match single words");
+    }
 }
 
 void GsDrawsASprite() {
@@ -431,8 +482,16 @@ void TexturePackNamesAsPcsx2() {
     bool pending = false;
     texture_pack::Find(name, &pending);
     Check(pending, "a texture the pack has (TCC's bit ignored): its file read in the background");
-    fs::remove_all(dir);
+    // The background read done before the folder goes: a file it still had
+    // open could not be removed (Windows), and remove_all threw - the tests
+    // ended there, now and then.
+    for (int i = 0; i < 200 && pending; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        texture_pack::Find(name, &pending);
+    }
     texture_pack::Open("");
+    std::error_code ignored;
+    fs::remove_all(dir, ignored);
 }
 
 void GsTakesImagesInBlocks() {
@@ -575,6 +634,73 @@ void GpuMemorySwizzlesAsTheGs() {
         what = std::string(f.name) + ": memory unswizzled on the GPU as the GS reads it";
         Check(back.size() == w * h && wrong == 0, what.c_str());
         base += 8;
+    }
+}
+
+// A target drawn at 2x-4x taken to memory and back (swizzle.comp, its
+// specialised pipelines): GS memory and every pixel as the scalar GS has them.
+void GpuScaledColourTransfersAsTheGs() {
+    using namespace ps2host::gs;
+    std::string error;
+    auto gpu = ps2gpu::CreateGpu(&error);
+    if (!gpu) return;
+    auto renderer = ps2gpu::CreateGsRenderer(*gpu, &error);
+    Check(renderer != nullptr, "scaled transfer renderer starts");
+    if (!renderer) return;
+    Memory reference;
+    renderer->MemoryWrite(0, 16384, reference.data());
+    const u32 w = 384, h = 64, fbw = 6;
+    u32 base = 0x20, seed = 52413;
+    auto next = [&] { return seed = seed * 1664525u + 1013904223u; };
+    for (u32 scale : {2u, 3u, 4u}) {
+        renderer->SetScale(scale);
+        for (u32 psm : {PSMCT32, PSMCT24, PSMCT16, PSMCT16S}) {
+            const bool sixteen = psm == PSMCT16 || psm == PSMCT16S;
+            renderer->TargetFromMemory(base, fbw, psm, w, h);
+            ps2gpu::GsDrawState state;
+            state.fbp = base; state.fbw = fbw; state.psm = psm;
+            state.width = w; state.height = h;
+            state.scissor_x1 = w - 1; state.scissor_y1 = h - 1;
+            const ps2gpu::GsVertex vertices[] = {
+                {0, 0, 0, 16, 32, 64, 128, 0, 0, 1},
+                {float(w), 0, 0, 16, 32, 64, 128, 0, 0, 1},
+                {0, float(h), 0, 16, 32, 64, 128, 0, 0, 1},
+                {float(w), 0, 0, 16, 32, 64, 128, 0, 0, 1},
+                {float(w), float(h), 0, 16, 32, 64, 128, 0, 0, 1},
+                {0, float(h), 0, 16, 32, 64, 128, 0, 0, 1}};
+            renderer->DrawTriangles(state, vertices, 6);
+            Check(renderer->TargetToMemory(base, fbw, psm, w, h), "scaled target swizzles to memory");
+            for (u32 y = 0; y < h; ++y)
+                for (u32 x = 0; x < w; ++x) {
+                    u32 c = 0x80402010u;
+                    if (sixteen) c = ((c >> 3) & 31) | (((c >> 11) & 31) << 5) |
+                        (((c >> 19) & 31) << 10) | ((c >> 31) << 15);
+                    reference.Write(base * 32, fbw, x, y, psm, c);
+                }
+            std::vector<u8> bytes(4u << 20);
+            renderer->MemoryRead(0, 16384, bytes.data());
+            Check(std::memcmp(bytes.data(), reference.data(), bytes.size()) == 0,
+                  "2x/3x/4x color transfer matches scalar GS memory");
+            const u32 begin = base * 32, end = begin + fbw * (sixteen ? 1 : 2) * 32;
+            for (u32 i = begin * 256; i < end * 256; ++i) reference.data()[i] = u8(next() >> 24);
+            renderer->MemoryWrite(begin, end, reference.data() + begin * 256);
+            renderer->TargetFromMemory(base, fbw, psm, w, h);
+            std::vector<u32> back;
+            u32 width = 0, height = 0;
+            Check(renderer->ReadTarget(base, fbw, psm, &back, &width, &height) && width == w && height == h,
+                  "scaled reloaded image reads at native dimensions");
+            u32 wrong = 0;
+            if (back.size() == w * h)
+                for (u32 y = 0; y < h; ++y)
+                    for (u32 x = 0; x < w; ++x) {
+                        const u32 raw = reference.Read(begin, fbw, x, y, psm);
+                        const u32 want = sixteen ? ((raw & 31) << 3) | (((raw >> 5) & 31) << 11) |
+                            (((raw >> 10) & 31) << 19) | ((raw & 0x8000) ? 0x80000000u : 0) : raw;
+                        if (back[y * w + x] != want) ++wrong;
+                    }
+            Check(back.size() == w * h && wrong == 0, "scaled reload preserves every native color pixel");
+            base += 16;
+        }
     }
 }
 
@@ -1236,6 +1362,17 @@ void MmiLanesAreScalar() {
             ++checked;
             if (lo1 != lo2 || hi1 != hi2) ++wrong;
         }
+    for (u32 width : {16u, 32u, 64u})
+        for (u32 kind = 0; kind < 3; ++kind)
+            for (int trial = 0; trial < 2000; ++trial) {
+                const u64 blo = value(), bhi = value();
+                const u32 amount = u32(value());
+                u64 lo1, hi1, lo2, hi2;
+                lifted::ShiftLanes(lo1, hi1, blo, bhi, width, kind, amount);
+                lifted::ShiftLanesScalar(lo2, hi2, blo, bhi, width, kind, amount);
+                ++checked;
+                if (lo1 != lo2 || hi1 != hi2) ++wrong;
+            }
     char what[128];
     std::snprintf(what, sizeof what, "MMI lanes in SSE2 are the model's (%u of %u differ)", wrong, checked);
     Check(wrong == 0, what);
@@ -1300,6 +1437,165 @@ void IopInstructionsMatchTheR5900() {
 
 }  // namespace
 
+// A core's sound-data input (a block transfer's PCM): heard at its BVOL in the
+// dry mix MMIX lets it into; silent at BVOL 0, and once stopped.
+void SpuPlaysItsSoundDataInput() {
+    using ps2host::iop::Spu2;
+    std::vector<Spu2::u8> pcm(0x800);
+    for (int block = 0; block < 2; ++block)
+        for (int i = 0; i < 256; ++i) {
+            const Spu2::s16 left = 8192, right = -8192;
+            std::memcpy(&pcm[block * 0x400 + i * 2], &left, 2);
+            std::memcpy(&pcm[block * 0x400 + 0x200 + i * 2], &right, 2);
+        }
+    auto play = [&](Spu2::u32 bvol, bool stop) {
+        Spu2 spu;
+        std::vector<Spu2::s16> heard;
+        spu.SetOutput([&](const Spu2::s16* frames, Spu2::u32 count) { heard.assign(frames, frames + 2 * count); });
+        spu.SetParam(0x0801, 0x00C0);                   // MMIX, core 1: the input, dry
+        spu.SetParam(0x0F01, bvol);                     // BVOLL
+        spu.SetParam(0x1001, bvol);                     // BVOLR
+        spu.SetInput(1, pcm.data(), Spu2::u32(pcm.size()));
+        if (stop) spu.SetInput(1, nullptr, 0);
+        spu.Advance(1000, [](Spu2::u32) {});
+        spu.Advance(11000, [](Spu2::u32) {});           // 10 ms: 480 samples
+        return heard;
+    };
+    const std::vector<Spu2::s16> loud = play(0x7FFF, false);
+    Check(loud.size() >= 2 && loud[loud.size() - 2] > 1000 && loud.back() < -1000,
+          "SPU2: the sound-data input, left and right");
+    const std::vector<Spu2::s16> muted = play(0, false), stopped = play(0x7FFF, true);
+    Check(!muted.empty() && muted[muted.size() - 2] == 0 && muted.back() == 0,
+          "SPU2: the sound-data input at BVOL 0 is silent");
+    Check(!stopped.empty() && stopped.back() == 0, "SPU2: a stopped input is silent");
+}
+
+// The cores' routing (PCSX2's mixer): core 0's output is core 1's external
+// input, heard at core 1's AVOL (silent at 0); MMIX's external bits (0-3) do
+// not let the sound-data input in - its own are 4-7.
+void SpuRoutesCore0ThroughCore1() {
+    using ps2host::iop::Spu2;
+    auto play = [](Spu2::u32 avol) {
+        Spu2 spu;
+        Spu2::u8 loop[16] = {0x00, 0x07};
+        for (int i = 2; i < 16; ++i) loop[i] = 0x11;
+        spu.Write(0x5000, loop, 16);
+        std::vector<Spu2::s16> heard;
+        spu.SetOutput([&](const Spu2::s16* frames, Spu2::u32 count) { heard.assign(frames, frames + 2 * count); });
+        spu.SetAddr(0x2000, 0x5000);                // voice 0 of core 0
+        spu.SetParam(0x0000, 0x3FFF);
+        spu.SetParam(0x0100, 0x3FFF);
+        spu.SetParam(0x0200, 0x1000);
+        spu.SetParam(0x0300, 0x000F);
+        spu.SetParam(0x0400, 0x1FC0);
+        spu.SetParam(0x0D01, avol);                 // AVOLL, core 1
+        spu.SetParam(0x0E01, avol);
+        spu.SetSwitch(0x1800, 1);
+        spu.SetSwitch(0x1A00, 1);
+        spu.SetSwitch(0x1500, 1);
+        spu.Advance(1000, [](Spu2::u32) {});
+        spu.Advance(2000, [](Spu2::u32) {});
+        return heard.size() == 96 ? int(heard[90]) : -1;
+    };
+    Check(play(0x7FFF) > 3500, "SPU2: core 0 heard through core 1");
+    Check(play(0) == 0, "SPU2: core 0 silent at core 1's AVOL 0");
+    std::vector<Spu2::u8> pcm(0x800, 0x40);
+    Spu2 spu;
+    std::vector<Spu2::s16> heard;
+    spu.SetOutput([&](const Spu2::s16* frames, Spu2::u32 count) { heard.assign(frames, frames + 2 * count); });
+    spu.SetParam(0x0801, 0x000F);                   // MMIX, core 1: the external input only
+    spu.SetInput(1, pcm.data(), Spu2::u32(pcm.size()));
+    spu.Advance(1000, [](Spu2::u32) {});
+    spu.Advance(2000, [](Spu2::u32) {});
+    Check(!heard.empty() && heard.back() == 0, "SPU2: the external bits keep the sound-data input out");
+}
+
+// A voice's samples go through the hardware's Gaussian interpolation, whose
+// four taps sum to 0x7F80, not 0x8000: a block of 4096s plays as ~4080 (4095
+// through linear interpolation, as before).
+void SpuInterpolatesAsTheHardware() {
+    using ps2host::iop::Spu2;
+    Spu2 spu;
+    Spu2::u8 loop[16] = {0x00, 0x07};
+    for (int i = 2; i < 16; ++i) loop[i] = 0x11;
+    spu.Write(0x5000, loop, 16);
+    std::vector<Spu2::s16> heard;
+    spu.SetOutput([&](const Spu2::s16* frames, Spu2::u32 count) { heard.assign(frames, frames + 2 * count); });
+    spu.SetAddr(0x2000, 0x5000);
+    spu.SetParam(0x0000, 0x3FFF);
+    spu.SetParam(0x0100, 0x3FFF);
+    spu.SetParam(0x0200, 0x1000);
+    spu.SetParam(0x0300, 0x000F);
+    spu.SetParam(0x0400, 0x1FC0);
+    spu.SetSwitch(0x1800, 1);
+    spu.SetSwitch(0x1A00, 1);
+    spu.SetSwitch(0x1500, 1);
+    spu.Advance(1000, [](Spu2::u32) {});
+    spu.Advance(2000, [](Spu2::u32) {});
+    Check(heard.size() == 96 && heard[90] >= 4070 && heard[90] <= 4088,
+          "SPU2: a voice's samples through the Gaussian table");
+}
+
+// The reverb runs at 24 kHz, its input and output resampled by the hardware's
+// half-band FIR: a 1.5 kHz tone through it, its 24 kHz image (22.5 kHz) below
+// -40 dB of the tone. A step's output held for two samples left it at -20 dB.
+void SpuReverbHasNoImage() {
+    using ps2host::iop::Spu2;
+    std::vector<Spu2::u8> pcm(0x1000);              // 1,024 samples: 32 periods of 1.5 kHz
+    for (int block = 0; block < 4; ++block)
+        for (int i = 0; i < 256; ++i) {
+            const double t = double(block * 256 + i) / 48000.0;
+            const Spu2::s16 s = Spu2::s16(8000.0 * std::sin(2.0 * 3.14159265358979 * 1500.0 * t));
+            std::memcpy(&pcm[block * 0x400 + i * 2], &s, 2);
+            std::memcpy(&pcm[block * 0x400 + 0x200 + i * 2], &s, 2);
+        }
+    Spu2 spu;
+    std::vector<Spu2::s16> heard;
+    spu.SetOutput([&](const Spu2::s16* frames, Spu2::u32 count) { heard.insert(heard.end(), frames, frames + 2 * count); });
+    spu.SetParam(0x0801, 0x0030);                   // MMIX, core 1: the input, wet only
+    spu.SetParam(0x0F01, 0x7FFF);
+    spu.SetParam(0x1001, 0x7FFF);
+    Check(spu.SetEffectAttr(1, 0x101, 0x3FFF, 0x3FFF, 0, 0) == 0, "SPU2: the Room preset on core 1");
+    spu.SetCoreAttr(0x3, 1);                        // SD_CORE_EFFECT_ENABLE, core 1
+    spu.SetInput(1, pcm.data(), Spu2::u32(pcm.size()));
+    spu.Advance(1000, [](Spu2::u32) {});
+    spu.Advance(1000 + 300000, [](Spu2::u32) {});   // 300 ms
+    auto bin = [&](double hz) {
+        double re = 0, im = 0;
+        const std::size_t from = heard.size() / 2 - 9600;
+        for (std::size_t k = 0; k < 9600; ++k) {
+            const double w = 2.0 * 3.14159265358979 * hz * double(k) / 48000.0;
+            re += heard[2 * (from + k)] * std::cos(w);
+            im += heard[2 * (from + k)] * std::sin(w);
+        }
+        return std::sqrt(re * re + im * im);
+    };
+    const double tone = bin(1500), image = bin(22500);
+    Check(tone > 1e5, "SPU2: the reverb passes the tone");
+    Check(image < tone * 0.01, "SPU2: the reverb's output has no 24 kHz image");
+}
+
+// The input's half-buffer interrupt comes from where the SPU2 plays: each half
+// begun stops the Advance there (the IOP refills the half before it is read
+// again), InputHalf says which half plays, and PlayedUs where it stopped.
+void SpuInputInterruptsAtEachHalf() {
+    using ps2host::iop::Spu2;
+    std::vector<Spu2::u8> pcm(0x1000);              // two halves of 512 samples
+    Spu2 spu;
+    Spu2::u32 played = 0;
+    spu.SetOutput([&](const Spu2::s16*, Spu2::u32 count) { played += count; });
+    spu.SetInput(1, pcm.data(), Spu2::u32(pcm.size()));
+    std::vector<Spu2::u32> halves;
+    auto half = [&](Spu2::u32 core) { halves.push_back(spu.InputHalf(core)); };
+    spu.Advance(1000, [](Spu2::u32) {}, half);
+    spu.Advance(1000 + 30000, [](Spu2::u32) {}, half);  // 30 ms: 1,440 samples due
+    Check(played == 512 && halves.size() == 1 && halves[0] == 1, "SPU2: the input stops at its second half");
+    Check(spu.PlayedUs() < 1000 + 30000, "SPU2: an input's stop leaves the rest owed");
+    spu.Advance(1000 + 30000, [](Spu2::u32) {}, half);
+    spu.Advance(1000 + 30000, [](Spu2::u32) {}, half);
+    Check(played == 1440 && halves.size() == 2 && halves[1] == 0, "SPU2: the rest played, a half at a time");
+}
+
 void SpuDecodesAdpcmAndPlaysAVoice() {
     using ps2host::iop::Spu2;
     // Shift 0, filter 0: a nibble is the sample's top four bits.
@@ -1350,6 +1646,141 @@ void SpuDecodesAdpcmAndPlaysAVoice() {
     Check(heard[2 * 575] == 0 && heard[2 * 575 + 1] > 3500, "SPU2: the sweep reaches silence, the other side plays on");
     Check(spu.GetParam(0x0600) == 0, "SPU2: VOLXL, the current volume, is the sweep's");
 
+    // Wet-only voices need their capture buffers even with reverb disabled.
+    // Burnout 3 DMA-reads this mix to process the player's engine sound.
+    Spu2 captured;
+    captured.Write(0x5000, loop, 16);
+    std::vector<Spu2::s16> capture_output;
+    captured.SetOutput([&](const Spu2::s16* frames, Spu2::u32 count) { capture_output.assign(frames, frames + 2 * count); });
+    captured.SetAddr(0x2000, 0x5000);
+    captured.SetParam(0x0000, 0x3FFF);
+    captured.SetParam(0x0100, 0x3FFF);
+    captured.SetParam(0x0200, 0x1000);
+    captured.SetParam(0x0300, 0x000F);
+    captured.SetParam(0x0400, 0x1FC0);
+    captured.SetSwitch(0x1900, 1);
+    captured.SetSwitch(0x1B00, 1);
+    captured.SetSwitch(0x1500, 1);
+    captured.SetAddr(0x1F00, 0x2820);
+    captured.SetAddr(0x1F01, 0x2820);
+    captured.SetCoreAttr(0x04, 1);
+    captured.SetCoreAttr(0x05, 1);
+    unsigned capture_irqs = 0;
+    auto capture_irq = [&](Spu2::u32 core) { capture_irqs |= 1u << core; };
+    captured.Advance(1000, capture_irq);
+    captured.Advance(2000, capture_irq);
+    // The interrupt (IRQA 0x2820: the ring's 16th sample) ends the batch
+    // there, for the IOP to answer it; the rest plays on the next Advance.
+    Check(capture_output.size() == 2 * 17, "SPU2: a batch stops at the sample its interrupt came on");
+    captured.Advance(2000, capture_irq);
+    auto capture_sample = [&](unsigned address) {
+        Spu2::u8 bytes[2]; captured.Read(address, bytes, 2);
+        return int(Spu2::s16(unsigned(bytes[0]) | unsigned(bytes[1]) << 8));
+    };
+    Check(capture_sample(0x2800 + 94) > 3500 && capture_sample(0x2C00 + 94) > 3500,
+          "SPU2: wet capture is written at 48 kHz without audible reverb");
+    Check(capture_sample(0x2000 + 94) == 0 && capture_sample(0x2400 + 94) == 0 &&
+          capture_output.back() == 0, "SPU2: a wet-only voice does not leak into the dry output");
+    Check(capture_irqs == 3, "SPU2: both cores see a capture-buffer write at their IRQA");
+    captured.Advance(12000, none);                  // Fill the complete ring before fading.
+    captured.SetParam(0x0000, 0);
+    captured.SetParam(0x0100, 0);
+    captured.Advance(14000, none);                  // 624 samples total: wrapped at 512
+    Check(capture_sample(0x2800 + 94) == 0 && capture_sample(0x2C00 + 94) == 0 &&
+          capture_sample(0x2800 + 400) > 3500,
+          "SPU2: 512-sample captures wrap and retain the unoverwritten part");
+    // Voice 1 and 3 taps are before voice volume and mix routing.
+    captured.SetAddr(0x2002, 0x5000);
+    captured.SetParam(0x0202, 0x1000);
+    captured.SetParam(0x0302, 0x000F);
+    captured.SetParam(0x0402, 0x1FC0);
+    captured.SetSwitch(0x1500, 2);
+    captured.Advance(15000, none);
+    Check(capture_sample(0x0800 + 300) > 3500,
+          "SPU2: the raw voice-1 tap captures post-envelope audio at zero volume");
+
+    // B3ROUTE returns planar, signed PCM to core 1's input RAM. BVOL is
+    // signed 16-bit (unlike a voice volume's signed 15-bit fixed mode).
+    Spu2 pcm;
+    std::vector<Spu2::s16> pcm_output;
+    pcm.SetOutput([&](const Spu2::s16* frames, Spu2::u32 count) { pcm_output.assign(frames, frames + 2 * count); });
+    std::vector<Spu2::u8> pcm_data(0x800);
+    for (unsigned i = 0; i < 512; ++i) {
+        pcm_data[i*2] = 0x10; pcm_data[i*2+1] = 0x27;     // left: +10000
+        pcm_data[0x400+i*2] = 0xF0; pcm_data[0x401+i*2] = 0xD8; // right: -10000
+    }
+    pcm.Write(0x4800, pcm_data.data(), unsigned(pcm_data.size()));
+    pcm.SetParam(0x0801, 0x0C0);                   // PCM directly to both speakers
+    pcm.SetParam(0x0F81, 0x7FFF);
+    pcm.SetParam(0x1081, 0x4000);
+    pcm.Advance(1000, none); pcm.Advance(2000, none);
+    Check(pcm_output[90] > 9900 && pcm_output[90] < 10000 &&
+          pcm_output[91] >= -5000 && pcm_output[91] < -4900,
+          "SPU2: planar PCM input plays at independent signed 16-bit volumes");
+    Check(pcm.GetParam(0x0801) == 0x0C0 && pcm.GetParam(0x0F81) == 0x7FFF &&
+          pcm.GetParam(0x1081) == 0x4000, "SPU2: input parameters read back");
+    pcm.SetParam(0x0801, 0x040);                   // gate off only the left input
+    pcm.Advance(3000, none);
+    Check(pcm_output[90] == 0 && pcm_output[91] < -4900,
+          "SPU2: MMIX gates PCM separately on each side");
+    pcm.SetParam(0x0801, 0x0C0);
+    pcm.SetParam(0x0F81, 0x8000);                  // negative unity, not a sweep
+    pcm.SetParam(0x1081, 0);
+    pcm.Advance(4000, none);
+    Check(pcm_output[90] < -9900 && pcm_output[91] == 0,
+          "SPU2: signed PCM volume can invert or silence the input");
+    pcm.Advance(15000, none);                     // crosses the 512-sample ring
+    Check(pcm_output[900] < -9900 && pcm_output[901] == 0,
+          "SPU2: PCM input wraps at 512 samples");
+
+    // Host engine gain changes only returned PCM, with a 5 ms ramp. The
+    // guest's samples and volume registers remain untouched.
+    pcm.SetParam(0x0F81, 0x7FFF);
+    pcm.SetParam(0x1081, 0x7FFF);
+    pcm.Advance(16000, none);
+    const int unity_left = pcm_output[90], unity_right = pcm_output[91];
+    pcm.SetInputVolume(1, 50);
+    pcm.Advance(25000, none);
+    Check(pcm_output[700] >= 4990 && pcm_output[700] <= 5000 &&
+          pcm_output[701] >= -5000 && pcm_output[701] <= -4990,
+          "SPU2: host PCM gain halves both channels after the ramp");
+    pcm.SetInputVolume(1, 0);
+    pcm.Advance(35000, none);
+    Check(pcm_output[0] > 0 && pcm_output[700] == 0 && pcm_output[701] == 0,
+          "SPU2: gain fades smoothly to silence");
+    pcm.SetInputVolume(1, 200);
+    pcm.Advance(45000, none);
+    Check(pcm_output[700] >= 19980 && pcm_output[700] <= 20000,
+          "SPU2: host PCM gain can boost to 200 percent");
+    pcm.SetInputVolume(1, 100);
+    pcm.Advance(55000, none);
+    Check(pcm_output[700] == unity_left && pcm_output[701] == unity_right,
+          "SPU2: 100 percent preserves the original PCM exactly");
+    Spu2::u8 retained[2] = {};
+    pcm.Read(0x4800, retained, 2);
+    Check(retained[0] == 0x10 && retained[1] == 0x27 &&
+          pcm.GetParam(0x0F81) == 0x7FFF,
+          "SPU2: host gain preserves guest input RAM and BVOL");
+
+    // Voices (traffic/effects/music) remain audible with player PCM muted.
+    Spu2::u8 traffic[16] = {0x00, 0x07};
+    for (int i = 2; i < 16; ++i) traffic[i] = 0x11;
+    pcm.Write(0x5000, traffic, 16);
+    pcm.SetAddr(0x2001, 0x5000);
+    pcm.SetParam(0x0001, 0x3FFF);
+    pcm.SetParam(0x0101, 0x3FFF);
+    pcm.SetParam(0x0201, 0x1000);
+    pcm.SetParam(0x0301, 0x000F);
+    pcm.SetParam(0x0401, 0x1FC0);
+    pcm.SetParam(0x0801, 0x0CC0);
+    pcm.SetSwitch(0x1801, 1);
+    pcm.SetSwitch(0x1A01, 1);
+    pcm.SetSwitch(0x1501, 1);
+    pcm.SetInputVolume(1, 0);
+    pcm.Advance(70000, none);
+    Check(pcm_output[1000] > 3500 && pcm_output[1001] > 3500,
+          "SPU2: PCM mute does not mute the other ADPCM voices");
+
     // The reverb: one loud sample sent only to it (VMIXEL/VMIXER, not the dry
     // mix) comes out later, and keeps coming out after the voice has ended.
     Spu2 wet;
@@ -1378,7 +1809,46 @@ void SpuDecodesAdpcmAndPlaysAVoice() {
     Check(wet.SetEffectAttr(0, 10, 0, 0, 0, 0) == -1, "SPU2: no eleventh preset");
 }
 
+// Two overlays loaded at the same address: a call runs the function of the one
+// whose code is in memory, and FlushCache makes a call look again.
+int g_overlay_ran = 0;
+void OverlayA(lifted::Context&) { g_overlay_ran = 1; }
+void OverlayB(lifted::Context&) { g_overlay_ran = 2; }
+
+void OverlaysRunWhatIsLoaded() {
+    static const ps2host::FunctionEntry a[] = {{0x00500000u, OverlayA, "a", 16u}};
+    static const ps2host::FunctionEntry b[] = {{0x00500000u, OverlayB, "b", 16u}};
+    static const u32 a_checks[] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u};
+    static const u32 b_checks[] = {0x55555555u, 0x66666666u, 0x77777777u, 0x88888888u};
+    static const ps2host::OverlayEntry overlays[] = {
+        {"a", 0x00500000u, 0x00500100u, a, 1, a_checks},
+        {"b", 0x00500000u, 0x00500100u, b, 1, b_checks},
+    };
+    ps2host::RegisterOverlays(overlays, 2);
+    ps2host::Memory& m = ps2host::GuestMemory();
+    lifted::Context c{};
+    for (int i = 0; i < 4; ++i) m.Write(0x00500000u + 4 * i, b_checks[i], 4);
+    ps2host::CodeChanged();
+    ps2host::Dispatch(c, 0x00500000u);
+    Check(g_overlay_ran == 2, "overlays: the loaded one's function runs");
+    for (int i = 0; i < 4; ++i) m.Write(0x00500000u + 4 * i, a_checks[i], 4);
+    ps2host::CodeChanged();
+    ps2host::Dispatch(c, 0x00500000u);
+    Check(g_overlay_ran == 1, "overlays: another loaded over it, and flushed: its function runs");
+    m.Write(0x00500000u, 0u, 4);
+    ps2host::CodeChanged();
+    bool refused = false;
+    try {
+        ps2host::Dispatch(c, 0x00500000u);
+    } catch (const ps2host::Unimplemented&) {
+        refused = true;
+    }
+    Check(refused, "overlays: code neither overlay's is not run as either");
+    ps2host::RegisterOverlays(nullptr, 0);
+}
+
 int main() {
+    OverlaysRunWhatIsLoaded();
     MirrorsReachTheSameRam();
     LoadsExtendAsTheEeDoes();
     OutsideMemoryFaults();
@@ -1397,10 +1867,12 @@ int main() {
     GsKeepsAFlatDepthExact();
     GsFillsTopLeft();
     GsTakesImagesInBlocks();
+    GsTakesRegisterPacketsInBlocks();
     TexturePackNamesAsPcsx2();
     TexturesCookAndKeep();
 #if PS2HOST_VULKAN
     GpuMemorySwizzlesAsTheGs();
+    GpuScaledColourTransfersAsTheGs();
     GpuDecodesTexturesAsTheGs();
 #endif
     VifRunsMicroprogramsOnAVu();
@@ -1415,6 +1887,11 @@ int main() {
     IpuDecodesAndRetriesCleanly();
     IopInstructionsMatchTheR5900();
     SpuDecodesAdpcmAndPlaysAVoice();
+    SpuPlaysItsSoundDataInput();
+    SpuInputInterruptsAtEachHalf();
+    SpuReverbHasNoImage();
+    SpuInterpolatesAsTheHardware();
+    SpuRoutesCore0ThroughCore1();
     std::printf(g_failures ? "host tests: %d failed\n" : "host tests: all passed\n", g_failures);
     return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

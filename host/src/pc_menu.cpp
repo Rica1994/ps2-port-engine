@@ -1,5 +1,5 @@
 /*
- * The PC settings panel: F1 (or L3 + R3 on a controller) over any game.
+ * The PC settings panel: F9 (or L3 + R3 on a controller) over any game.
  *
  * A port can put its PC settings in the game's own menus (Burnout 3's main
  * menu has PC SETTINGS); this panel is the engine's, for every port: the
@@ -8,7 +8,7 @@
  *
  *   Up / Down          choose
  *   Left / Right       change (Enter or Cross too)
- *   F1, Esc, Circle    close
+ *   F9, Esc, Circle    close
  */
 
 #include <array>
@@ -62,7 +62,7 @@ const std::vector<Choice>& Choices() {
          [](const std::string& v) { SetWindowVsync(v == "on"); },
          "V-SYNC", {"OFF", "ON"}, "Wait for the screen's refresh: no tearing."},
         {"Frame pacing", {"on", "off"}, {"On", "Off"},
-         [] { return OnOff(SettingOn("frame_pacing", true)); },
+         [] { return OnOff(SettingOn("frame_pacing", FramePacingDefault())); },
          [](const std::string& v) { SetSettingOn("frame_pacing", v == "on"); },
          "PACING", {"ON", "OFF"}, "Frame pacing: pictures shown at an even pace."},
         {"Texture pack", {"on", "off"}, {"On", "Off"},
@@ -87,7 +87,7 @@ std::vector<int> Rows() {
 }
 
 void Draw(bool force = false) {
-    std::vector<std::string> lines = {"PC SETTINGS   (F1 closes)"};
+    std::vector<std::string> lines = {"PC SETTINGS   (F9 closes)"};
     const std::vector<int> rows = Rows();
     for (int r = 0; r < int(rows.size()); ++r) {
         std::string text;
@@ -135,7 +135,7 @@ std::array<bool, kInputs> Held() {
     std::array<bool, kInputs> held{};
     const bool focused = WindowFocused();
     auto key = [&](int vk) { return focused && HostKeyDown(vk); };
-    held[kToggle] = key(VK_F1);
+    held[kToggle] = key(VK_F9);
     held[kUp] = key(VK_UP);
     held[kDown] = key(VK_DOWN);
     held[kLeft] = key(VK_LEFT);

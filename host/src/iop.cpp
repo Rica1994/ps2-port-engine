@@ -18,6 +18,7 @@
  * and procedure - so the report says which IOP services the game needs.
  */
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -79,7 +80,7 @@ void PutWord(std::vector<u8>& bytes, std::size_t at, u32 value) {
 std::vector<u8> ReadGuest(u32 address, u32 size) {
     std::vector<u8> bytes(size);
     Memory& m = GuestMemory();
-    for (u32 i = 0; i < size; ++i) bytes[i] = u8(m.Read(address + i, 1));
+    m.ReadBytes(address, bytes.data(), size);
     return bytes;
 }
 
@@ -181,8 +182,11 @@ void Command(const std::vector<u8>& packet, const std::vector<u8>& data) {
                      " bytes sent (no host implementation: answered with zeros); from" + callers);
             }
             Memory& m = GuestMemory();
-            for (u32 i = 0; i < receive_size && receive; ++i)
-                m.Write(receive + i, i < reply.size() ? reply[i] : 0, 1);
+            if (receive && receive_size) {
+                std::vector<u8> answer(receive_size, 0);
+                std::memcpy(answer.data(), reply.data(), std::min<std::size_t>(reply.size(), receive_size));
+                m.WriteBytes(receive, answer.data(), answer.size());
+            }
             QueueEnd(packet, kRpcCall, server, server + 0x100, server + 0x200);
             return;
         }
@@ -231,11 +235,16 @@ void SifDma(u32 transfers, u32 count) {
             data.clear();
         } else {
             // Extra data, DMA'd into IOP memory where the sender said - a
-            // module reads it there. Data for the host's own servers is bound
-            // for their pretended addresses, above any module's memory.
-            if (dest < kServerBase)
-                for (u32 k = 0; k < size; ++k) m.Write(kIopRamBase + dest + k, bytes[k], 1);
-            if (std::getenv("PS2HOST_SIF_LOG"))
+            // module reads it there. The address may be a segment's
+            // (0x80000000, 0xA0000000: EA's DirtySock sends its RPC ring's
+            // descriptor to 0xA0xxxxxx); the IOP's RAM is what it names. Data
+            // for the host's own servers is bound for their pretended
+            // addresses, above any module's memory.
+            const u32 physical = dest & 0x1FFFFFFFu;
+            if (physical < kServerBase)
+                m.WriteBytes(kIopRamBase + physical, bytes.data(), size);
+            static const bool sif_log = std::getenv("PS2HOST_SIF_LOG") != nullptr;
+            if (sif_log)
                 std::fprintf(stderr, "[sif] data %u bytes from 0x%08X to IOP 0x%08X: %08X %08X %08X %08X\n",
                              unsigned(size), unsigned(src), unsigned(dest), unsigned(Word(bytes, 0)),
                              unsigned(Word(bytes, 4)), unsigned(Word(bytes, 8)), unsigned(Word(bytes, 12)));
@@ -269,7 +278,7 @@ bool DeliverIopReply() {
     std::vector<u8> packet = std::move(iop.replies.front().packet);
     iop.replies.pop_front();
     Memory& m = GuestMemory();
-    for (std::size_t i = 0; i < packet.size(); ++i) m.Write(iop.receive_buffer + u32(i), packet[i], 1);
+    m.WriteBytes(iop.receive_buffer, packet.data(), packet.size());
     RaiseDmac(kSif0Channel);
     return true;
 }

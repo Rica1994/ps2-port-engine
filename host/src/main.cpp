@@ -47,6 +47,8 @@
 
 extern const ps2host::FunctionEntry kGuestFunctions[];
 extern const std::size_t kGuestFunctionCount;
+extern const ps2host::OverlayEntry kGuestOverlays[];
+extern const std::size_t kGuestOverlayCount;
 
 /* The game's host implementations of guest functions (its port's overrides.cpp). */
 void RegisterGameOverrides();
@@ -168,6 +170,19 @@ std::vector<std::string> PlayArguments(const char* self) {
     ps2host::LoadSettings((here / "pc_settings.ini").string());     // where --memcard puts them
     std::string disc = ps2host::Setting("disc");
 #ifdef _WIN32
+    // None chosen yet, or gone: an image of the game's disc beside the
+    // executable is taken without asking.
+    if (!IsGameDisc(disc)) {
+        std::error_code error;
+        for (const auto& entry : std::filesystem::directory_iterator(here, error)) {
+            std::string ext = entry.path().extension().string();
+            for (char& ch : ext) ch = char(tolower(static_cast<unsigned char>(ch)));
+            if ((ext == ".iso" || ext == ".bin" || ext == ".cue") && IsGameDisc(entry.path().string())) {
+                disc = entry.path().string();
+                break;
+            }
+        }
+    }
     while (!IsGameDisc(disc)) {
         std::error_code ec;
         if (!disc.empty() && std::filesystem::exists(disc, ec))
@@ -299,6 +314,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "[port] %s, version %s\n", PS2HOST_GAME_TITLE, PS2HOST_GAME_VERSION);
 #endif
     ps2host::RegisterFunctions(kGuestFunctions, kGuestFunctionCount);
+    ps2host::RegisterOverlays(kGuestOverlays, kGuestOverlayCount);
     RegisterGameOverrides();
     const int code = ps2host::Main(argc, argv);
     if (!play.empty() && code != 0) {         // closing the window ends a run with 0

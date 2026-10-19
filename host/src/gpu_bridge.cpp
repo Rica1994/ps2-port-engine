@@ -62,6 +62,8 @@
 #include <vector>
 
 #include "ps2host/asset_cache.h"
+#define XXH_INLINE_ALL
+#include "xxhash.h"
 #include "ps2host/gs.h"
 #include "ps2host/platform.h"
 #include "ps2host/profile.h"
@@ -74,11 +76,15 @@
 #if PS2HOST_VULKAN
 #include "ps2gpu/display.h"
 #include "ps2gpu/gs_renderer.h"
-#define XXH_INLINE_ALL
-#include "xxhash.h"
 #endif
 
 namespace ps2host {
+
+namespace {
+std::vector<u32> g_pipeline_hints;      // SetGpuPipelineHints
+}  // namespace
+
+void SetGpuPipelineHints(const u32* keys, std::size_t count) { g_pipeline_hints.assign(keys, keys + count); }
 
 #if PS2HOST_VULKAN
 
@@ -366,6 +372,14 @@ std::map<std::string, u64> g_decode_kinds;      // PS2HOST_GPU_COUNT
 }  // namespace
 
 u64 GpuBusyMicroseconds() { return ps2gpu::GpuBusyNanoseconds() / 1000; }
+
+/* SetPresentAtBlankEnd's (the GS thread's): a frame's picture waits, from
+   its end in the stream, for the stream to move past the displayed buffer -
+   the first draw elsewhere, or the next frame's end. */
+bool g_present_at_blank_end = false;
+bool g_present_waits = false;
+u64 g_present_frame = 0;
+void PresentWaiting();
 
 namespace {
 
@@ -842,12 +856,12 @@ Owned& Use(Bridge& b, u32 fbp, u32 fbw, u32 psm, bool depth, u32 width, u32 heig
    16-bit). */
 Pages PagesOf(const Owned& o, u32 x0, u32 x1, u32 y0, u32 y1) {
     Pages pages;
-    const u32 page_rows = Is16(o.psm) ? 64 : 32, fbw = std::max(1u, o.fbw);
+    const u32 shift = Is16(o.psm) ? 6 : 5, fbw = std::max(1u, o.fbw);       // a page's rows: 64 or 32
     x1 = std::min(x1, fbw * 64);
     x0 = std::min(x0, x1 ? x1 - 1 : 0);
     x1 = std::max(x1, x0 + 1);
     y1 = std::max(y1, y0 + 1);
-    for (u32 py = y0 / page_rows; py <= (y1 - 1) / page_rows; ++py)
+    for (u32 py = y0 >> shift; py <= (y1 - 1) >> shift; ++py)
         for (u32 px = x0 / 64; px <= (x1 - 1) / 64; ++px) {
             const u32 page = o.begin / 32 + py * fbw + px;
             if (page < 512) pages.set(page);
@@ -858,21 +872,29 @@ Pages PagesOf(const Owned& o, u32 x0, u32 x1, u32 y0, u32 y1) {
 /* After the GPU drew into `o`, pixels [x0, x1) x [y0, y1): memory and the
    other images over those blocks are behind. */
 void Drew(Bridge& b, Owned& o, u32 x0, u32 x1, u32 y1, u32 y0) {
-    const u32 page_rows = Is16(o.psm) ? 64 : 32, row_blocks = std::max(1u, o.fbw) * 32;
+    const u32 shift = Is16(o.psm) ? 6 : 5, fbw = std::max(1u, o.fbw), row_blocks = fbw * 32;    // a page's rows: 64 or 32
     y1 = std::min(std::max(y1, y0 + 1), o.height);
     y0 = std::min(y0, y1 - 1);
-    const u32 db = o.begin + (y0 / page_rows) * row_blocks;
-    const u32 de = o.begin + ((y1 + page_rows - 1) / page_rows) * row_blocks;
     // Already newer than memory over these pages: the others over them were
     // made stale then (any reloaded since wrote this one back first).
-    const u32 fbw = std::max(1u, o.fbw), cx1 = std::min(x1, fbw * 64);
+    const u32 cx1 = std::min(x1, fbw * 64);
     const u32 cx0 = std::min(x0, cx1 ? cx1 - 1 : 0);
-    const u32 r[4] = {cx0 / 64, (std::max(cx1, cx0 + 1) - 1) / 64, y0 / page_rows, (y1 - 1) / page_rows};
+    const u32 r[4] = {cx0 / 64, (std::max(cx1, cx0 + 1) - 1) / 64, y0 >> shift, (y1 - 1) >> shift};
     const bool in_rect = o.rect_dirty && r[0] >= o.rect[0] && r[1] <= o.rect[1] && r[2] >= o.rect[2] && r[3] <= o.rect[3];
-    Pages pages;
-    if (!in_rect) pages = PagesOf(o, x0, x1, y0, y1);
-    const bool inside = o.gpu_newer && db >= o.dirty_begin && de <= o.dirty_end &&
-                        (in_rect || (pages & ~o.dirty_pages).none());
+    // Inside the rectangle the last draw outside it marked (most primitives):
+    // newer than memory there already, its blocks and pages dirty, the rows
+    // it reaches drawn - only the pixels drawn so far and the serial move
+    // (as below, the rest unchanged; a write-back clears the rectangle).
+    if (in_rect) {
+        o.x1 = std::max(o.x1, std::min(x1, o.width));
+        o.y1 = std::max(o.y1, y1);
+        o.drawn_serial = ++b.serial;
+        return;
+    }
+    const u32 db = o.begin + r[2] * row_blocks;
+    const u32 de = o.begin + (r[3] + 1) * row_blocks;
+    const Pages pages = PagesOf(o, x0, x1, y0, y1);
+    const bool inside = o.gpu_newer && db >= o.dirty_begin && de <= o.dirty_end && (pages & ~o.dirty_pages).none();
     o.gpu_newer = true;
     o.x1 = std::max(o.x1, std::min(x1, o.width));
     o.y1 = std::max(o.y1, y1);
@@ -880,14 +902,11 @@ void Drew(Bridge& b, Owned& o, u32 x0, u32 x1, u32 y1, u32 y0) {
     o.end = std::max(o.end, o.drawn_end);
     o.dirty_begin = std::min(o.dirty_begin, db);
     o.dirty_end = std::max(o.dirty_end, de);
-    if (!in_rect) {
-        o.dirty_pages |= pages;
-        std::memcpy(o.rect, r, sizeof r);
-        o.rect_dirty = true;
-    }
+    o.dirty_pages |= pages;
+    std::memcpy(o.rect, r, sizeof r);
+    o.rect_dirty = true;
     o.drawn_serial = ++b.serial;    // textures over it decoded before this are out of date
     if (inside) return;
-    if (in_rect) pages = PagesOf(o, x0, x1, y0, y1);   // (not expected: inside whenever in the rectangle)
     ++g_mutations;
     ++b.newer_epoch;
     for (auto& [key, other] : b.owned) {
@@ -1143,28 +1162,10 @@ void Sample(Bridge& b, Owned& o, const Pages& pages, bool top_bytes = false) {
    textures are hashed hundreds of thousands of times a run (only compared
    within a run, so the values themselves are free to change). */
 u64 Hash(const unsigned char* data, std::size_t size) {
-    constexpr u64 kMul = 0xFF51AFD7ED558CCDull;
-    u64 h[4] = {0x9E3779B97F4A7C15ull ^ size, 0xC2B2AE3D27D4EB4Full, 0x165667B19E3779F9ull, 0x27D4EB2F165667C5ull};
-    std::size_t i = 0;
-    for (; i + 32 <= size; i += 32)
-        for (int lane = 0; lane < 4; ++lane) {
-            u64 word;
-            std::memcpy(&word, data + i + lane * 8, 8);
-            h[lane] = (h[lane] ^ word) * kMul;
-            h[lane] ^= h[lane] >> 29;
-        }
-    for (int lane = 0; i + 8 <= size; i += 8, ++lane) {
-        u64 word;
-        std::memcpy(&word, data + i, 8);
-        h[lane] = (h[lane] ^ word) * kMul;
-        h[lane] ^= h[lane] >> 29;
-    }
-    u64 out = h[0];
-    for (int lane = 1; lane < 4; ++lane) {
-        out = (out ^ h[lane]) * kMul;
-        out ^= out >> 29;
-    }
-    return out;
+    // XXH3 (as texture_pack.cpp has it): a re-uploaded texture's blocks are
+    // hashed each time it is used again (Burnout 3 sends its textures every
+    // picture) - several times as fast as the four-lane hash it replaced.
+    return XXH3_64bits(data, size);
 }
 
 bool GpuHolds(const Bridge& b, u32 begin, u32 end);
@@ -1543,7 +1544,10 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         // PS2HOST_GPU_TEXDUMP=TBP (hex): each decode of a texture there, as the
         // GPU has it, to gpu_tex_<n>_<primitive>.bmp (the CPU's beside it as
         // cpu_tex_<n>.bmp) - what a draw sampled, against the GS model.
-        if (const char* want = std::getenv("PS2HOST_GPU_TEXDUMP")) {
+        // (The switches read once: a decode is dozens of times a frame.)
+        static const char* const texdump = std::getenv("PS2HOST_GPU_TEXDUMP");
+        static const bool count_decodes = std::getenv("PS2HOST_GPU_COUNT") != nullptr;
+        if (const char* want = texdump) {
             static int dumped = 0;
             if (tbp == u32(std::strtoul(want, nullptr, 16)) && dumped < 64) {
                 std::vector<u32> pixels;
@@ -1557,7 +1561,7 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
                 ++dumped;
             }
         }
-        if (std::getenv("PS2HOST_GPU_COUNT")) {
+        if (count_decodes) {
             char key[96];
             std::snprintf(key, sizeof key, "psm %02X tbp %04X tbw %u %ux%u clutrows %d", unsigned(psm), unsigned(tbp),
                           unsigned(tbw), unsigned(tw), unsigned(th), int((clut_rows & ~b.clut_cpu) != 0));
@@ -1743,6 +1747,41 @@ void DumpPass(Bridge& s, const std::tuple<u32, u32, u32>& target) {
     WriteBmp(s.dump_passes + name, pixels, w, std::min(w, 640u), std::min(h, 512u));
 }
 
+/* A buffer starting inside another's drawing, at the same width and format
+   and a whole row of pages down: that one's image, `offset` rows lower -
+   drawn into and sampled at the internal resolution, not a second image
+   reconciled with it through memory (at 1x). Burnout 3's splitscreen draws
+   player 2's post effects into a frame based at the picture's row 224. */
+Owned* Containing(Bridge& b, u32 fbp, u32 fbw, u32 psm, u32* offset) {
+    // PS2HOST_GPU_NO_CONTAINING=1: each buffer an image of its own (comparisons).
+    static const bool off = std::getenv("PS2HOST_GPU_NO_CONTAINING") != nullptr;
+    if (off) return nullptr;
+    // Inside what a buffer of that width has drawn (in any format), not
+    // only its memory: buffers laid end to end (Burnout 3's glow chain,
+    // 128x128 each) stay apart.
+    const u32 block = fbp * 32;
+    bool inside = false;
+    for (const auto& [key, o] : b.owned)
+        if (!o.depth && o.fbw == fbw && o.begin <= block && block < o.drawn_end) {
+            inside = true;
+            break;
+        }
+    if (!inside) return nullptr;
+    Owned* best = nullptr;
+    for (auto& [key, o] : b.owned) {
+        if (o.depth || o.fbw != fbw || o.psm != psm || o.fbp >= fbp || (fbp - o.fbp) % std::max(1u, fbw)) continue;
+        const u32 rows = (fbp - o.fbp) / std::max(1u, fbw) * (Is16(psm) ? 64 : 32);
+        if (rows >= o.height || (best && o.fbp < best->fbp)) continue;
+        best = &o;
+        *offset = rows;
+    }
+    static std::set<std::tuple<u32, u32, u32>> told;
+    if (best && told.insert(std::make_tuple(fbp, fbw, psm)).second)
+        std::fprintf(stderr, "[gpu] %X/%u/%02X drawn inside %X, %u rows down\n", unsigned(fbp), unsigned(fbw),
+                     unsigned(psm), unsigned(best->fbp), unsigned(*offset));
+    return best;
+}
+
 void OnDraw(const gs::Gs::DrawCall& call) {
     // Timed only past the fast path below: two clock reads a primitive were
     // a twentieth of the GS thread.
@@ -1752,45 +1791,46 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     if (type == 7) return;
     if (!s.primary && type < 3) return;                 // the shadow compares what it has always drawn
     const gs::Context& c = *call.context;
-    ps2gpu::GsDrawState state;
-    state.fbp = Bits(c.frame, 0, 9);
-    state.fbw = std::max(1u, Bits(c.frame, 16, 6));
-    state.psm = Bits(c.frame, 24, 6);
-    state.fbmsk = u32(c.frame >> 32);
-    state.width = std::min(2048u, state.fbw * 64);
+    if (g_present_waits) {
+        u32 fbp = 0, fbw = 0, psm = 0;
+        if (!gs::TheGs().Displayed(&fbp, &fbw, &psm) || Bits(c.frame, 0, 9) != fbp) PresentWaiting();
+    }
+    // The frame and scissor as the registers have them; the draw's whole
+    // state (a large struct) is made past the fast path below, which reuses
+    // the one before.
+    const u32 frame_psm = Bits(c.frame, 24, 6), frame_width = std::min(2048u, std::max(1u, Bits(c.frame, 16, 6)) * 64);
     // The rows a page holds twice over in a 16-bit format: a 16-bit view of a
     // 448-row picture is 896 rows (Burnout 3 writes its depth into the
     // picture's alpha through one - at 512 rows, the lower half went unwritten,
     // its haze and the sun's halo with it).
-    state.height = Is16(state.psm) ? 1024 : 512;
-    state.scissor_x0 = int(Bits(c.scissor, 0, 11));
-    state.scissor_x1 = int(Bits(c.scissor, 16, 11));
-    state.scissor_y0 = int(Bits(c.scissor, 32, 11));
-    state.scissor_y1 = int(Bits(c.scissor, 48, 11));
-    state.gouraud = (call.prim >> 3) & 1;
-    state.textured = (call.prim >> 4) & 1;
-    state.sprite = type == 6 && s.renderer->Scale() > 1;     // (at 1x it would only split batches)
-    state.sprite_prim = type == 6;
+    const u32 frame_height = Is16(frame_psm) ? 1024 : 512;
+    const int scissor_x0 = int(Bits(c.scissor, 0, 11)), scissor_x1 = int(Bits(c.scissor, 16, 11));
+    const int scissor_y0 = int(Bits(c.scissor, 32, 11)), scissor_y1 = int(Bits(c.scissor, 48, 11));
     const bool fst = (call.prim >> 8) & 1;
     const u32 tw = 1u << std::min(Bits(c.tex0, 26, 4), 10u), th = 1u << std::min(Bits(c.tex0, 30, 4), 10u);
     // The primitive as triangles, and the pixels it can reach.
     ps2gpu::GsVertex v[6];
-    bool gouraud = state.gouraud;
+    bool gouraud = (call.prim >> 3) & 1;
     const std::size_t n = Triangles(call, fst, tw, th, v, &gouraud);
-    state.gouraud = gouraud;
     if (!n) return;
-    u32 x0 = state.width, x1 = 0, y1 = 0, y0 = state.height;
+    // The vertices' extremes, then rounded once (floor, ceil and the clamp
+    // keep order: the same bounds as rounding each vertex).
+    float low_x = float(frame_width), high_x = 0, low_y = float(frame_height), high_y = 0;
     for (std::size_t i = 0; i < n; ++i) {
-        x0 = std::min(x0, u32(std::clamp(std::floor(v[i].x), 0.0f, float(state.width))));
-        // Exclusive: the GS draws the pixels whose centres lie before the far edge.
-        x1 = std::max(x1, u32(std::clamp(std::ceil(v[i].x), 0.0f, float(state.width))));
-        y1 = std::max(y1, u32(std::clamp(std::ceil(v[i].y), 0.0f, float(state.height))));
-        y0 = std::min(y0, u32(std::clamp(std::floor(v[i].y), 0.0f, float(state.height))));
+        low_x = std::min(low_x, v[i].x);
+        high_x = std::max(high_x, v[i].x);
+        low_y = std::min(low_y, v[i].y);
+        high_y = std::max(high_y, v[i].y);
     }
-    y0 = std::max(y0, u32(std::max(state.scissor_y0, 0)));
-    x0 = std::max(x0, u32(std::max(state.scissor_x0, 0)));
-    x1 = std::min(x1, u32(state.scissor_x1 + 1));
-    y1 = std::min(y1, u32(state.scissor_y1 + 1));
+    u32 x0 = u32(std::clamp(std::floor(low_x), 0.0f, float(frame_width)));
+    // Exclusive: the GS draws the pixels whose centres lie before the far edge.
+    u32 x1 = u32(std::clamp(std::ceil(high_x), 0.0f, float(frame_width)));
+    u32 y0 = u32(std::clamp(std::floor(low_y), 0.0f, float(frame_height)));
+    u32 y1 = u32(std::clamp(std::ceil(high_y), 0.0f, float(frame_height)));
+    y0 = std::max(y0, u32(std::max(scissor_y0, 0)));
+    x0 = std::max(x0, u32(std::max(scissor_x0, 0)));
+    x1 = std::min(x1, u32(scissor_x1 + 1));
+    y1 = std::min(y1, u32(scissor_y1 + 1));
     if (s.primary) {
         // Wholly outside the scissor (or the buffer): nothing to draw, and no
         // image to bring up to date for it. Burnout 3's garage sends thousands
@@ -1802,9 +1842,9 @@ void OnDraw(const gs::Gs::DrawCall& call) {
             hi_x = std::max(hi_x, v[i].x);
             hi_y = std::max(hi_y, v[i].y);
         }
-        const float left = float(std::max(state.scissor_x0, 0)), top = float(std::max(state.scissor_y0, 0));
-        const float right = float(std::min(state.scissor_x1, int(state.width) - 1));
-        const float bottom = float(std::min(state.scissor_y1, int(state.height) - 1));
+        const float left = float(std::max(scissor_x0, 0)), top = float(std::max(scissor_y0, 0));
+        const float right = float(std::min(scissor_x1, int(frame_width) - 1));
+        const float bottom = float(std::min(scissor_y1, int(frame_height) - 1));
         if (std::floor(hi_x) < left || std::ceil(lo_x) > right || std::floor(hi_y) < top || std::ceil(lo_y) > bottom)
             return;
         if (Bits(c.test, 16, 1) && Bits(c.test, 17, 2) == 0) return;    // ZTST NEVER: every pixel fails
@@ -1825,6 +1865,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         Owned* depth = nullptr;
         Owned* source = nullptr;    // a target sampled as the texture: fast only while it is not stale
         bool draws_colour = false;
+        u32 y_offset = 0, t_offset = 0, th = 1;     // Containing's: the target's rows, the texture's
     };
     static Fast fast;
     const u64 regs[12] = {call.prim, c.frame, c.scissor, c.tex0, c.tex1, c.clamp, c.alpha, c.test, c.zbuf,
@@ -1832,9 +1873,16 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     if (s.primary && fast.valid && fast.mutations == g_mutations && fast.context == call.context &&
         rows <= fast.rows && std::memcmp(regs, fast.regs, sizeof regs) == 0 && !s.Dumping() &&
         (!fast.source || !fast.source->stale)) {
-        ps2gpu::GsDrawState st = fast.state;
+        ps2gpu::GsDrawState& st = fast.state;      // (the renderer copies what it keeps)
         st.gouraud = gouraud;
         for (std::size_t i = 0; i < n; ++i) v[i].z = std::min(v[i].z, fast.zmax);
+        if (fast.y_offset) {
+            for (std::size_t i = 0; i < n; ++i) v[i].y += float(fast.y_offset);
+            y0 += fast.y_offset;
+            y1 += fast.y_offset;
+        }
+        if (fast.t_offset)
+            for (std::size_t i = 0; i < n; ++i) v[i].t += float(fast.t_offset) * v[i].q / float(fast.th);
         s.renderer->DrawTriangles(st, v, n);
         if (fast.draws_colour) Drew(s, *fast.target, x0, x1, y1, y0);
         if (fast.depth) Drew(s, *fast.depth, x0, x1, y1, y0);
@@ -1842,6 +1890,21 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     }
     fast.valid = false;
     timed.emplace(Section::GpuBridge);
+    ps2gpu::GsDrawState state;
+    state.fbp = Bits(c.frame, 0, 9);
+    state.fbw = std::max(1u, Bits(c.frame, 16, 6));
+    state.psm = frame_psm;
+    state.fbmsk = u32(c.frame >> 32);
+    state.width = frame_width;
+    state.height = frame_height;
+    state.scissor_x0 = scissor_x0;
+    state.scissor_x1 = scissor_x1;
+    state.scissor_y0 = scissor_y0;
+    state.scissor_y1 = scissor_y1;
+    state.gouraud = gouraud;
+    state.textured = (call.prim >> 4) & 1;
+    state.sprite = type == 6 && s.renderer->Scale() > 1;     // (at 1x it would only split batches)
+    state.sprite_prim = type == 6;
     if (s.primary && s.Dumping()) {
         const auto key = std::make_tuple(state.fbp, state.fbw, state.psm);
         if (key != s.last_target) {
@@ -1859,7 +1922,31 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     }
     Owned* target = nullptr;
     Owned* tex_source = nullptr;
-    if (s.primary) target = &Use(s, state.fbp, state.fbw, state.psm, false, state.width, state.height, rows, true);
+    u32 y_offset = 0, t_offset = 0;
+    u32 draw_rows = rows;
+    u32 z_shift = 0;                    // the depth buffer's pages, moved with the target
+    if (s.primary && !s.owned.count(std::make_tuple(state.fbp, state.fbw, state.psm, false))) {
+        Owned* base = Containing(s, state.fbp, state.fbw, state.psm, &y_offset);
+        // Its depth buffer as far into the base's (Burnout 3's player 2 has
+        // its Z 224 rows into the picture's depth buffer too): there, or the
+        // buffer stays apart.
+        if (base && Bits(c.test, 16, 1)) {
+            const u32 pages = state.fbp - base->fbp, zbp = Bits(c.zbuf, 0, 9);
+            const u32 zpsm_early = 0x30 | Bits(c.zbuf, 24, 4);
+            if (zbp >= pages && s.owned.count(std::make_tuple(zbp - pages, state.fbw, zpsm_early, true))) z_shift = pages;
+            else base = nullptr, y_offset = 0;
+        }
+        if (base) {
+            state.fbp = base->fbp;
+            state.scissor_y0 += int(y_offset);
+            state.scissor_y1 += int(y_offset);
+            for (std::size_t i = 0; i < n; ++i) v[i].y += float(y_offset);
+            y0 += y_offset;
+            y1 += y_offset;
+            draw_rows = std::max(1u, y1);
+        }
+    }
+    if (s.primary) target = &Use(s, state.fbp, state.fbw, state.psm, false, state.width, state.height, draw_rows, true);
     if (state.textured) {
         const u32 tex_psm = Bits(c.tex0, 20, 6), tbp_blocks = Bits(c.tex0, 0, 14);
         // A target read as PSMT8H (Burnout 3's glow and blur passes, ~900 a
@@ -1900,11 +1987,26 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         if ((s.primary || s.targets_as_textures) && tex_format != 3 && tbp_blocks % 32 == 0) {
             const u32 candidates[2] = {tex_format == 2 ? tex_psm : gs::PSMCT32,
                                        tex_format == 2 ? tex_psm : tex_format == 4 ? gs::PSMCT32 : gs::PSMCT24};
-            const u32 tex_fbp = tbp_blocks / 32, tex_fbw = Bits(c.tex0, 14, 6);
+            const u32 tex_fbw = Bits(c.tex0, 14, 6);
             for (u32 psm : candidates) {
+                u32 tex_fbp = tbp_blocks / 32;
+                // Inside another target (Containing): that one, its rows lower.
+                if (s.primary && !s.owned.count(std::make_tuple(tex_fbp, tex_fbw, psm, false))) {
+                    u32 offset = 0;
+                    if (Owned* base = Containing(s, tex_fbp, tex_fbw, psm, &offset)) {
+                        tex_fbp = base->fbp;
+                        t_offset = offset;
+                        for (std::size_t i = 0; i < n; ++i) v[i].t += float(offset) * v[i].q / float(th);
+                    }
+                }
                 const bool known = s.primary ? s.owned.count(std::make_tuple(tex_fbp, tex_fbw, psm, false)) != 0
                                              : s.renderer->HasTarget(tex_fbp, tex_fbw, psm);
-                if (!known) continue;
+                if (!known) {
+                    if (t_offset)
+                        for (std::size_t i = 0; i < n; ++i) v[i].t -= float(t_offset) * v[i].q / float(th);
+                    t_offset = 0;
+                    continue;
+                }
                 if (s.primary) {
                     Owned& source = s.owned[std::make_tuple(tex_fbp, tex_fbw, psm, false)];
                     Pages sampled;
@@ -1966,6 +2068,10 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         state.maxu = Bits(c.clamp, 14, 10);
         state.minv = Bits(c.clamp, 24, 10);
         state.maxv = Bits(c.clamp, 34, 10);
+        if (t_offset && state.wmt == 2) {       // REGION_CLAMP's rows, as far down
+            state.minv += t_offset;
+            state.maxv += t_offset;
+        }
     }
     state.alpha_test = Bits(c.test, 0, 1) != 0;
     state.atst = Bits(c.test, 1, 3);
@@ -1987,7 +2093,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     const u32 zmax = zpsm == gs::PSMZ32 ? 0xFFFFFFFFu : zpsm == gs::PSMZ24 ? 0xFFFFFFu : 0xFFFFu;
     state.depth = Bits(c.test, 16, 1) != 0;
     state.ztst = Bits(c.test, 17, 2);
-    state.zbp = Bits(c.zbuf, 0, 9);
+    state.zbp = Bits(c.zbuf, 0, 9) - z_shift;
     state.depth_write = Bits(c.zbuf, 32, 1) == 0;
     // An alpha test failing every pixel (ATST NEVER) writes Z only for AFAIL
     // ZB_ONLY: otherwise none, whatever ZMSK says. Burnout 3's glow passes
@@ -2059,7 +2165,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
             // Over the rows a fast primitive can draw (it reaches no further
             // than this one's rows), not all the target could hold: the
             // race keeps textures past its depth buffer's 448 rows.
-            const u32 colour_end = Blocks(state.fbp, state.fbw, state.psm, rows).second;
+            const u32 colour_end = Blocks(state.fbp, state.fbw, state.psm, draw_rows).second;
             if (target->begin < tend && tbp < colour_end) may = false;
             if (depth && depth->begin < tend && tbp < Blocks(depth->fbp, depth->fbw, depth->psm, rows).second)
                 may = false;
@@ -2076,6 +2182,9 @@ void OnDraw(const gs::Gs::DrawCall& call) {
             fast.depth = depth && state.depth_write ? depth : nullptr;
             fast.source = state.texture_target ? tex_source : nullptr;
             fast.draws_colour = draws_colour;
+            fast.y_offset = y_offset;
+            fast.t_offset = t_offset;
+            fast.th = th;
         }
         if (z_as_colour) {
             // The Z, as the bytes the Z format stores, into the Z-format view.
@@ -2322,10 +2431,28 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
         if (!bridge.gpu) return false;
         device = bridge.gpu.get();
     }
-    // What the renderer keeps between runs (its pipeline cache): the asset cache's.
-    ps2gpu::SetCacheDirectory((platform::CacheDirectory() / "gpu").u8string());
+    ps2gpu::SetPipelineHints(g_pipeline_hints.data(), g_pipeline_hints.size());
+    // The pipeline cache beside the PC settings - a player's only: a scripted
+    // run's settings are beside its memory card, in %TEMP% (what every
+    // game's runs there would share), and it makes every pipeline at once.
+    // On a tablet, in the app's caches (what the system may clear and the
+    // Files app does not show), with the cooked textures.
+    if (!SettingsPath().empty() && !VirtualClock()) {
+        std::filesystem::path dir = std::filesystem::path(SettingsPath()).parent_path();
+        if (platform::kMobile) {
+            std::error_code ignored;
+            dir = platform::CacheDirectory() / "gpu";
+            std::filesystem::create_directories(dir, ignored);
+        }
+        ps2gpu::SetPipelineCacheDir(dir.u8string());
+    }
     bridge.renderer = ps2gpu::CreateGsRenderer(*device, error);
     if (!bridge.renderer) return false;
+    // Vulkan's recording on a thread of its own, beside the GS thread's
+    // (PS2HOST_GPU_THREAD=0: on the GS thread, as before).
+    const char* threaded = std::getenv("PS2HOST_GPU_THREAD");
+    if (!threaded || std::strcmp(threaded, "0") != 0)
+        bridge.renderer = ps2gpu::MakeThreadedGsRenderer(std::move(bridge.renderer));
     g_bridge = &bridge;
     OpenTexturePack();
     bridge.primary = mode == GpuMode::Primary;
@@ -2380,32 +2507,18 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     if (bridge.primary) {
         // The end of each frame on the GS thread, at its place in the stream:
         // the frame to the GPU, and the window's picture straight from the
-        // displayed target (no read-back); the EE goes on meanwhile.
+        // displayed target (no read-back) - at once, or once the stream has
+        // moved past the displayed buffer (SetPresentAtBlankEnd); the EE goes
+        // on meanwhile.
         SetGsFrameHandler([](u64 frame) {
+            PresentWaiting();               // the last frame's, nothing having moved it on
             GpuShadowFrame(frame, std::string());
             // The internal resolution, between frames (the GS thread's).
             const u32 scale = WantedScale(WindowDisplay());
             if (scale != g_bridge->renderer->Scale()) Rescale(*g_bridge, scale);
-            if (ps2gpu::Display* display = WindowDisplay()) {
-                const bool pace = !VirtualClock() && SettingOn("frame_pacing", true);    // (PC SETTINGS)
-                static u64 presented_serial = ~0ull;
-                const long long now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count();
-                const bool drawn_only = now_ns - g_left_out_at.load(std::memory_order_relaxed) < 1000000000LL;
-                // A frame whose race draw was left out (frame skipping) shows
-                // the last picture with a new HUD over it: not shown - each
-                // present is a copy and a scale of the whole screen on the
-                // GPU the race draws on, and its queue taken from the GS
-                // thread meanwhile (three of four frames, on an A12 iPad).
-                const bool left_out = FrameLeftOut(frame);
-                bool presented = false;
-                if (!(drawn_only && left_out) && (!drawn_only || g_bridge->serial != presented_serial)) {
-                    presented_serial = g_bridge->serial;
-                    PresentGpuPicture(*display, pace ? FrameDue(frame) : 0);
-                    presented = true;
-                }
-                ShowPictureRate(frame, presented);
-            }
+            g_present_frame = frame;
+            g_present_waits = true;
+            if (!g_present_at_blank_end || VirtualClock()) PresentWaiting();
         });
     }
     std::fprintf(stderr, "gpu: drawing on %s %s\n", device->Describe().c_str(),
@@ -2424,6 +2537,33 @@ bool GpuPrimary() { return g_bridge && g_bridge->primary; }
 void GpuSetScale(u32 scale) {
     if (g_bridge && scale != g_bridge->renderer->Scale()) Rescale(*g_bridge, scale);
 }
+
+void PresentWaiting() {
+    if (!g_present_waits) return;
+    g_present_waits = false;
+    if (ps2gpu::Display* display = WindowDisplay()) {
+        const bool pace = !VirtualClock() && SettingOn("frame_pacing", FramePacingDefault());    // (PC SETTINGS)
+        static u64 presented_serial = ~0ull;
+        const long long now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const bool drawn_only = now_ns - g_left_out_at.load(std::memory_order_relaxed) < 1000000000LL;
+        // A frame whose race draw was left out (frame skipping) shows the
+        // last picture with a new HUD over it: not shown - each present is a
+        // copy and a scale of the whole screen on the GPU the race draws on,
+        // and its queue taken from the GS thread meanwhile (three of four
+        // frames, on an A12 iPad).
+        const bool left_out = FrameLeftOut(g_present_frame);
+        bool presented = false;
+        if (g_bridge && !(drawn_only && left_out) && (!drawn_only || g_bridge->serial != presented_serial)) {
+            presented_serial = g_bridge->serial;
+            PresentGpuPicture(*display, pace ? FrameDue(g_present_frame) : 0);
+            presented = true;
+        }
+        ShowPictureRate(g_present_frame, presented);
+    }
+}
+
+void SetPresentAtBlankEnd(bool on) { g_present_at_blank_end = on; }
 
 void GpuCaptureBegin(u64 frame, const std::string& passes_dir) {
     if (!g_bridge) return;
@@ -2512,10 +2652,7 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
         }
         // The pipeline cache to disk now and then (a tablet's app can be
         // ended without warning): nothing written while nothing is new.
-        if (frame % 600 == 0) {
-            s.renderer->SaveCaches();
-            assets::Save();
-        }
+        if (frame % 600 == 0) assets::Save();
         if (frame % 100 == 0)
             std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads (%llu made from a twin), %llu decodes, %zu images, %zu textures (%llu MB, %llu evicted)\n",
                          static_cast<unsigned long long>(frame), static_cast<unsigned long long>(s.serial),
@@ -2574,9 +2711,7 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                     const std::string passes = ps2gpu::GpuPassReport();
                     if (!passes.empty()) std::fprintf(stderr, "[perf]   %s\n", passes.c_str());
                 }
-                // What the run keeps between runs: the pipelines built ahead,
-                // the textures cooked and used cooked.
-                std::fprintf(stderr, "[perf]   %s\n", ps2gpu::PipelineCacheReport().c_str());
+                // What the run keeps between runs: the textures cooked and used cooked.
                 if (assets::Enabled()) {
                     static u64 last_decodes = 0, last_uploads = 0, last_swaps = 0, last_draws = 0, last_cooked = 0;
                     // The texture cache now: how much of it is drawn cooked, and
@@ -2648,7 +2783,8 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                 std::fprintf(stderr, "[gpu]     GPU decodes %llu: %s\n", (unsigned long long)kinds[i].first, kinds[i].second.c_str());
             g_decode_kinds.clear();
         }
-        if (std::getenv("PS2HOST_GPU_LOG")) {
+        static const bool gpu_log = std::getenv("PS2HOST_GPU_LOG") != nullptr;
+        if (gpu_log) {
             std::fprintf(stderr, "[gpu]   KB to the CPU: %llu for textures, %llu for reads, %llu for writes;",
                          static_cast<unsigned long long>(s.downloads_by[0] / 4),
                          static_cast<unsigned long long>(s.downloads_by[1] / 4),
@@ -2658,7 +2794,7 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                              static_cast<unsigned long long>(blocks / 4));
             std::fprintf(stderr, "\n");
         }
-        if (std::getenv("PS2HOST_GPU_LOG"))
+        if (gpu_log)
             for (const auto& [key, o] : s.owned)
                 std::fprintf(stderr, "[gpu]   %s %X/%u/%02X blocks %X-%X drawn to %X, %ux%u; reloads new %llu memory %llu draw %llu write-back %llu\n",
                              o.depth ? "Z" : "C", unsigned(o.fbp), unsigned(o.fbw), unsigned(o.psm), unsigned(o.begin),

@@ -45,32 +45,57 @@ bool g_closed = false;
 std::unique_ptr<ps2gpu::Display> g_display;
 
 // The keys the controller reads, as Win32 virtual keys, by position.
+/* A Win32 virtual key as SDL's scancode: the key in that place on a US
+   keyboard (SDL names keys by place). The punctuation's virtual keys are a
+   US layout's. */
 int Scancode(int key) {
     switch (key) {
         case VK_BACK: return SDL_SCANCODE_BACKSPACE;
+        case VK_TAB: return SDL_SCANCODE_TAB;
         case VK_RETURN: return SDL_SCANCODE_RETURN;
         case VK_ESCAPE: return SDL_SCANCODE_ESCAPE;      // the PC settings panel's
+        case VK_SPACE: return SDL_SCANCODE_SPACE;
         case VK_UP: return SDL_SCANCODE_UP;
         case VK_DOWN: return SDL_SCANCODE_DOWN;
         case VK_LEFT: return SDL_SCANCODE_LEFT;
         case VK_RIGHT: return SDL_SCANCODE_RIGHT;
-        // Keys a game's own tools read (Burnout 3's HUD editing).
         case VK_PRIOR: return SDL_SCANCODE_PAGEUP;
         case VK_NEXT: return SDL_SCANCODE_PAGEDOWN;
         case VK_HOME: return SDL_SCANCODE_HOME;
         case VK_END: return SDL_SCANCODE_END;
         case VK_INSERT: return SDL_SCANCODE_INSERT;
         case VK_DELETE: return SDL_SCANCODE_DELETE;
-        case VK_NUMPAD8: return SDL_SCANCODE_KP_8;
-        case VK_NUMPAD4: return SDL_SCANCODE_KP_4;
-        case VK_NUMPAD5: return SDL_SCANCODE_KP_5;
-        case VK_NUMPAD6: return SDL_SCANCODE_KP_6;
+        case VK_CAPITAL: return SDL_SCANCODE_CAPSLOCK;
+        case VK_LSHIFT: return SDL_SCANCODE_LSHIFT;
+        case VK_RSHIFT: return SDL_SCANCODE_RSHIFT;
+        case VK_LCONTROL: return SDL_SCANCODE_LCTRL;
+        case VK_RCONTROL: return SDL_SCANCODE_RCTRL;
+        case VK_LMENU: return SDL_SCANCODE_LALT;
+        case VK_RMENU: return SDL_SCANCODE_RALT;
+        case VK_NUMPAD0: return SDL_SCANCODE_KP_0;
+        case VK_DECIMAL: return SDL_SCANCODE_KP_PERIOD;
+        case VK_ADD: return SDL_SCANCODE_KP_PLUS;
+        case VK_SUBTRACT: return SDL_SCANCODE_KP_MINUS;
+        case VK_MULTIPLY: return SDL_SCANCODE_KP_MULTIPLY;
+        case VK_DIVIDE: return SDL_SCANCODE_KP_DIVIDE;
+        case VK_OEM_1: return SDL_SCANCODE_SEMICOLON;
+        case VK_OEM_PLUS: return SDL_SCANCODE_EQUALS;
+        case VK_OEM_COMMA: return SDL_SCANCODE_COMMA;
+        case VK_OEM_MINUS: return SDL_SCANCODE_MINUS;
+        case VK_OEM_PERIOD: return SDL_SCANCODE_PERIOD;
+        case VK_OEM_2: return SDL_SCANCODE_SLASH;
+        case VK_OEM_3: return SDL_SCANCODE_GRAVE;
+        case VK_OEM_4: return SDL_SCANCODE_LEFTBRACKET;
+        case VK_OEM_5: return SDL_SCANCODE_BACKSLASH;
+        case VK_OEM_6: return SDL_SCANCODE_RIGHTBRACKET;
+        case VK_OEM_7: return SDL_SCANCODE_APOSTROPHE;
         default: break;
     }
-    if (key >= VK_F1 && key <= VK_F11) return SDL_SCANCODE_F1 + (key - VK_F1);
+    if (key >= VK_F1 && key <= VK_F12) return SDL_SCANCODE_F1 + (key - VK_F1);
     if (key >= 'A' && key <= 'Z') return SDL_SCANCODE_A + (key - 'A');
     if (key >= '1' && key <= '9') return SDL_SCANCODE_1 + (key - '1');
     if (key == '0') return SDL_SCANCODE_0;
+    if (key >= VK_NUMPAD1 && key <= VK_NUMPAD9) return SDL_SCANCODE_KP_1 + (key - VK_NUMPAD1);
     return -1;
 }
 #endif
@@ -180,16 +205,24 @@ std::vector<std::uint32_t> DrawOverlayText(const std::vector<std::string>& lines
    pictures (drawn larger, SupersamplingFactor) averaged down. */
 ps2gpu::Display::AntiAliasing DisplayAntiAliasing(const std::string& mode) {
     using AA = ps2gpu::Display::AntiAliasing;
-    return mode == "fxaa" ? AA::kFxaa : mode == "ssaa2" || mode == "ssaa4" ? AA::kDownsample : AA::kOff;
+    return mode == "fxaa"                        ? AA::kFxaa
+           : mode == "smaa"                      ? AA::kSmaa
+           : mode == "ssaa2" || mode == "ssaa4" ? AA::kDownsample
+                                                 : AA::kOff;
 }
 #endif
 
 /* The "aspect" setting as the display takes it: "4:3" (the default), "16:9",
-   or "auto" (0, the window's own shape). */
+   any other "W:H" (21:9, 32:9: an ultrawide screen's), or "auto" (0, the
+   window's own shape). */
 float SettingAspect() {
     const std::string aspect = Setting("aspect", "4:3");
-    if (aspect == "16:9") return 16.0f / 9.0f;
     if (aspect == "auto") return 0.0f;
+    float width = 0.0f, height = 0.0f;
+    if (std::sscanf(aspect.c_str(), "%f:%f", &width, &height) == 2 && width > 0.0f && height > 0.0f) {
+        const float shape = width / height;
+        if (shape >= 1.0f && shape <= 4.0f) return shape;
+    }
     return 4.0f / 3.0f;
 }
 
@@ -263,6 +296,7 @@ bool WindowClosed() { return g_closed; }
 void QuitGame() { g_closed = true; }
 
 bool HostKeyDown(int key) {
+    if (ScriptedKeyDown(key)) return true;          // --key
 #ifdef PS2HOST_VULKAN
     if (g_display) return g_display->KeyDown(Scancode(key));
 #endif
@@ -357,19 +391,70 @@ void ShowHostCursor(bool on) {
 #endif
 }
 
+#ifdef PS2HOST_VULKAN
+namespace {
+ControllerFamily Family(std::uint8_t family) {
+    return family == ps2gpu::Display::kPlayStationController ? ControllerFamily::kPlayStation
+           : family == ps2gpu::Display::kXboxController      ? ControllerFamily::kXbox
+                                                             : ControllerFamily::kOther;
+}
+void Convert(const ps2gpu::Display::PadState& pad, HostPadState* state) {
+    state->buttons = pad.buttons;
+    for (int i = 0; i < 4; ++i) state->sticks[i] = pad.sticks[i];
+    state->l2 = pad.l2;
+    state->r2 = pad.r2;
+    state->family = Family(pad.family);
+}
+}  // namespace
+#endif
+
 bool HostPad(HostPadState* state) {
 #ifdef PS2HOST_VULKAN
     ps2gpu::Display::PadState pad;
     if (g_display && g_display->Pad(&pad)) {
-        state->buttons = pad.buttons;
-        for (int i = 0; i < 4; ++i) state->sticks[i] = pad.sticks[i];
-        state->l2 = pad.l2;
-        state->r2 = pad.r2;
+        Convert(pad, state);
         return true;
     }
 #endif
     (void)state;
     return false;   // the GDI window has none
+}
+
+std::vector<HostDevice> WindowControllers() {
+    std::vector<HostDevice> list;
+#ifdef PS2HOST_VULKAN
+    if (g_display)
+        for (const auto& c : g_display->Controllers()) list.push_back({c.id, c.name, Family(c.family)});
+#endif
+    return list;
+}
+
+bool WindowControllerPad(u32 id, HostPadState* state) {
+#ifdef PS2HOST_VULKAN
+    ps2gpu::Display::PadState pad;
+    if (g_display && g_display->PadOf(id, &pad)) {
+        Convert(pad, state);
+        return true;
+    }
+#endif
+    (void)id, (void)state;
+    return false;
+}
+
+void HostRumbleOf(u32 id, u8 large, u8 small) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetRumbleOf(id, u16(large * 257), u16(small * 257));
+#else
+    (void)id, (void)large, (void)small;
+#endif
+}
+
+void HostTriggerTargets(const std::vector<u32>& ids) {
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetTriggerTargets(std::vector<std::uint32_t>(ids.begin(), ids.end()));
+#else
+    (void)ids;
+#endif
 }
 
 namespace {
@@ -384,6 +469,10 @@ ps2gpu::Gpu* WindowGpu() { return g_display ? g_display->SharedGpu() : nullptr; 
 void SetPictureSource(std::function<bool(std::vector<u32>*, u32*, u32*)> source) {
     g_picture_source = std::move(source);
 }
+
+namespace {
+void RefreshOverlay();      // the overlay's lines and the FPS counter's, drawn
+}  // namespace
 
 // Alt+Enter changes fullscreen in the display's Pump: saved as the setting.
 void KeepFullscreenSetting() {
@@ -401,7 +490,18 @@ bool PumpWindow() {
         if (!g_display->Pump()) g_closed = true;
         KeepFullscreenSetting();
         if (g_display->TakeCapture()) RequestCapture();
-        UpdatePcMenu();                     // F1: the PC settings panel (pc_menu.cpp)
+        UpdatePcMenu();                     // F9: the PC settings panel (pc_menu.cpp)
+        // F1: the FPS counter on or off; its figure redrawn twice a second.
+        static std::chrono::steady_clock::time_point fps_drawn{};
+        const auto now = std::chrono::steady_clock::now();
+        if (g_display->TakeFpsToggle()) {
+            SetSettingOn("fps_counter", !SettingOn("fps_counter", false));
+            RefreshOverlay();
+            fps_drawn = now;
+        } else if (now - fps_drawn >= std::chrono::milliseconds(500)) {
+            RefreshOverlay();
+            fps_drawn = now;
+        }
         // Tab: the texture pack on or off, said on the screen for two seconds.
         static std::chrono::steady_clock::time_point notice_until{};
         static bool notice = false;
@@ -431,7 +531,12 @@ void SetWindowFullscreen(bool on) {
 #endif
 }
 
-void SetWindowOverlay(const std::vector<std::string>& lines) {
+namespace {
+
+std::vector<std::string> g_overlay_lines;      // SetWindowOverlay's: the panel's, a notice's
+
+// Draws the lines as the window's overlay (none when empty).
+void DrawOverlay(const std::vector<std::string>& lines) {
 #ifdef PS2HOST_VULKAN
     if (!g_display) return;
     if (lines.empty()) {
@@ -496,6 +601,32 @@ void SetWindowOverlay(const std::vector<std::string>& lines) {
 #else
     (void)lines;
 #endif
+}
+
+// The FPS counter (F1, setting "fps_counter", off unless turned on): the
+// pictures shown a second, a line under whatever else the overlay says.
+void RefreshOverlay() {
+    std::vector<std::string> lines = g_overlay_lines;
+#ifdef PS2HOST_VULKAN
+    if (g_display && SettingOn("fps_counter", false)) {
+        const double fps = g_display->PresentsPerSecond();
+        char text[32];
+        if (fps > 0) std::snprintf(text, sizeof text, "FPS %.1f", fps);
+        else std::snprintf(text, sizeof text, "FPS --");
+        lines.push_back(text);
+    }
+#endif
+    static std::vector<std::string> shown;
+    if (lines == shown) return;                 // drawn again only when it changes
+    shown = lines;
+    DrawOverlay(lines);
+}
+
+}  // namespace
+
+void SetWindowOverlay(const std::vector<std::string>& lines) {
+    g_overlay_lines = lines;
+    RefreshOverlay();
 }
 
 void SetWindowStatus(const std::string& status) {

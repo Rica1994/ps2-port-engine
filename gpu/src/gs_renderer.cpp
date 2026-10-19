@@ -22,7 +22,13 @@
 #include <thread>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
+#include <fstream>
+#include <set>
+#include <string>
+#include <thread>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -68,17 +74,77 @@ struct PackedVertex {
 // found by its offset: whole vertices to 256 bytes.
 static_assert(256 % sizeof(PackedVertex) == 0, "a vertex must divide the ring's alignment");
 
+/* A batch's vertices so far: room handed out a primitive at a time (Grow)
+   and its fields written in place - no vertex built and then copied, nor
+   its padding cleared (the vertex shader reads none of it). A splitscreen
+   race appends ~400,000 a picture: push_back's temporary and copy were a
+   twelfth of the GS thread. */
+class PendingVertices {
+public:
+    std::size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    void clear() { size_ = 0; }
+    PackedVertex* data() { return data_.get(); }
+    PackedVertex& operator[](std::size_t i) { return data_[i]; }
+    PackedVertex* Grow(std::size_t n) {
+        if (size_ + n > capacity_) {
+            const std::size_t capacity = std::max<std::size_t>(capacity_ * 2, std::max<std::size_t>(size_ + n, 4096));
+            std::unique_ptr<PackedVertex[]> data(new PackedVertex[capacity]);
+            if (size_) std::memcpy(data.get(), data_.get(), size_ * sizeof(PackedVertex));
+            data_ = std::move(data);
+            capacity_ = capacity;
+        }
+        PackedVertex* at = data_.get() + size_;
+        size_ += n;
+        return at;
+    }
+
+private:
+    std::unique_ptr<PackedVertex[]> data_;
+    std::size_t size_ = 0, capacity_ = 0;
+};
+
 /* What the fragment shader is told, after the vertex shader's 16 bytes. */
 struct FragmentParams {
     std::uint32_t textured, tfx, tcc, atst, aref, fix_factor, fix, afail, fge, fogcol, pabe;
     std::uint32_t bilinear, wms, wmt, minu, maxu, minv, maxv;
-    std::uint32_t tw, th, tex_format, ta0, ta1, aem;
+    std::uint32_t tw, th, tex_format;
+    std::uint32_t texa;         // TA0 in bits 0-7, TA1 8-15, AEM 16
+    std::uint32_t image_size;   // the bound image's pixels: width in bits 0-15, height 16-31
     std::uint32_t logic, keep;
     std::uint32_t scale;        // the texture's pixels to a GS texel (a target drawn larger: the internal resolution)
     std::uint32_t blend_ops;    // bits 0-7: blending in the shader, ALPHA's A, B, C, D, two bits each;
                                 // 8-15: a sprite on a target drawn larger, the target's scale (0: none)
 };
 constexpr std::uint32_t kFragmentOffset = 16;
+
+/* gs.frag's kFeatures: what a draw with these parameters may use (each bit
+   as the shader has it), for a pipeline made without the rest. Kept in a
+   pipeline key's bits 16-27, inverted: a key without them is the whole
+   shader. */
+constexpr int kFeatureShift = 16;
+constexpr std::uint32_t kFeatureBits = 0xFFFu;
+std::uint32_t Features(const FragmentParams& p) {
+    std::uint32_t f = 0;
+    if (p.textured) {
+        f |= 1u;                                                    // kTextured
+        if (p.tex_format & 0x100u) f |= 2u;                         // kReplaced
+        if (p.bilinear & 2u) f |= 4u | 8u;                          // kMip (its levels may be bilinear)
+        if (p.bilinear & 1u) f |= 8u;                               // kLinear
+        if (p.tex_format & 0xFFu) f |= 16u;                         // kExpand
+        if (p.scale > 1u) f |= 32u;                                 // kFine
+        if (((p.blend_ops >> 8) & 255u) > 1u) f |= 64u;             // kSnap
+    }
+    if (p.fge) f |= 128u;                                           // kFog
+    // kAlphaTest: anything discarded by it - not a pass drawing every pixel
+    // (afail 2: its pixels all kept, the test's result unused), which a
+    // tile-based GPU then draws without discard: hidden pixels not shaded.
+    if ((p.atst != 1u && p.afail != 2u) || p.afail == 1u) f |= 256u;
+    if (p.pabe) f |= 512u;                                          // kPabe
+    if (p.logic) f |= 1024u;                                        // kLogic
+    if ((p.blend_ops >> 16) & 1u) f |= 2048u;                       // kSixteen
+    return f;
+}
 
 struct Image {
     VkImage image = VK_NULL_HANDLE;
@@ -88,6 +154,7 @@ struct Image {
     VkDeviceSize offset = 0;
     std::uint32_t piece_class = 0, memory_type = 0;
     VkImageView view = VK_NULL_HANDLE;
+    VkImageView words = VK_NULL_HANDLE;     /* an RGBA8 image's texels as 32-bit words (gs.frag's gather) */
     std::uint32_t width = 0, height = 0;    // in GS pixels
     std::uint32_t scale = 1;                // the image's pixels to a GS pixel, each way (targets, depth)
     std::uint32_t levels = 1;               // mipmap levels (a texture pack's replacements)
@@ -95,6 +162,7 @@ struct Image {
     std::uint32_t pw() const { return width * scale; }
     std::uint32_t ph() const { return height * scale; }
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageUsageFlags usage = 0;                 /* as made (MakeImage) */
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     VkDescriptorSet sampled = VK_NULL_HANDLE;   /* a target read by the DATE setup pass */
     VkDescriptorSet storage = VK_NULL_HANDLE;   /* a target as the swizzle's storage image */
@@ -128,14 +196,6 @@ std::uint64_t g_barriers = 0, g_transitions = 0, g_dispatches = 0, g_draws = 0, 
    is a Metal pipeline compiled on the thread that asks, tens of
    milliseconds; a race's new blend and test combinations come in bursts. */
 std::uint64_t g_pipelines = 0, g_pipeline_ns = 0;
-
-/* The pipeline cache (SetCacheDirectory): where it lives, and what it did -
-   pipelines built ahead of need by the prewarm thread, how many of those a
-   batch then took, how many a batch asked for before they were ready, the
-   driver's cache data loaded at the start. */
-std::string g_cache_dir;
-std::atomic<std::uint64_t> g_prewarmed{0}, g_prewarm_used{0}, g_prewarm_missed{0};
-std::uint64_t g_cache_loaded_bytes = 0, g_prewarm_listed = 0;
 
 /* Why the open rendering pass ended (RendererCounters): on a tile-based GPU
    (an iPad's) each end stores the target and its depth buffer to memory and
@@ -173,9 +233,6 @@ std::uint64_t g_work_hoistable[kWorks] = {};
 std::uint64_t g_work_hoisted[kWorks] = {};
 std::uint64_t g_blend_copies[kBlendWhys] = {};     // copies for the destination, by why
 std::uint64_t g_batches = 0, g_blend_batches = 0, g_date_batches = 0;
-// Batches by shader shape: untextured, plain texture, and the whole shader's
-// for a mipmapped texture, a target as the texture, anything else.
-std::uint64_t g_shapes[5] = {};
 // Local read: batches that read their target in place, and the barriers
 // before those that read what their pass had drawn (each a Metal pass's end).
 std::uint64_t g_local_reads = 0, g_local_barriers = 0;
@@ -214,7 +271,7 @@ void MemoryBarrier(VkCommandBuffer cmd) {
 struct DecodeParams {
     std::uint32_t tbp, tbw, psm, tw, th, wms, wmt, minu, maxu, minv, maxv, texa_lo, ta1, csa;
     std::uint32_t mode = 0;     // 0 a texture, 1 a CLUT load
-    std::uint32_t y0 = 0;       // decode_image: the image's row the level starts at
+    std::uint32_t row0 = 0;     // into the image (decode_image_pipeline_): the level's first row
 };
 
 /* swizzle.comp's push constants. */
@@ -301,18 +358,6 @@ BlendWhy ShaderBlendWhy(const GsDrawState& s) {
 
 bool ShaderBlend(const GsDrawState& s) { return ShaderBlendWhy(s) != kBlendNone; }
 constexpr std::uint32_t kShaderBlend = 1u << 15;
-/* Bit 16: a pass whose pixels the shader never drops (no alpha test passes,
-   no PABE halves - gs.frag's kMayDiscard false). Drawn the same; on a
-   tile-based GPU the hidden ones are no longer shaded. On by default with
-   MoltenVK; PS2GPU_DISCARD_ALWAYS=1 every pipeline as before, =0 these
-   pipelines anywhere. */
-constexpr std::uint32_t kNoDiscard = 1u << 16;
-/* Bits 17-19: gs.frag's kShape - 0 the whole shader, 1 untextured, 2 a
-   texture as it is, 3 mipmapped, 4 a target through the CLUT (Flush) - smaller shaders for what most
-   batches draw. PS2GPU_SHAPES=0 the whole shader always; "ab" (a tablet's
-   default for now) on and off in turn, measured. */
-constexpr std::uint32_t kShapeShift = 17;
-
 /* The pipeline a state needs: blending and its operands, and the write mask
    (bits 9-12, inverted so that 0 is the plain pipeline); bit 15 the blend
    in the shader. */
@@ -366,6 +411,9 @@ VkPipelineColorBlendAttachmentState Blending(std::uint32_t key, bool dual_source
 }
 
 bool SameBatch(const GsDrawState& x, const GsDrawState& y) {
+    // Most primitives come with the very state of the one before (the
+    // bridge's fast path): the same bytes are the same fields, at once.
+    if (std::memcmp(&x, &y, sizeof x) == 0) return true;
     return x.fbp == y.fbp && x.fbw == y.fbw && x.psm == y.psm && x.fbmsk == y.fbmsk && x.scissor_x0 == y.scissor_x0 &&
            x.scissor_y0 == y.scissor_y0 && x.scissor_x1 == y.scissor_x1 && x.scissor_y1 == y.scissor_y1 &&
            x.textured == y.textured && (!x.textured || (x.texture == y.texture && x.tfx == y.tfx &&
@@ -375,7 +423,11 @@ bool SameBatch(const GsDrawState& x, const GsDrawState& y) {
            x.tex_target_psm == y.tex_target_psm && x.tex_format == y.tex_format && x.ta0 == y.ta0 &&
            x.ta1 == y.ta1 && x.aem == y.aem)) &&
            x.alpha_test == y.alpha_test && (!x.alpha_test || (x.atst == y.atst && x.aref == y.aref && x.afail == y.afail)) &&
-           PipelineKey(x) == PipelineKey(y) && (!x.blend || (x.fix == y.fix && x.pabe == y.pabe)) && x.depth == y.depth &&
+           // PipelineKey's inputs compared rather than two keys built a
+           // primitive: the format, mask, width and sprite kind are compared
+           // already, and the blend's operands and FIX are here.
+           x.blend == y.blend && (!x.blend || (x.a == y.a && x.b == y.b && x.c == y.c && x.d == y.d &&
+           x.fix == y.fix && x.pabe == y.pabe)) && x.depth == y.depth &&
            (!x.depth || (x.zbp == y.zbp && x.ztst == y.ztst && x.depth_write == y.depth_write)) &&
            x.fog == y.fog && (!x.fog || x.fogcol == y.fogcol) && x.date == y.date && (!x.date || x.datm == y.datm) &&
            x.sprite == y.sprite && x.sprite_prim == y.sprite_prim;
@@ -395,6 +447,8 @@ public:
     bool BlockCompression() const override { return g_.bc; }
     bool UploadCooked(std::uint64_t key, std::uint32_t format, std::uint32_t width, std::uint32_t height,
                       const std::uint8_t* data, std::size_t bytes, std::uint32_t flags) override;
+    bool Converts() const override { return reinterpret_pipeline_ != VK_NULL_HANDLE; }
+    bool ConvertsDepth() const override { return reinterpret_depth_pipeline_ != VK_NULL_HANDLE; }
     bool CookedFormat(std::uint32_t format) const override {
         return format == 0 || (format == 4 && g_.bc) || (format == 5 && g_.astc);
     }
@@ -415,75 +469,7 @@ public:
         g_.Flush();
         ++frame_;
         EvictReplacements();
-        FastSamplingTurn();
-        HintsTurn();
-    }
-    /* PS2GPU_TILE_HINTS: 1 on, 0 off, "ab" (a tablet's default for now) each
-       in turn for 600 frames with the GPU's time a picture for each in the
-       log: the tile hints - stencil and unused depth neither loaded nor
-       stored at a pass's ends - measured in normal play. */
-    bool hints_ab_ = false;             // (now the shapes' turns: shapes_now_)
-    bool shapes_now_ = true;
-    std::uint64_t hints_frames_ = 0, hints_from_ns_ = 0, hints_pictures_ = 0, hints_last_draws_ = 0;
-    double hints_sum_[2] = {}, hints_count_[2] = {};
-    void HintsTurn() {
-        if (!hints_ab_) return;
-        if (g_draws - hints_last_draws_ > 300) ++hints_pictures_;
-        hints_last_draws_ = g_draws;
-        if (++hints_frames_ < 600) return;
-        const std::uint64_t ns = g_gpu_ns.load();
-        if (hints_pictures_ > 20) {
-            const double ms = double(ns - hints_from_ns_) / 1e6 / double(hints_pictures_);
-            hints_sum_[shapes_now_] += ms;
-            hints_count_[shapes_now_] += 1;
-            std::fprintf(stderr, "[gpu] shader shapes %s: %.1f ms a picture over %llu pictures (on average %.1f on, %.1f off)\n",
-                         shapes_now_ ? "on" : "off", ms, (unsigned long long)hints_pictures_,
-                         hints_count_[1] ? hints_sum_[1] / hints_count_[1] : 0.0,
-                         hints_count_[0] ? hints_sum_[0] / hints_count_[0] : 0.0);
-        }
-        hints_from_ns_ = ns;
-        hints_frames_ = hints_pictures_ = 0;
-        shapes_now_ = !shapes_now_;
-    }
-    /* PS2GPU_FAST_SAMPLE: 1 on, 0 off, "ab" each in turn for 600 frames
-       (~10 s) with the GPU's time a picture for each in the log - the
-       default on a tablet for now, to measure it in normal play; elsewhere off. */
-    int fast_mode_ = -1;                // 0 off, 1 on, 2 in turn
-    bool fast_now_ = false;
-    std::uint64_t fast_frames_ = 0, fast_from_draws_ = 0, fast_from_ns_ = 0, fast_pictures_ = 0;
-    std::uint64_t fast_last_draws_ = 0;
-    double fast_sum_[2] = {}, fast_count_[2] = {};
-    bool FastSampling() {
-        if (fast_mode_ < 0) {
-            const char* v = std::getenv("PS2GPU_FAST_SAMPLE");
-            // (Measured on an A12, 18 Oct: 34.8 ms a picture on, 34.6 off - off by default.)
-            const std::string mode = v ? v : "0";
-            fast_mode_ = mode == "ab" ? 2 : (mode == "1" ? 1 : 0);
-            fast_now_ = fast_mode_ != 0;
-            std::fprintf(stderr, "[gpu] fast sampling: %s\n", fast_mode_ == 2 ? "on and off in turn, 10 s each (measured)"
-                                                         : fast_mode_ ? "on" : "off");
-        }
-        return fast_now_;
-    }
-    void FastSamplingTurn() {
-        if (fast_mode_ != 2) return;
-        // A picture: a frame with a race's drawing (hundreds of draws).
-        if (g_draws - fast_last_draws_ > 300) ++fast_pictures_;
-        fast_last_draws_ = g_draws;
-        if (++fast_frames_ < 600) return;
-        const std::uint64_t ns = g_gpu_ns.load();
-        if (fast_pictures_ > 20) {
-            const double ms = double(ns - fast_from_ns_) / 1e6 / double(fast_pictures_);
-            fast_sum_[fast_now_] += ms;
-            fast_count_[fast_now_] += 1;
-            std::fprintf(stderr, "[gpu] fast sampling %s: %.1f ms a picture over %llu pictures (on average %.1f on, %.1f off)\n",
-                         fast_now_ ? "on" : "off", ms, (unsigned long long)fast_pictures_,
-                         fast_count_[1] ? fast_sum_[1] / fast_count_[1] : 0.0,
-                         fast_count_[0] ? fast_sum_[0] / fast_count_[0] : 0.0);
-        }
-        fast_from_ns_ = ns;
-        fast_frames_ = fast_pictures_ = 0;
-        fast_now_ = !fast_now_;
+        SavePipelineCache();
     }
     bool GpuCaughtUp() override { return g_.CaughtUp(); }
     void TargetRowsFromMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t width,
@@ -563,31 +549,18 @@ private:
     std::vector<VkDeviceMemory> image_blocks_;
     void Fill(Texture& texture, const std::uint32_t* pixels);
     VkPipeline PipelineFor(std::uint32_t key);
-    /* A GS pipeline made (PipelineFor's, and the prewarm thread's: it reads
-       only what Init made, and the pipeline cache is synchronised by the
-       driver). */
-    VkPipeline MakePipeline(std::uint32_t key);
-    /* The pipeline cache between runs (SetCacheDirectory): the driver's
-       cache, loaded in Init; the keys the last runs made, built ahead on a
-       thread of their own (prewarm_) into prewarmed_, which PipelineFor
-       takes from. What depends on this build's shaders and this GPU's ways
-       stamps both files: another build's are not used. */
-public:
-    void SaveCaches() override;
-private:
-    void LoadPipelineCache();
-    std::uint64_t ShaderStamp() const;
-    VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
-    // The keys the cache's list held at the start, in the order the last run
-    // first asked for them (the prewarm thread builds them so: the menus'
-    // first, the race's after), and sorted (to look one up).
-    std::vector<std::uint32_t> listed_keys_, listed_sorted_;
-    std::vector<std::uint32_t> asked_order_;           // this run's keys, as first asked for
-    std::mutex prewarm_lock_;
-    std::unordered_map<std::uint32_t, VkPipeline> prewarmed_;
-    std::thread prewarm_;
-    std::atomic<bool> stop_prewarm_{false};
-    std::size_t saved_pipelines_ = ~std::size_t(0);    // pipelines_.size() when last saved
+    /* The pipeline cache (SetPipelineCacheDir): every pipeline is made
+       through it; the keys PipelineFor has made, kept to make again at the
+       next start (WarmPipelines); written back now and then as they grow
+       (SavePipelineCache: on a thread of its own, the frame not waiting). */
+    VkPipelineCache cache_ = VK_NULL_HANDLE;
+    std::set<std::uint32_t> known_keys_;
+    bool cache_dirty_ = false;
+    std::chrono::steady_clock::time_point cache_saved_{};
+    std::atomic<bool> cache_saving_{false};
+    void OpenPipelineCache();
+    void WarmPipelines();
+    void SavePipelineCache();
     /* The destination alpha test's setup pass: stencil 1 where the target's
        alpha bit equals DATM. */
     bool MakeDatePipeline();
@@ -676,8 +649,12 @@ private:
        through 64-320-wide views of one memory some fifty times a frame,
        each brought back from memory: at 4x those were a third of the GPU's
        time, and the upscaled glow ghosted (a second, offset outline around
-       its words). */
-    std::uint32_t ScaleOf(std::uint32_t width) const { return width <= 320 ? 1u : scale_; }
+       its words). 1024 wide or more (FBW 16 and up) too: wider than any
+       picture the GS shows, a view of memory as texture pages - Burnout 3's
+       1024x256 over its glow's memory, read as PSMT8H, brought back from
+       memory 18 times a splitscreen frame and never drawn into: at 3x its
+       reloads were a third of the swizzles. */
+    std::uint32_t ScaleOf(std::uint32_t width) const { return width <= 320 || width >= 1024 ? 1u : scale_; }
     Image* open_target_ = nullptr;
     Image* open_depth_ = nullptr;
     /* What the open pass's draws read (textures, targets sampled, copies;
@@ -837,6 +814,7 @@ private:
     }
     VkPipeline date_pipeline_ = VK_NULL_HANDLE;
     VkDescriptorSet SetFor(Texture& texture, int sampler);
+    void WriteTextureSet(VkDescriptorSet set, VkSampler sampler, const Image& image);
     bool Buffer(VkDeviceSize bytes, VkBufferUsageFlags usage, VkBuffer* buffer, VkDeviceMemory* memory, void** mapped);
 
     VulkanGpu& g_;
@@ -888,6 +866,25 @@ private:
     std::map<std::uint32_t, VkPipeline> pipelines_;
     std::uint32_t last_pipeline_key_ = ~0u;
     VkPipeline last_pipeline_ = VK_NULL_HANDLE;
+    /* A pipeline for a kind of draw (a key with features, Features) made by
+       a thread of its own while playing: until it is ready the batch draws
+       with the whole shader (the same pictures) - none made in the middle of
+       a frame. Scripted runs (no pipeline cache) make them at once. */
+    bool async_pipelines_ = false;
+    std::thread pipeline_worker_;
+    std::mutex pipeline_lock_;
+    std::condition_variable pipeline_wake_;
+    std::deque<std::uint32_t> pipeline_queue_;
+    std::vector<std::pair<std::uint32_t, VkPipeline>> pipelines_made_;
+    std::set<std::uint32_t> pipelines_asked_;
+    std::atomic<bool> pipelines_ready_{false};
+    bool pipeline_stop_ = false;
+    VkPipeline MakePipeline(std::uint32_t key);
+    void AskWorker(std::uint32_t key, bool soon);
+    std::size_t warm_left_ = 0;         // WarmPipelines' still to come
+    std::chrono::steady_clock::time_point warm_began_{};
+    void KeepPipeline(std::uint32_t key, VkPipeline pipeline, double ms);
+    void TakeMadePipelines();
     std::map<Key, Image> targets_;
     std::map<Key, Image> depths_;   /* by (ZBP or a target's own, width, height) */
     std::map<std::uint64_t, Texture> textures_;
@@ -901,7 +898,7 @@ private:
     void DestroyTexture(Texture texture);
     Texture blank_;                 /* bound when nothing is textured */
     GsDrawState state_;
-    std::vector<PackedVertex> pending_;
+    PendingVertices pending_;
     /* Vertex data for what is recorded: appended to chunks of host-visible
        memory, all reusable once the submission that reads them has run. */
     struct VertexChunk {
@@ -1093,19 +1090,18 @@ private:
     // The CLUT for the draws (gs.frag's set 1): a target read as PSMT8H.
     VkDescriptorSetLayout clut_set_layout_ = VK_NULL_HANDLE;
     VkDescriptorSet clut_set_ = VK_NULL_HANDLE;
-    VkBuffer gsmem_ = VK_NULL_HANDLE, linear_ = VK_NULL_HANDLE, clut_ = VK_NULL_HANDLE;
-    VkDeviceMemory gsmem_memory_ = VK_NULL_HANDLE, linear_memory_ = VK_NULL_HANDLE, clut_memory_ = VK_NULL_HANDLE;
+    VkBuffer gsmem_ = VK_NULL_HANDLE, linear_ = VK_NULL_HANDLE, clut_ = VK_NULL_HANDLE, tables_ = VK_NULL_HANDLE;
+    VkDeviceMemory gsmem_memory_ = VK_NULL_HANDLE, linear_memory_ = VK_NULL_HANDLE, clut_memory_ = VK_NULL_HANDLE,
+                   tables_memory_ = VK_NULL_HANDLE;     // decode.comp's layout tables
     VkShaderModule decode_ = VK_NULL_HANDLE;
-    VkPipeline decode_pipeline_ = VK_NULL_HANDLE;
-    /* The decode into the texture's image (decode.comp's IMAGE_OUT), its
-       storage descriptor from the slot's pool (reset when the slot's command
-       buffer is recorded again: the one before it has run). PS2GPU_DECODE_LINEAR=1:
-       through the linear buffer and a copy, as before. */
+    /* The decode into a texture's own image (storage image, set 1 - the
+       swizzle's image layout), each texture's set from texture_storage_pool_;
+       null where it would not build: the staging buffer and a copy then. */
     VkShaderModule decode_image_ = VK_NULL_HANDLE;
     VkPipeline decode_image_pipeline_ = VK_NULL_HANDLE;
-    VkDescriptorPool decode_pools_[VulkanGpu::kSlots] = {};
-    std::uint64_t decode_pool_recording_[VulkanGpu::kSlots] = {};
-    VkDescriptorSet DecodeSet(Image& image);
+    VkDescriptorPool texture_storage_pool_ = VK_NULL_HANDLE;
+    VkDescriptorSet TextureStorageSet(Image& image);
+    VkPipeline decode_pipeline_ = VK_NULL_HANDLE;
     VkShaderModule swizzle_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout swizzle_set_layout_ = VK_NULL_HANDLE;
     VkDescriptorPool swizzle_pool_ = VK_NULL_HANDLE;
@@ -1129,6 +1125,10 @@ private:
     VkShaderModule reinterpret_depth_ = VK_NULL_HANDLE;     /* ...from a depth buffer: ConvertFromDepth */
     VkPipelineLayout reinterpret_depth_layout_ = VK_NULL_HANDLE;
     VkPipeline reinterpret_depth_pipeline_ = VK_NULL_HANDLE;
+    /* The same for a colour format, direction and scale (InitMemory): by
+       kSpecialisedFormats' index, to memory or not, scale - 1. */
+    static constexpr std::uint32_t kSpecialisedFormats[4] = {0x00, 0x01, 0x02, 0x0A};    // CT32, CT24, CT16, CT16S
+    VkPipeline swizzle_image_specialised_[4][2][4] = {};
     VkDescriptorSet StorageSet(Image& image);
     void SwizzleImage(VkCommandBuffer cmd, const SwizzleParams& params, Image& image);
     /* Depth buffers: to memory sampled (the swizzle's DEPTH_IMAGE), back drawn
@@ -1276,6 +1276,19 @@ bool VulkanGsRenderer::MakeImage(Image& t, std::uint32_t width, std::uint32_t he
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = usage;
+    t.usage = usage;
+    // An RGBA8 image a draw reads is read as 32-bit words as well: four
+    // texels in one gather (gs.frag's Sample). The two formats named, so a
+    // driver can keep its compression.
+    const bool words = format == VK_FORMAT_R8G8B8A8_UNORM && (usage & VK_IMAGE_USAGE_SAMPLED_BIT);
+    const VkFormat both[2] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_UINT};
+    VkImageFormatListCreateInfo formats{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    formats.viewFormatCount = 2;
+    formats.pViewFormats = both;
+    if (words) {
+        ici.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        ici.pNext = &formats;
+    }
     if (vkCreateImage(g_.device, &ici, nullptr, &t.image) != VK_SUCCESS) return false;
     VkMemoryRequirements req;
     vkGetImageMemoryRequirements(g_.device, t.image, &req);
@@ -1287,6 +1300,11 @@ bool VulkanGsRenderer::MakeImage(Image& t, std::uint32_t width, std::uint32_t he
     vci.format = format;
     vci.subresourceRange = {t.aspect, 0, t.levels, 0, 1};
     if (vkCreateImageView(g_.device, &vci, nullptr, &t.view) != VK_SUCCESS) return false;
+    if (words) {
+        vci.format = VK_FORMAT_R32_UINT;
+        if (vkCreateImageView(g_.device, &vci, nullptr, &t.words) != VK_SUCCESS) return false;
+        vci.format = format;
+    }
     if (format == kDepthFormat && (usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
         vci.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
         if (vkCreateImageView(g_.device, &vci, nullptr, &t.depth_view) != VK_SUCCESS) return false;
@@ -1296,6 +1314,7 @@ bool VulkanGsRenderer::MakeImage(Image& t, std::uint32_t width, std::uint32_t he
 
 void VulkanGsRenderer::DestroyImage(Image& t) {
     if (t.view) vkDestroyImageView(g_.device, t.view, nullptr);
+    if (t.words) vkDestroyImageView(g_.device, t.words, nullptr);
     if (t.depth_view) vkDestroyImageView(g_.device, t.depth_view, nullptr);
     if (t.image) vkDestroyImage(g_.device, t.image, nullptr);
     if (t.memory) FreeImageMemory(t.memory, t.offset, t.piece_class, t.memory_type);
@@ -1350,6 +1369,7 @@ void VulkanGsRenderer::FreeImageMemory(VkDeviceMemory memory, VkDeviceSize offse
 }
 
 bool VulkanGsRenderer::Init(std::string* error) {
+    OpenPipelineCache();
     auto module = [&](const std::uint32_t* code, std::size_t bytes) {
         VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = bytes;
@@ -1358,7 +1378,6 @@ bool VulkanGsRenderer::Init(std::string* error) {
         vkCreateShaderModule(g_.device, &ci, nullptr, &m);
         return m;
     };
-    LoadPipelineCache();
     vert_ = module(spirv_gs_vert, sizeof spirv_gs_vert);
     frag_ = g_.dual_source ? module(spirv_gs_frag, sizeof spirv_gs_frag)
                            : module(spirv_gs_frag_single, sizeof spirv_gs_frag_single);
@@ -1372,11 +1391,14 @@ bool VulkanGsRenderer::Init(std::string* error) {
     }
     std::fprintf(stderr, "[gpu] the destination read in the shader: %s\n",
                  g_.local_read ? "in place (VK_KHR_dynamic_rendering_local_read)" : "from a copy of the target");
-    VkDescriptorSetLayoutBinding binding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
-                                         VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    // The image a draw reads, and the same as 32-bit words (an image that
+    // has none: the blank texture's).
+    VkDescriptorSetLayoutBinding bindings[2] = {
+        {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = 1;
-    dli.pBindings = &binding;
+    dli.bindingCount = 2;
+    dli.pBindings = bindings;
     vkCreateDescriptorSetLayout(g_.device, &dli, nullptr, &set_layout_);
     if (g_.local_read) {
         VkDescriptorSetLayoutBinding input{0, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -1392,7 +1414,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
     cli.bindingCount = 1;
     cli.pBindings = &clut_binding;
     vkCreateDescriptorSetLayout(g_.device, &cli, nullptr, &clut_set_layout_);
-    VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8192},
+    VkDescriptorPoolSize sizes[3] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * 8192},
                                      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4 + kClutSlots},
                                      {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1024}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1428,28 +1450,6 @@ bool VulkanGsRenderer::Init(std::string* error) {
         if (error) *error = "vkCreateGraphicsPipelines failed";
         return false;
     }
-    // The pipelines the last runs made, built now on a thread of their own:
-    // the ones a race needs are ready before it asks (on MoltenVK each is a
-    // Metal compile of tens of milliseconds, on the GS thread otherwise).
-    if (!listed_keys_.empty()) {
-        prewarm_ = std::thread([this] {
-#if defined(__APPLE__)
-            pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
-#endif
-            for (const std::uint32_t key : listed_keys_) {
-                if (stop_prewarm_) break;
-                {
-                    std::lock_guard<std::mutex> hold(prewarm_lock_);
-                    if (prewarmed_.count(key)) continue;
-                }
-                const VkPipeline pipeline = MakePipeline(key);
-                if (!pipeline) continue;
-                std::lock_guard<std::mutex> hold(prewarm_lock_);
-                prewarmed_[key] = pipeline;
-                ++g_prewarmed;
-            }
-        });
-    }
     const std::uint32_t white = 0xFFFFFFFFu;
     if (!MakeImage(blank_.image, 1, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
         if (error) *error = "no image for the blank texture";
@@ -1464,13 +1464,7 @@ bool VulkanGsRenderer::Init(std::string* error) {
     tile_hints_ = defer_passes_ = TileWays(g_.portability);
     if (g_.portability) pool_limit_ = 128;
     if (const char* hints = std::getenv("PS2GPU_TILE_HINTS")) tile_hints_ = hints[0] != '0';
-    {
-        // (Tile hints measured on an A12, 18 Oct: no difference - off.)
-        const char* shapes = std::getenv("PS2GPU_SHAPES");
-        // (Measured on an A12, 18 Oct: ~33.5 ms a race picture on, ~36 off - on.)
-        hints_ab_ = shapes && std::string(shapes) == "ab";
-        shapes_now_ = !shapes || shapes[0] != '0';
-    }
+    // (Tile hints measured on an A12, 18 Oct: no difference - off.)
     if (const char* emulate = std::getenv("PS2GPU_LOCAL_READ_EMULATE"))
         emulate_tbdr_ = emulate[0] && emulate[0] != '0' && !g_.local_read;
     if (emulate_tbdr_) std::fprintf(stderr, "[gpu] local read emulated as a tile-based GPU reads (a copy at each pass)\n");
@@ -1481,11 +1475,12 @@ bool VulkanGsRenderer::Init(std::string* error) {
     if (const char* reorder = std::getenv("PS2GPU_REORDER")) reorder_ = reorder[0] && reorder[0] != '0';
     if (InPlaceReads()) reorder_ = false;
     if (reorder_) defer_passes_ = true;
-    std::fprintf(stderr, "[gpu] shader shapes: %s\n", hints_ab_ ? "on and off in turn, 10 s each (measured)" : shapes_now_ ? "on" : "off");
     std::fprintf(stderr, "[gpu] tile-based GPU ways: local read %s, tile hints %s%s, deferred passes %s, reordered passes %s\n",
                  g_.local_read ? "on" : "off", tile_hints_ ? "on" : "off", "", defer_passes_ ? "on" : "off",
                  reorder_ ? "on" : "off");
-    return InitMemory(error);
+    if (!InitMemory(error)) return false;
+    WarmPipelines();
+    return true;
 }
 
 bool VulkanGsRenderer::DeviceBuffer(VkDeviceSize bytes, VkBufferUsageFlags usage, VkBuffer* buffer,
@@ -1508,7 +1503,8 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     if (!DeviceBuffer(kLocalMemory, usage, &gsmem_, &gsmem_memory_) ||
         !DeviceBuffer(kLinear, usage, &linear_, &linear_memory_) ||
-        !DeviceBuffer(1024 * kClutSlots, usage, &clut_, &clut_memory_)) {
+        !DeviceBuffer(1024 * kClutSlots, usage, &clut_, &clut_memory_) ||
+        !DeviceBuffer(4096, usage, &tables_, &tables_memory_)) {
         if (error) *error = "no GPU memory for GS local memory";
         return false;
     }
@@ -1549,15 +1545,16 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
     ci.pCode = spirv_swizzle_comp;
     vkCreateShaderModule(g_.device, &ci, nullptr, &swizzle_);
     const VkShaderStageFlags memory_stages = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    VkDescriptorSetLayoutBinding bindings[3] = {
+    VkDescriptorSetLayoutBinding bindings[4] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, memory_stages, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, memory_stages, nullptr},
-        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, memory_stages, nullptr}};
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, memory_stages, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, memory_stages, nullptr}};     // decode.comp's tables
     VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dli.bindingCount = 3;
+    dli.bindingCount = 4;
     dli.pBindings = bindings;
     vkCreateDescriptorSetLayout(g_.device, &dli, nullptr, &swizzle_set_layout_);
-    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+    VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.maxSets = 1;
     dpi.poolSizeCount = 1;
@@ -1571,10 +1568,10 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         if (error) *error = "no descriptor set for GS local memory";
         return false;
     }
-    VkDescriptorBufferInfo infos[3] = {{gsmem_, 0, VK_WHOLE_SIZE}, {linear_, 0, VK_WHOLE_SIZE},
-                                       {clut_, 0, 1024}};
-    VkWriteDescriptorSet writes[3] = {};
-    for (int i = 0; i < 3; ++i) {
+    VkDescriptorBufferInfo infos[4] = {{gsmem_, 0, VK_WHOLE_SIZE}, {linear_, 0, VK_WHOLE_SIZE},
+                                       {clut_, 0, 1024}, {tables_, 0, VK_WHOLE_SIZE}};
+    VkWriteDescriptorSet writes[4] = {};
+    for (int i = 0; i < 4; ++i) {
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[i].dstSet = swizzle_set_;
         writes[i].dstBinding = std::uint32_t(i);
@@ -1582,7 +1579,7 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &infos[i];
     }
-    vkUpdateDescriptorSets(g_.device, 3, writes, 0, nullptr);
+    vkUpdateDescriptorSets(g_.device, 4, writes, 0, nullptr);
     VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0,
                              std::uint32_t(std::max(sizeof(SwizzleParams), sizeof(DecodeParams)))};
     VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -1598,7 +1595,7 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
     cpi.stage.pName = "main";
     cpi.layout = swizzle_layout_;
     if (!swizzle_ ||
-        vkCreateComputePipelines(g_.device, pipeline_cache_, 1, &cpi, nullptr, &swizzle_pipeline_) != VK_SUCCESS) {
+        vkCreateComputePipelines(g_.device, cache_, 1, &cpi, nullptr, &swizzle_pipeline_) != VK_SUCCESS) {
         if (error) *error = "the swizzle shader did not load";
         return false;
     }
@@ -1630,7 +1627,7 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         pi.stage.module = swizzle_image_;
         pi.layout = swizzle_image_layout_;
         if (!swizzle_image_ ||
-            vkCreateComputePipelines(g_.device, pipeline_cache_, 1, &pi, nullptr, &swizzle_image_pipeline_) !=
+            vkCreateComputePipelines(g_.device, cache_, 1, &pi, nullptr, &swizzle_image_pipeline_) !=
                 VK_SUCCESS) {
             if (error) *error = "the swizzle shader (images) did not load";
             return false;
@@ -1652,8 +1649,23 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         rp.stage.module = reinterpret_;
         rp.layout = reinterpret_layout_;
         if (!reinterpret_ ||
-            vkCreateComputePipelines(g_.device, pipeline_cache_, 1, &rp, nullptr, &reinterpret_pipeline_) != VK_SUCCESS)
+            vkCreateComputePipelines(g_.device, cache_, 1, &rp, nullptr, &reinterpret_pipeline_) != VK_SUCCESS)
             reinterpret_pipeline_ = VK_NULL_HANDLE;     // (ConvertImage declines: through memory, as before)
+        // The common colour transfers (CT32, CT24, CT16, CT16S; each way; at
+        // 1x-4x) made at start as pipelines of their own, the format,
+        // direction and scale constants (swizzle.comp's specialisation) so
+        // the driver drops the branches the rest take. One that fails to
+        // build leaves that transfer to the general pipeline.
+        const VkSpecializationMapEntry entries[] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}};
+        for (std::uint32_t f = 0; f < 4; ++f)
+            for (std::uint32_t direction = 0; direction < 2; ++direction)
+                for (std::uint32_t scale = 1; scale <= 4; ++scale) {
+                    const std::uint32_t values[] = {kSpecialisedFormats[f], direction, scale, 0};
+                    const VkSpecializationInfo info{4, entries, sizeof values, values};
+                    pi.stage.pSpecializationInfo = &info;
+                    vkCreateComputePipelines(g_.device, cache_, 1, &pi, nullptr,
+                                             &swizzle_image_specialised_[f][direction][scale - 1]);
+                }
     }
     if (!MakeDepthPipelines()) {
         if (error) *error = "the depth buffer shaders did not load";
@@ -1681,7 +1693,7 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         rp.stage.pName = "main";
         rp.layout = reinterpret_depth_layout_;
         if (!reinterpret_depth_ || !reinterpret_depth_layout_ ||
-            vkCreateComputePipelines(g_.device, pipeline_cache_, 1, &rp, nullptr, &reinterpret_depth_pipeline_) !=
+            vkCreateComputePipelines(g_.device, cache_, 1, &rp, nullptr, &reinterpret_depth_pipeline_) !=
                 VK_SUCCESS)
             reinterpret_depth_pipeline_ = VK_NULL_HANDLE;   // (ConvertFromDepth declines)
     }
@@ -1700,7 +1712,7 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         VkComputePipelineCreateInfo pp = cpi;
         pp.stage.module = patch_;
         pp.layout = patch_layout_;
-        if (!patch_ || vkCreateComputePipelines(g_.device, pipeline_cache_, 1, &pp, nullptr, &patch_pipeline_) != VK_SUCCESS) {
+        if (!patch_ || vkCreateComputePipelines(g_.device, cache_, 1, &pp, nullptr, &patch_pipeline_) != VK_SUCCESS) {
             if (error) *error = "the memory patch shader did not load";
             return false;
         }
@@ -1710,39 +1722,42 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
     vkCreateShaderModule(g_.device, &ci, nullptr, &decode_);
     cpi.stage.module = decode_;
     if (!decode_ ||
-        vkCreateComputePipelines(g_.device, pipeline_cache_, 1, &cpi, nullptr, &decode_pipeline_) != VK_SUCCESS) {
+        vkCreateComputePipelines(g_.device, cache_, 1, &cpi, nullptr, &decode_pipeline_) != VK_SUCCESS) {
         if (error) *error = "the texture decode shader did not load";
         return false;
     }
-    {
-        // ...and into the texture's image: the swizzle's image layout (set 0
-        // memory, the linear buffer and the CLUT; set 1 the image).
-        static const bool linear = [] {
-            const char* v = std::getenv("PS2GPU_DECODE_LINEAR");
-            return v && *v && *v != '0';
-        }();
+    if (swizzle_image_layout_) {
         VkShaderModuleCreateInfo di{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         di.codeSize = sizeof spirv_decode_image_comp;
         di.pCode = spirv_decode_image_comp;
-        if (!linear && swizzle_image_layout_ && vkCreateShaderModule(g_.device, &di, nullptr, &decode_image_) == VK_SUCCESS) {
-            VkComputePipelineCreateInfo dp = cpi;
-            dp.stage.module = decode_image_;
-            dp.layout = swizzle_image_layout_;
-            if (vkCreateComputePipelines(g_.device, pipeline_cache_, 1, &dp, nullptr, &decode_image_pipeline_) !=
-                VK_SUCCESS)
-                decode_image_pipeline_ = VK_NULL_HANDLE;
-            VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256};
-            VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-            pi.maxSets = 256;
-            pi.poolSizeCount = 1;
-            pi.pPoolSizes = &size;
-            for (VkDescriptorPool& pool : decode_pools_)
-                if (vkCreateDescriptorPool(g_.device, &pi, nullptr, &pool) != VK_SUCCESS) decode_image_pipeline_ = VK_NULL_HANDLE;
-        }
+        vkCreateShaderModule(g_.device, &di, nullptr, &decode_image_);
+        VkComputePipelineCreateInfo dp = cpi;
+        dp.stage.module = decode_image_;
+        dp.layout = swizzle_image_layout_;
+        if (!decode_image_ ||
+            vkCreateComputePipelines(g_.device, cache_, 1, &dp, nullptr, &decode_image_pipeline_) != VK_SUCCESS)
+            decode_image_pipeline_ = VK_NULL_HANDLE;
+        // A set for every texture there may be: the bridge's cache, the pool of
+        // spare images, and room.
+        VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8192};
+        VkDescriptorPoolCreateInfo tp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        tp.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        tp.maxSets = 8192;
+        tp.poolSizeCount = 1;
+        tp.pPoolSizes = &size;
+        if (vkCreateDescriptorPool(g_.device, &tp, nullptr, &texture_storage_pool_) != VK_SUCCESS)
+            decode_image_pipeline_ = VK_NULL_HANDLE;
     }
-    // Local memory starts as zeros, the CPU's copy too.
+    // Local memory starts as zeros, the CPU's copy too; decode.comp's
+    // tables copied to their buffer (mode 2), once.
     g_.Record([&](VkCommandBuffer cmd) {
         vkCmdFillBuffer(cmd, gsmem_, 0, kLocalMemory, 0);
+        DecodeParams params{};
+        params.mode = 2;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, decode_pipeline_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, swizzle_layout_, 0, 1, &swizzle_set_, 0, nullptr);
+        vkCmdPushConstants(cmd, swizzle_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
+        vkCmdDispatch(cmd, 768 / 8, 1, 1);
         MemoryBarrier(cmd);
     });
     return true;
@@ -1783,7 +1798,7 @@ bool VulkanGsRenderer::MakeDepthPipelines() {
     cpi.stage.module = swizzle_depth_;
     cpi.stage.pName = "main";
     cpi.layout = swizzle_depth_layout_;
-    if (vkCreateComputePipelines(g_.device, pipeline_cache_, 1, &cpi, nullptr, &swizzle_depth_pipeline_) !=
+    if (vkCreateComputePipelines(g_.device, cache_, 1, &cpi, nullptr, &swizzle_depth_pipeline_) !=
         VK_SUCCESS)
         return false;
     // Back: drawn, Z from memory as the depth, every pixel (ALWAYS) - the
@@ -1840,7 +1855,7 @@ bool VulkanGsRenderer::MakeDepthPipelines() {
     pci.pDepthStencilState = &depth;
     pci.pDynamicState = &dynamic;
     pci.layout = depth_load_layout_;
-    return vkCreateGraphicsPipelines(g_.device, pipeline_cache_, 1, &pci, nullptr, &depth_load_pipeline_) ==
+    return vkCreateGraphicsPipelines(g_.device, cache_, 1, &pci, nullptr, &depth_load_pipeline_) ==
            VK_SUCCESS;
 }
 
@@ -1933,6 +1948,24 @@ VkDescriptorSet VulkanGsRenderer::StorageSet(Image& image) {
     return image.storage;
 }
 
+/* A texture's image as the decode's storage image (TextureFromMemory). */
+VkDescriptorSet VulkanGsRenderer::TextureStorageSet(Image& image) {
+    if (image.storage) return image.storage;
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = texture_storage_pool_;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &image_set_layout_;
+    if (vkAllocateDescriptorSets(g_.device, &ai, &image.storage) != VK_SUCCESS) return image.storage = VK_NULL_HANDLE;
+    VkDescriptorImageInfo info{VK_NULL_HANDLE, image.view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = image.storage;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    write.pImageInfo = &info;
+    vkUpdateDescriptorSets(g_.device, 1, &write, 0, nullptr);
+    return image.storage;
+}
+
 /* The swizzle on a colour target's image itself (GENERAL, as storage). */
 void VulkanGsRenderer::SwizzleImage(VkCommandBuffer cmd, const SwizzleParams& params, Image& image) {
     g_.Mark(cmd, kProfSwizzle);   // before the work, so that its time is counted as it
@@ -1940,7 +1973,12 @@ void VulkanGsRenderer::SwizzleImage(VkCommandBuffer cmd, const SwizzleParams& pa
     Transition(cmd, image, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     const VkDescriptorSet sets[2] = {swizzle_set_, StorageSet(image)};
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, swizzle_image_pipeline_);
+    VkPipeline pipeline = swizzle_image_pipeline_;
+    if (params.depth == 0 && params.to_memory <= 1 && params.scale >= 1 && params.scale <= 4)
+        for (std::uint32_t f = 0; f < 4; ++f)
+            if (params.psm == kSpecialisedFormats[f] && swizzle_image_specialised_[f][params.to_memory][params.scale - 1])
+                pipeline = swizzle_image_specialised_[f][params.to_memory][params.scale - 1];
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, swizzle_image_layout_, 0, 2, sets, 0, nullptr);
     vkCmdPushConstants(cmd, swizzle_image_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
     ++g_dispatches;
@@ -2060,9 +2098,12 @@ void VulkanGsRenderer::MemoryRead(std::uint32_t begin, std::uint32_t end, std::u
 
 bool VulkanGsRenderer::TargetToMemory(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t cols,
                                       std::uint32_t rows, std::uint32_t first_row) {
+    // The batch pending first: a target it draws into for the first time is
+    // made as it goes (and the answer is the same however far behind a
+    // threaded caller's queue is - MakeThreadedGsRenderer).
+    Flush();
     auto found = targets_.find(Key{fbp, fbw, psm});
     if (found == targets_.end()) return false;
-    Flush();
     Image& t = found->second;
     cols = std::min(cols, t.width);
     rows = std::min(rows, t.height);
@@ -2187,9 +2228,9 @@ void VulkanGsRenderer::TargetFromMemory(std::uint32_t fbp, std::uint32_t fbw, st
 bool VulkanGsRenderer::DepthToMemory(std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::uint32_t fbw,
                                      std::uint32_t zpsm, std::uint32_t cols, std::uint32_t rows,
                                      std::uint32_t first_row) {
+    Flush();                        // (as TargetToMemory)
     auto found = depths_.find(Key{zbp, width, height});
     if (found == depths_.end()) return false;
-    Flush();
     Image& d = found->second;
     cols = std::min(cols, d.width);
     rows = std::min(rows, d.height);
@@ -2306,41 +2347,188 @@ void VulkanGsRenderer::SetScale(std::uint32_t scale) {
     scale_ = scale;
 }
 
+namespace {
+std::string g_pipeline_cache_dir;       // SetPipelineCacheDir
+std::vector<std::uint32_t> g_pipeline_hints;    // SetPipelineHints
+std::string CacheFile(const char* name) { return g_pipeline_cache_dir + "/" + name; }
+}  // namespace
+
+void VulkanGsRenderer::OpenPipelineCache() {
+    // What a last run left (the driver checks it is its own, and ignores it
+    // if not - another GPU, another driver).
+    std::vector<char> data;
+    if (!g_pipeline_cache_dir.empty()) {
+        std::ifstream in(CacheFile("gpu_pipeline_cache.bin"), std::ios::binary);
+        if (in) data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    ci.initialDataSize = data.size();
+    ci.pInitialData = data.empty() ? nullptr : data.data();
+    if (vkCreatePipelineCache(g_.device, &ci, nullptr, &cache_) != VK_SUCCESS) {
+        ci.initialDataSize = 0;
+        ci.pInitialData = nullptr;
+        if (vkCreatePipelineCache(g_.device, &ci, nullptr, &cache_) != VK_SUCCESS) cache_ = VK_NULL_HANDLE;
+    }
+    cache_saved_ = std::chrono::steady_clock::now();
+}
+
+/* The pipelines the game drew with before, made by the worker from the
+   start (from the cache: a fraction of a millisecond each; after a new
+   driver or shader, tens of milliseconds - seconds in all, which the start
+   does not wait for) rather than when a race first needs one. */
+void VulkanGsRenderer::WarmPipelines() {
+    if (g_pipeline_cache_dir.empty()) return;
+    async_pipelines_ = true;            // (a run that keeps a cache is a player's)
+    std::ifstream in(CacheFile("gpu_pipelines.txt"));
+    std::string word;
+    std::vector<std::uint32_t> keys;
+    while (in && in >> word) {
+        const std::uint32_t key = std::uint32_t(std::strtoul(word.c_str(), nullptr, 16));
+        if (pipelines_.count(key) || !pipelines_asked_.insert(key).second) continue;
+        known_keys_.insert(key);
+        keys.push_back(key);
+    }
+    // The game's own list after (SetPipelineHints): kept in the file only
+    // once drawn with.
+    for (std::uint32_t key : g_pipeline_hints)
+        if (!pipelines_.count(key) && pipelines_asked_.insert(key).second) keys.push_back(key);
+    if (keys.empty()) return;
+    warm_began_ = std::chrono::steady_clock::now();
+    warm_left_ = keys.size();
+    for (std::uint32_t key : keys) AskWorker(key, false);
+}
+
+/* A pipeline for the worker to make: a player's draw first (`soon`), the
+   start's list after. */
+void VulkanGsRenderer::AskWorker(std::uint32_t key, bool soon) {
+    if (!pipeline_worker_.joinable())
+        pipeline_worker_ = std::thread([this] {
+            std::unique_lock<std::mutex> hold(pipeline_lock_);
+            for (;;) {
+                pipeline_wake_.wait(hold, [this] { return pipeline_stop_ || !pipeline_queue_.empty(); });
+                if (pipeline_stop_) return;
+                const std::uint32_t next = pipeline_queue_.front();
+                pipeline_queue_.pop_front();
+                hold.unlock();
+                const VkPipeline made = MakePipeline(next);
+                hold.lock();
+                pipelines_made_.emplace_back(next, made);
+                pipelines_ready_.store(true, std::memory_order_release);
+            }
+        });
+    {
+        std::lock_guard<std::mutex> hold(pipeline_lock_);
+        if (soon) pipeline_queue_.push_front(key);
+        else pipeline_queue_.push_back(key);
+    }
+    pipeline_wake_.notify_one();
+}
+
+/* The cache and the keys, written when new pipelines came, at most every
+   five seconds, by a thread of their own; a run ends by being ended
+   (TerminateProcess), not by a destructor, so this is where they are kept. */
+void VulkanGsRenderer::SavePipelineCache() {
+    if (!cache_dirty_ || !cache_ || g_pipeline_cache_dir.empty() || cache_saving_.load()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - cache_saved_ < std::chrono::seconds(5)) return;
+    cache_saved_ = now;
+    cache_dirty_ = false;
+    std::string keys;
+    for (std::uint32_t key : known_keys_) {
+        char text[12];
+        std::snprintf(text, sizeof text, "%08X\n", unsigned(key));
+        keys += text;
+    }
+    cache_saving_ = true;
+    std::thread([this, device = g_.device, cache = cache_, keys = std::move(keys)] {
+        std::size_t size = 0;
+        std::vector<char> data;
+        if (vkGetPipelineCacheData(device, cache, &size, nullptr) == VK_SUCCESS && size) {
+            data.resize(size);
+            if (vkGetPipelineCacheData(device, cache, &size, data.data()) != VK_SUCCESS) data.clear();
+            data.resize(size);
+        }
+        // Each written beside, then put in place: a run ended halfway leaves
+        // the last whole one.
+        auto write = [](const std::string& path, const char* bytes, std::size_t count) {
+            {
+                std::ofstream out(path + ".new", std::ios::binary | std::ios::trunc);
+                if (!out) return;
+                out.write(bytes, std::streamsize(count));
+                if (!out) return;
+            }
+            std::remove(path.c_str());
+            std::rename((path + ".new").c_str(), path.c_str());
+        };
+        if (!data.empty()) write(CacheFile("gpu_pipeline_cache.bin"), data.data(), data.size());
+        write(CacheFile("gpu_pipelines.txt"), keys.data(), keys.size());
+        cache_saving_ = false;
+    }).detach();
+}
+
 VkPipeline VulkanGsRenderer::PipelineFor(std::uint32_t key) {
     // Batch after batch asks for the same one.
     if (key == last_pipeline_key_ && last_pipeline_) return last_pipeline_;
+    if (pipelines_ready_.load(std::memory_order_acquire)) TakeMadePipelines();
     auto found = pipelines_.find(key);
     if (found != pipelines_.end()) {
         last_pipeline_key_ = key;
         last_pipeline_ = found->second;
         return found->second;
     }
-    // Built ahead by the prewarm thread (the pipeline cache's list)?
-    if (!listed_keys_.empty()) {
-        std::lock_guard<std::mutex> hold(prewarm_lock_);
-        auto ready = prewarmed_.find(key);
-        if (ready != prewarmed_.end()) {
-            const VkPipeline pipeline = ready->second;
-            prewarmed_.erase(ready);
-            ++g_prewarm_used;
-            pipelines_[key] = pipeline;
-            asked_order_.push_back(key);
-            last_pipeline_key_ = key;
-            last_pipeline_ = pipeline;
-            return pipeline;
+    // A kind of draw's own, while playing: asked of the worker, the whole
+    // shader's meanwhile (made now if it is not yet: one for many kinds - a
+    // kind's own made here instead, the first time a player meets each, took
+    // up to 0.7 s on an integrated GPU's cold driver).
+    if (async_pipelines_ && (key >> kFeatureShift)) {
+        const VkPipeline stand_in = PipelineFor(key & ((1u << kFeatureShift) - 1));
+        if (stand_in) {
+            if (pipelines_asked_.insert(key).second) AskWorker(key, true);
+            return stand_in;
         }
-        if (std::binary_search(listed_sorted_.begin(), listed_sorted_.end(), key)) ++g_prewarm_missed;
     }
     const auto began = std::chrono::steady_clock::now();
     const VkPipeline pipeline = MakePipeline(key);
-    ++g_pipelines;
-    g_pipeline_ns += std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - began).count());
     if (!pipeline) return VK_NULL_HANDLE;
-    pipelines_[key] = pipeline;
-    asked_order_.push_back(key);
+    KeepPipeline(key, pipeline, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count());
     return pipeline;
 }
 
+/* The worker's pipelines into the renderer's (the GS thread's) own. */
+void VulkanGsRenderer::TakeMadePipelines() {
+    std::vector<std::pair<std::uint32_t, VkPipeline>> made;
+    {
+        std::lock_guard<std::mutex> hold(pipeline_lock_);
+        made.swap(pipelines_made_);
+        pipelines_ready_.store(false, std::memory_order_relaxed);
+    }
+    for (const auto& [key, pipeline] : made) {
+        pipelines_asked_.erase(key);
+        if (warm_left_ && --warm_left_ == 0)
+            std::fprintf(stderr, "[gpu] the pipelines known from the start (the last runs', the game's) made ready in %.0f ms\n",
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - warm_began_).count());
+        if (!pipeline) continue;
+        if (pipelines_.count(key)) vkDestroyPipeline(g_.device, pipeline, nullptr);
+        else KeepPipeline(key, pipeline, -1.0);
+    }
+    last_pipeline_key_ = ~0u;           // (it may have been the whole shader's, standing in)
+}
+
+void VulkanGsRenderer::KeepPipeline(std::uint32_t key, VkPipeline pipeline, double ms) {
+    pipelines_[key] = pipeline;
+    // PS2HOST_PIPELINE_LOG=1: each pipeline made, and how long it took.
+    static const bool log = std::getenv("PS2HOST_PIPELINE_LOG") != nullptr;
+    if (log) {
+        if (ms >= 0.0)
+            std::fprintf(stderr, "[gpu] pipeline %08X made in %.2f ms (%zu)\n", unsigned(key), ms, pipelines_.size());
+        else
+            std::fprintf(stderr, "[gpu] pipeline %08X made by the worker (%zu)\n", unsigned(key), pipelines_.size());
+    }
+    if (known_keys_.insert(key).second) cache_dirty_ = true;
+}
+
+/* A pipeline for a key: blending and the write mask (PipelineKey), the
+   shader's features (Features) as its specialisation. Any thread. */
 VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     VkPipelineShaderStageCreateInfo stages[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                                  {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
@@ -2350,11 +2538,10 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = key & kShaderBlend ? frag_blend_ : frag_;
     stages[1].pName = "main";
-    const struct { VkBool32 may_discard; std::uint32_t shape; } constants{(key & kNoDiscard) ? VK_FALSE : VK_TRUE,
-                                                                           (key >> kShapeShift) & 7u};
-    const VkSpecializationMapEntry entries[2] = {{0, 0, sizeof(VkBool32)}, {1, sizeof(VkBool32), sizeof(std::uint32_t)}};
-    VkSpecializationInfo specialization{2, entries, sizeof constants, &constants};
-    stages[1].pSpecializationInfo = &specialization;
+    const std::uint32_t features = ~(key >> kFeatureShift);     // all of them for a key without
+    const VkSpecializationMapEntry feature_entry{0, 0, sizeof features};
+    VkSpecializationInfo specialisation{1, &feature_entry, sizeof features, &features};
+    stages[1].pSpecializationInfo = &specialisation;
     VkVertexInputBindingDescription binding{0, sizeof(PackedVertex), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attributes[6] = {
         {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(PackedVertex, x)},
@@ -2418,7 +2605,7 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     pci.pDynamicState = &dynamic;
     pci.layout = layout_;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(g_.device, pipeline_cache_, 1, &pci, nullptr, &pipeline) != VK_SUCCESS)
+    if (vkCreateGraphicsPipelines(g_.device, cache_, 1, &pci, nullptr, &pipeline) != VK_SUCCESS)
         return VK_NULL_HANDLE;
     return pipeline;
 }
@@ -2479,7 +2666,7 @@ bool VulkanGsRenderer::MakeDatePipeline() {
     pci.pColorBlendState = &blending;
     pci.pDynamicState = &dynamic;
     pci.layout = layout_;
-    const VkResult r = vkCreateGraphicsPipelines(g_.device, pipeline_cache_, 1, &pci, nullptr, &date_pipeline_);
+    const VkResult r = vkCreateGraphicsPipelines(g_.device, cache_, 1, &pci, nullptr, &date_pipeline_);
     vkDestroyShaderModule(g_.device, vert, nullptr);
     vkDestroyShaderModule(g_.device, frag, nullptr);
     return r == VK_SUCCESS;
@@ -2492,14 +2679,25 @@ VkDescriptorSet VulkanGsRenderer::SampledSet(Image& image) {
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &set_layout_;
     if (vkAllocateDescriptorSets(g_.device, &ai, &image.sampled) != VK_SUCCESS) return VK_NULL_HANDLE;
-    VkDescriptorImageInfo info{samplers_[3], image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = image.sampled;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &info;
-    vkUpdateDescriptorSets(g_.device, 1, &write, 0, nullptr);
+    WriteTextureSet(image.sampled, samplers_[3], image);
     return image.sampled;
+}
+
+/* A set of set_layout_: the image with its sampler, and its words (the
+   blank texture's for an image without: a texture pack's compressed one). */
+void VulkanGsRenderer::WriteTextureSet(VkDescriptorSet set, VkSampler sampler, const Image& image) {
+    const VkImageView words = image.words ? image.words : blank_.image.words;
+    VkDescriptorImageInfo info[2] = {{sampler, image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                     {samplers_[3], words, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    for (int i = 0; i < 2; ++i) {
+        writes[i].dstSet = set;
+        writes[i].dstBinding = std::uint32_t(i);
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[i].pImageInfo = &info[i];
+    }
+    vkUpdateDescriptorSets(g_.device, words ? 2 : 1, writes, 0, nullptr);
 }
 
 void VulkanGsRenderer::DateSetup(VkCommandBuffer cmd, Image& target, Image& depth, std::uint32_t datm,
@@ -2596,13 +2794,7 @@ VkDescriptorSet VulkanGsRenderer::SetFor(Texture& texture, int sampler) {
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &set_layout_;
     if (vkAllocateDescriptorSets(g_.device, &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
-    VkDescriptorImageInfo info{samplers_[sampler], texture.image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = set;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write.pImageInfo = &info;
-    vkUpdateDescriptorSets(g_.device, 1, &write, 0, nullptr);
+    WriteTextureSet(set, samplers_[sampler], texture.image);
     return set;
 }
 
@@ -2715,7 +2907,9 @@ void VulkanGsRenderer::RetireTextureImage(Texture& texture) {
     g_.AfterSubmit([this, device, pool, old]() mutable {
         for (VkDescriptorSet& set : old.sets)
             if (set) vkFreeDescriptorSets(device, pool, 1, &set);
+        if (old.image.storage) vkFreeDescriptorSets(device, texture_storage_pool_, 1, &old.image.storage);
         if (old.image.view) vkDestroyImageView(device, old.image.view, nullptr);
+        if (old.image.words) vkDestroyImageView(device, old.image.words, nullptr);
         if (old.image.image) vkDestroyImage(device, old.image.image, nullptr);
         if (old.image.memory)
             FreeImageMemory(old.image.memory, old.image.offset, old.image.piece_class, old.image.memory_type);
@@ -2739,7 +2933,9 @@ bool VulkanGsRenderer::UploadCooked(std::uint64_t key, std::uint32_t format, std
     if (texture.image.image) RetireTextureImage(texture);
     texture.replacement = 0;
     texture.replaced = 0;
-    texture.cooked = (flags & 255) ? 0x1000u | (flags & 255) << 13 : 0u;
+    // Block-compressed: no 32-bit words to gather (gs.frag's Words), its
+    // alpha perhaps stretched (Cooked).
+    texture.cooked = 0x200000u | ((flags & 255) ? 0x1000u | (flags & 255) << 13 : 0u);
     const VkFormat vk_format = format == 4 ? VK_FORMAT_BC7_UNORM_BLOCK : VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
     if (!MakeImage(texture.image, width, height, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                    vk_format)) {
@@ -2798,7 +2994,9 @@ void VulkanGsRenderer::DestroyTexture(Texture texture) {
     g_.AfterSubmit([this, device, pool, texture]() mutable {
         for (VkDescriptorSet& set : texture.sets)
             if (set) vkFreeDescriptorSets(device, pool, 1, &set);
+        if (texture.image.storage) vkFreeDescriptorSets(device, texture_storage_pool_, 1, &texture.image.storage);
         if (texture.image.view) vkDestroyImageView(device, texture.image.view, nullptr);
+        if (texture.image.words) vkDestroyImageView(device, texture.image.words, nullptr);
         if (texture.image.image) vkDestroyImage(device, texture.image.image, nullptr);
         if (texture.image.memory)
             FreeImageMemory(texture.image.memory, texture.image.offset, texture.image.piece_class,
@@ -2817,6 +3015,8 @@ Texture* VulkanGsRenderer::TextureImage(std::uint64_t key, std::uint32_t width, 
                 vkFreeDescriptorSets(g_.device, pool_, 1, &set);
                 set = VK_NULL_HANDLE;
             }
+        if (texture.image.storage) vkFreeDescriptorSets(g_.device, texture_storage_pool_, 1, &texture.image.storage);
+        texture.image.storage = VK_NULL_HANDLE;
         DestroyImage(texture.image);
         auto pooled = texture_pool_.find(std::uint64_t(width) << 32 | height);
         if (pooled != texture_pool_.end() && !pooled->second.empty()) {
@@ -2827,7 +3027,7 @@ Texture* VulkanGsRenderer::TextureImage(std::uint64_t key, std::uint32_t width, 
         }
         if (!MakeImage(texture.image, width, height,
                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                           VK_IMAGE_USAGE_STORAGE_BIT))
+                           (decode_image_pipeline_ ? VK_IMAGE_USAGE_STORAGE_BIT : 0)))
             return nullptr;
     }
     return &texture;
@@ -2847,20 +3047,24 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
     Work(kWorkDecode, {&t}, {&t}, d.clut != nullptr && !clut_ring_);
     if (d.clut) clut_dirty_ = true;
     WorkLabel("decode: T %X/%u/%02X %ux%u", unsigned(d.tbp), unsigned(d.tbw), unsigned(d.psm), unsigned(d.tw), unsigned(d.th));
-    g_.Record([&](VkCommandBuffer cmd) {
-        g_.Mark(cmd, kProfDecode);   // before the work, so that its time is counted as it
-        const VkDescriptorSet image_set = decode_image_pipeline_ ? DecodeSet(t) : VK_NULL_HANDLE;
-        if (image_set) {
-            // Straight into the image: one barrier before (memory and the
-            // CLUT written before it), the image's own after.
-            if (d.clut) {
-                MemoryBarrier(cmd);
-                vkCmdUpdateBuffer(cmd, clut_, 0, 1024, d.clut);
-            }
+    // Straight into the image where it can be (see decode_image_pipeline_):
+    // one barrier for what wrote local memory and the CLUT before, the
+    // image's layout changes around the levels' dispatches - not a staging
+    // buffer, a copy and two full barriers a level, which on an integrated
+    // GPU were more than half its frame.
+    const VkDescriptorSet direct =
+        decode_image_pipeline_ && (t.usage & VK_IMAGE_USAGE_STORAGE_BIT) ? TextureStorageSet(t) : VK_NULL_HANDLE;
+    if (direct) {
+        g_.Record([&](VkCommandBuffer cmd) {
+            g_.Mark(cmd, kProfDecode);   // before the work, so that its time is counted as it
             MemoryBarrier(cmd);
+            if (d.clut) {
+                vkCmdUpdateBuffer(cmd, clut_, 0, 1024, d.clut);
+                MemoryBarrier(cmd);
+            }
             drawn_ = DrawState{};
             Transition(cmd, t, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-            const VkDescriptorSet sets[2] = {swizzle_set_, image_set};
+            const VkDescriptorSet sets[2] = {swizzle_set_, direct};
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, decode_image_pipeline_);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, swizzle_image_layout_, 0, 2, sets, 0, nullptr);
             std::uint32_t y = 0;
@@ -2869,16 +3073,20 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
                 DecodeParams params{n ? d.level_tbp[n] : d.tbp, n ? std::max(1u, d.level_tbw[n]) : d.tbw, d.psm,
                                     w, h, d.wms, d.wmt, d.minu >> n, d.maxu >> n, d.minv >> n, d.maxv >> n,
                                     d.texa_lo, d.ta1, d.csa};
-                params.y0 = y;
+                params.row0 = y;
                 vkCmdPushConstants(cmd, swizzle_image_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
                 ++g_dispatches;
                 vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+                g_.Mark(cmd, kProfDecode);
                 y += h;
             }
             Transition(cmd, t, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-            return;
-        }
+        });
+        return;
+    }
+    g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfDecode);   // before the work, so that its time is counted as it
         MemoryBarrier(cmd);
         if (d.clut) vkCmdUpdateBuffer(cmd, clut_, 0, 1024, d.clut);
         MemoryBarrier(cmd);
@@ -2914,34 +3122,6 @@ void VulkanGsRenderer::TextureFromMemory(std::uint64_t key, const GsTextureDecod
                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
         MemoryBarrier(cmd);
     });
-}
-
-/* A storage descriptor for a texture's image, for one decode: from the
-   current slot's pool, reset the first time the slot records again (its
-   command buffer before has run by then: Flush retires a slot before its
-   reuse). Null when the pool is full - the decode goes the old way. */
-VkDescriptorSet VulkanGsRenderer::DecodeSet(Image& image) {
-    const int slot = g_.slot();
-    VkDescriptorPool pool = decode_pools_[slot];
-    if (!pool) return VK_NULL_HANDLE;
-    if (decode_pool_recording_[slot] != g_.recording_id()) {
-        vkResetDescriptorPool(g_.device, pool, 0);
-        decode_pool_recording_[slot] = g_.recording_id();
-    }
-    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    ai.descriptorPool = pool;
-    ai.descriptorSetCount = 1;
-    ai.pSetLayouts = &image_set_layout_;
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    if (vkAllocateDescriptorSets(g_.device, &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
-    VkDescriptorImageInfo info{VK_NULL_HANDLE, image.view, VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    write.dstSet = set;
-    write.descriptorCount = 1;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    write.pImageInfo = &info;
-    vkUpdateDescriptorSets(g_.device, 1, &write, 0, nullptr);
-    return set;
 }
 
 /* A copy of the CLUT (slot 0) into a slot no pass open or set aside reads,
@@ -3072,7 +3252,9 @@ void VulkanGsRenderer::ReleaseTexture(std::uint64_t key) {
     g_.AfterSubmit([this, device, pool, texture]() mutable {
         for (VkDescriptorSet& set : texture.sets)
             if (set) vkFreeDescriptorSets(device, pool, 1, &set);
+        if (texture.image.storage) vkFreeDescriptorSets(device, texture_storage_pool_, 1, &texture.image.storage);
         if (texture.image.view) vkDestroyImageView(device, texture.image.view, nullptr);
+        if (texture.image.words) vkDestroyImageView(device, texture.image.words, nullptr);
         if (texture.image.image) vkDestroyImage(device, texture.image.image, nullptr);
         if (texture.image.memory)
             FreeImageMemory(texture.image.memory, texture.image.offset, texture.image.piece_class,
@@ -3367,13 +3549,24 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             last_flat_valid_ = true;
         }
     }
+    PackedVertex* out = pending_.Grow(count / 3 * 3);
     for (std::size_t i = 0; i + 2 < count; i += 3) {
-        for (int k = 0; k < 3; ++k) {
+        for (int k = 0; k < 3; ++k, ++out) {
             // Flat shading takes the colour of the triangle's last vertex.
             const GsVertex& c = state.gouraud ? v[i + k] : v[i + 2];
             const GsVertex& p = v[i + k];
-            pending_.push_back({p.x, p.y, c.r, c.g, c.b, c.a, p.s, p.t, p.q, p.z, p.fog, {0, 0, 0},
-                                {range[0], range[1], range[2], range[3]}, {0, 0, 0, 0}});
+            out->x = p.x;
+            out->y = p.y;
+            out->r = c.r;
+            out->g = c.g;
+            out->b = c.b;
+            out->a = c.a;
+            out->s = p.s;
+            out->t = p.t;
+            out->q = p.q;
+            out->z = p.z;
+            out->fog = p.fog;
+            for (int n = 0; n < 4; ++n) out->range[n] = range[n];
         }
     }
 }
@@ -3463,7 +3656,6 @@ void VulkanGsRenderer::Flush() {
     // target is twice as tall: the same memory), so it is one image.
     Image* depth = DepthFor(state_.depth ? state_.zbp : 0x10000u + state_.fbp, t->width,
                             state_.depth ? std::min(t->height, kDepthRows) : t->height);
-    const VkPipeline pipeline = PipelineFor(PipelineKey(state_));
     Texture* texture = &blank_;
     if (state_.textured) {
         auto found = textures_.find(state_.texture);
@@ -3482,6 +3674,7 @@ void VulkanGsRenderer::Flush() {
     VkDescriptorSet set = SetFor(*texture, sampler);
     // Render to texture: the target itself, or a copy when it is also drawn into.
     Image* source = nullptr;
+    const Image* bound = &texture->image;   // what the shader reads (its size, gs.frag's ImageSize)
     bool copy_first = false;
     const BlendWhy blend_why = ShaderBlendWhy(state_);
     const bool shader_blend = blend_why != kBlendNone;
@@ -3500,8 +3693,10 @@ void VulkanGsRenderer::Flush() {
                 feedback_ = &copy;
                 copy_first = true;
                 set = SampledSet(copy);
+                bound = &copy;
             } else {
                 set = SampledSet(*source);
+                bound = source;
             }
         }
     }
@@ -3584,56 +3779,24 @@ void VulkanGsRenderer::Flush() {
     params.maxv = state_.maxv;
     params.tw = state_.tw;
     params.th = state_.th;
+    // A cooked texture (UploadCooked): its alpha scaled back (bits 12-20),
+    // and block-compressed - no words to gather (bit 21).
     params.tex_format = source ? state_.tex_format : texture->replaced | texture->cooked;    // gs.frag's Replaced, Cooked
-    params.ta0 = state_.ta0;
-    params.ta1 = state_.ta1;
-    params.aem = state_.aem;
+    params.texa = (state_.ta0 & 0xFFu) | (state_.ta1 & 0xFFu) << 8 | (state_.aem ? 1u : 0u) << 16;
+    params.image_size = (bound->pw() & 0xFFFFu) | bound->ph() << 16;
     params.scale = source ? source->scale : 1;
     params.blend_ops = std::uint32_t(state_.a) | std::uint32_t(state_.b) << 2 | std::uint32_t(state_.c) << 4 |
                        std::uint32_t(state_.d) << 6;
     if (!state_.blend) params.blend_ops = 0;    // (A - B) * C + D as Cs - Cs + Cs: the source as it is
     if (state_.textured && t->scale > 1) params.blend_ops |= (t->scale & 0xFFu) << 8;
     if (Is16Bit(state_.psm)) params.blend_ops |= 1u << 16;    // gs.frag: colour cut to five bits a channel
-    // FAST SAMPLING (a tablet's default, FastSampling): a texture decoded as it
-    // is - its image TW x TH, one level, no texture pack's - wrapped by REPEAT
-    // or CLAMP, sampled by the GPU's own sampler (gs.frag's bit 12 of
-    // bilinear) rather than four texelFetch and the GS's wrapping and
-    // rounding by hand. The GS's bilinear weights are in sixteenths, the
-    // GPU's finer: a level here and there differs.
-    if (state_.textured && !source && texture != &blank_ && !texture->replaced && !texture->replacement &&
-        !(params.bilinear & 2u) && state_.wms <= 1 && state_.wmt <= 1 && texture->image.width == state_.tw &&
-        texture->image.height == state_.th && texture->image.scale <= 1 && !(params.blend_ops & (0xFFu << 8)) &&
-        FastSampling()) {
-        const int fast = (state_.bilinear ? 4 : 0) | (state_.wms ? 2 : 0) | (state_.wmt ? 1 : 0);
-        if (VkDescriptorSet fast_set = SetFor(*texture, fast)) {
-            set = fast_set;
-            params.bilinear |= 1u << 12;
-        }
-    }
-    // The shader's shape (kShapeShift): untextured, or a texture as it is.
-    std::uint32_t shape_bits = 0;
-    if (shapes_now_) {
-        if (!params.textured) shape_bits = 1u << kShapeShift;
-        else if (params.scale <= 1 && params.tex_format <= 2 && !(params.blend_ops & (0xFFu << 8)) &&
-                 !(params.bilinear & (1u << 12)))
-            shape_bits = (params.bilinear & ~1u ? 3u : 2u) << kShapeShift;
-        else if (source && params.scale <= 1 && params.tex_format == 4 && !(params.blend_ops & (0xFFu << 8)) &&
-                 !(params.bilinear & ~1u))
-            shape_bits = 4u << kShapeShift;
-    }
-    // Counted (RendererBreakdown): untextured, a texture as it is, the whole
-    // shader, through the CLUT, mipmapped.
-    {
-        const std::uint32_t shape = shape_bits >> kShapeShift;
-        ++g_shapes[shape == 1 ? 0 : shape == 2 ? 1 : shape == 0 ? 2 : shape == 4 ? 3 : 4];
-    }
     const std::uint32_t count = std::uint32_t(pending_.size());
     static int complaints = 0;
-    if ((!pipeline || !set) && complaints < 5) {
+    if (!set && complaints < 5) {
         ++complaints;
-        std::fprintf(stderr, "[ps2gpu] a batch was dropped: %s\n", pipeline ? "no descriptor set" : "no pipeline");
+        std::fprintf(stderr, "[ps2gpu] a batch was dropped: no descriptor set\n");
     }
-    if (pipeline && set) {
+    if (set) {
         g_.RecordInPass([&](VkCommandBuffer cmd) {
             // Barriers and copies cannot go inside a rendering pass: a batch
             // needing one, or drawing elsewhere, ends the open pass first.
@@ -3948,20 +4111,23 @@ void VulkanGsRenderer::Flush() {
                     std::uint32_t keep = kept;
                     for (int channel = 0; channel < 4; ++channel)
                         if (!(pass.write_mask >> channel & 1)) keep |= 0xFFu << (8 * channel);
-                    // Nothing this pass draws can be dropped: the pipeline without discard.
-                    // Only on a tile-based GPU (MoltenVK) by default: on lavapipe,
-                    // which removes no hidden pixels, the race's pictures took ~5%
-                    // more GPU time so (427 -> 450 ms a picture, 18 Oct).
-                    static const bool discard_always = [this] {
-                        const char* v = std::getenv("PS2GPU_DISCARD_ALWAYS");
-                        if (v && *v) return *v != '0';
-                        return !g_.portability;
-                    }();
-                    const std::uint32_t no_discard = pass.mode == 2 && half == 0 && !discard_always ? kNoDiscard : 0u;
                     for (std::uint32_t op = logic ? 1 : 0; op <= (logic ? 2u : 0u); ++op) {
-                        const std::uint32_t op_key = (op ? ((key & (0xFu << 9)) | op << 13) : key) | no_discard | shape_bits;
-                        const VkPipeline chosen = op_key == PipelineKey(state_) ? pipeline : PipelineFor(op_key);
-                        if (!chosen) continue;
+                        const std::uint32_t op_key = op ? ((key & (0xFu << 9)) | op << 13) : key;
+                        params.afail = pass.mode;
+                        params.pabe = half;
+                        params.logic = merge ? 3u : op;
+                        // PS2HOST_GPU_UBERSHADER=1: every draw with the whole shader.
+                        static const bool whole = std::getenv("PS2HOST_GPU_UBERSHADER") != nullptr;
+                        const std::uint32_t full_key =
+                            whole ? op_key : op_key | ((~Features(params) & kFeatureBits) << kFeatureShift);
+                        const VkPipeline chosen = PipelineFor(full_key);
+                        if (!chosen) {
+                            if (complaints < 5) {
+                                ++complaints;
+                                std::fprintf(stderr, "[ps2gpu] a batch was dropped: no pipeline\n");
+                            }
+                            continue;
+                        }
                         if (d.pipeline != chosen) {
                             d.pipeline = chosen;
                             vkCmdBindPipeline(dc, VK_PIPELINE_BIND_POINT_GRAPHICS, chosen);
@@ -3969,9 +4135,6 @@ void VulkanGsRenderer::Flush() {
                         const int depth_write = pass.depth_write && op != 1 ? 1 : 0;
                         if (d.depth_write != depth_write)
                             vkCmdSetDepthWriteEnable(dc, VkBool32(d.depth_write = depth_write));
-                        params.afail = pass.mode;
-                        params.pabe = half;
-                        params.logic = merge ? 3u : op;
                         params.keep = keep;
                         vkCmdPushConstants(dc, layout_, VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset,
                                            sizeof params, &params);
@@ -4130,11 +4293,17 @@ bool VulkanGsRenderer::ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uin
 }
 
 VulkanGsRenderer::~VulkanGsRenderer() {
-    stop_prewarm_ = true;
-    if (prewarm_.joinable()) prewarm_.join();
-    SaveCaches();
-    for (auto& [key, pipeline] : prewarmed_) vkDestroyPipeline(g_.device, pipeline, nullptr);
-    prewarmed_.clear();
+    if (pipeline_worker_.joinable()) {
+        {
+            std::lock_guard<std::mutex> hold(pipeline_lock_);
+            pipeline_stop_ = true;
+        }
+        pipeline_wake_.notify_one();
+        pipeline_worker_.join();
+    }
+    for (const auto& [key, pipeline] : pipelines_made_)
+        if (pipeline) pipelines_.emplace(key, pipeline);
+    while (cache_saving_.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     g_.Submit();                    // (the writes held back go first)
     g_.before_record = nullptr;
     g_.end_pass = nullptr;
@@ -4165,7 +4334,6 @@ VulkanGsRenderer::~VulkanGsRenderer() {
             vkFreeMemory(g_.device, chunk.memory, nullptr);
         }
     for (auto& [key, pipeline] : pipelines_) vkDestroyPipeline(g_.device, pipeline, nullptr);
-    if (pipeline_cache_) vkDestroyPipelineCache(g_.device, pipeline_cache_, nullptr);
     if (date_pipeline_) vkDestroyPipeline(g_.device, date_pipeline_, nullptr);
     for (VkSampler s : samplers_)
         if (s) vkDestroySampler(g_.device, s, nullptr);
@@ -4177,15 +4345,19 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (frag_) vkDestroyShaderModule(g_.device, frag_, nullptr);
     if (frag_blend_) vkDestroyShaderModule(g_.device, frag_blend_, nullptr);
     if (swizzle_pipeline_) vkDestroyPipeline(g_.device, swizzle_pipeline_, nullptr);
+    for (auto& format : swizzle_image_specialised_)
+        for (auto& direction : format)
+            for (VkPipeline pipeline : direction)
+                if (pipeline) vkDestroyPipeline(g_.device, pipeline, nullptr);
     if (swizzle_layout_) vkDestroyPipelineLayout(g_.device, swizzle_layout_, nullptr);
     if (swizzle_pool_) vkDestroyDescriptorPool(g_.device, swizzle_pool_, nullptr);
+    if (texture_storage_pool_) vkDestroyDescriptorPool(g_.device, texture_storage_pool_, nullptr);
+    if (cache_) vkDestroyPipelineCache(g_.device, cache_, nullptr);
     if (swizzle_set_layout_) vkDestroyDescriptorSetLayout(g_.device, swizzle_set_layout_, nullptr);
     if (swizzle_) vkDestroyShaderModule(g_.device, swizzle_, nullptr);
     if (decode_pipeline_) vkDestroyPipeline(g_.device, decode_pipeline_, nullptr);
     if (decode_image_pipeline_) vkDestroyPipeline(g_.device, decode_image_pipeline_, nullptr);
     if (decode_image_) vkDestroyShaderModule(g_.device, decode_image_, nullptr);
-    for (VkDescriptorPool pool : decode_pools_)
-        if (pool) vkDestroyDescriptorPool(g_.device, pool, nullptr);
     if (decode_) vkDestroyShaderModule(g_.device, decode_, nullptr);
     if (input_set_layout_) vkDestroyDescriptorSetLayout(g_.device, input_set_layout_, nullptr);
     // The swizzle on images and depth buffers, the memory patch, depth loads.
@@ -4202,7 +4374,7 @@ VulkanGsRenderer::~VulkanGsRenderer() {
         if (l) vkDestroyDescriptorSetLayout(g_.device, l, nullptr);
     if (storage_pool_) vkDestroyDescriptorPool(g_.device, storage_pool_, nullptr);
     for (auto [buffer, memory] : {std::pair{gsmem_, gsmem_memory_}, std::pair{linear_, linear_memory_},
-                                  std::pair{clut_, clut_memory_}}) {
+                                  std::pair{clut_, clut_memory_}, std::pair{tables_, tables_memory_}}) {
         if (buffer) vkDestroyBuffer(g_.device, buffer, nullptr);
         if (memory) vkFreeMemory(g_.device, memory, nullptr);
     }
@@ -4297,137 +4469,6 @@ std::string GpuProfileReport() {
     return out;
 }
 
-// ------------------------------------------------------------------ the pipeline cache
-
-void SetCacheDirectory(const std::string& directory) { g_cache_dir = directory; }
-
-std::string PipelineCacheReport() {
-    char text[200];
-    std::snprintf(text, sizeof text,
-                  "pipelines: %llu of %llu listed built ahead of need (%llu of them used), %llu asked for before "
-                  "they were ready; the driver's cache %llu KB loaded",
-                  (unsigned long long)g_prewarmed.load(), (unsigned long long)g_prewarm_listed,
-                  (unsigned long long)g_prewarm_used.load(), (unsigned long long)g_prewarm_missed.load(),
-                  (unsigned long long)(g_cache_loaded_bytes >> 10));
-    return text;
-}
-
-namespace {
-
-bool PipelineCacheWanted() {
-    const char* v = std::getenv("PS2GPU_PIPELINE_CACHE");
-    return !g_cache_dir.empty() && !(v && v[0] == '0');
-}
-
-std::uint64_t Fnv(const void* data, std::size_t bytes, std::uint64_t h = 0xCBF29CE484222325ull) {
-    const unsigned char* p = static_cast<const unsigned char*>(data);
-    for (std::size_t i = 0; i < bytes; ++i) h = (h ^ p[i]) * 0x100000001B3ull;
-    return h;
-}
-
-// Written beside, then put in place: a run ended halfway leaves the old file.
-void WriteWhole(const std::filesystem::path& path, const void* data, std::size_t bytes) {
-    std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    const std::filesystem::path temporary = path.string() + ".new";
-    {
-        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
-        if (!out) return;
-        out.write(static_cast<const char*>(data), std::streamsize(bytes));
-        if (!out) return;
-    }
-    std::filesystem::rename(temporary, path, ec);
-}
-
-}  // namespace
-
-std::uint64_t VulkanGsRenderer::ShaderStamp() const {
-    // What a key's pipeline is made from: the shaders, the device's ways.
-    std::uint64_t h = Fnv(spirv_gs_vert, sizeof spirv_gs_vert);
-    h = Fnv(spirv_gs_frag, sizeof spirv_gs_frag, h);
-    h = Fnv(spirv_gs_frag_single, sizeof spirv_gs_frag_single, h);
-    h = Fnv(spirv_gs_frag_blend, sizeof spirv_gs_frag_blend, h);
-    h = Fnv(spirv_gs_frag_blend_local, sizeof spirv_gs_frag_blend_local, h);
-    const std::uint32_t ways[4] = {g_.dual_source, g_.local_read, g_.logic_op, std::uint32_t(sizeof(PackedVertex))};
-    h = Fnv(ways, sizeof ways, h);
-    VkPhysicalDeviceProperties properties{};
-    vkGetPhysicalDeviceProperties(g_.gpu, &properties);
-    h = Fnv(&properties.vendorID, sizeof properties.vendorID, h);
-    h = Fnv(&properties.deviceID, sizeof properties.deviceID, h);
-    h = Fnv(&properties.driverVersion, sizeof properties.driverVersion, h);
-    return h;
-}
-
-void VulkanGsRenderer::LoadPipelineCache() {
-    std::vector<char> initial;
-    const bool wanted = PipelineCacheWanted();
-    const std::uint64_t stamp = wanted ? ShaderStamp() : 0;
-    if (wanted) {
-        const std::filesystem::path dir(g_cache_dir);
-        // The driver's data, after our stamp (the driver checks its own header).
-        std::ifstream in(dir / "pipelines.vkcache", std::ios::binary);
-        std::uint64_t file_stamp = 0;
-        if (in && in.read(reinterpret_cast<char*>(&file_stamp), sizeof file_stamp) && file_stamp == stamp)
-            initial.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
-        // The keys the last runs made: "stamp <hex>" first, then one a line.
-        std::ifstream keys(dir / "pipelines.keys");
-        std::string line;
-        if (keys && std::getline(keys, line) && line == "stamp " + std::to_string(stamp)) {
-            while (std::getline(keys, line))
-                if (!line.empty()) listed_keys_.push_back(std::uint32_t(std::strtoul(line.c_str(), nullptr, 16)));
-            listed_sorted_ = listed_keys_;
-            std::sort(listed_sorted_.begin(), listed_sorted_.end());
-            listed_sorted_.erase(std::unique(listed_sorted_.begin(), listed_sorted_.end()), listed_sorted_.end());
-        }
-    }
-    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
-    ci.initialDataSize = initial.size();
-    ci.pInitialData = initial.empty() ? nullptr : initial.data();
-    if (vkCreatePipelineCache(g_.device, &ci, nullptr, &pipeline_cache_) != VK_SUCCESS) {
-        // Data the driver will not take: an empty cache.
-        ci.initialDataSize = 0;
-        ci.pInitialData = nullptr;
-        initial.clear();
-        if (vkCreatePipelineCache(g_.device, &ci, nullptr, &pipeline_cache_) != VK_SUCCESS)
-            pipeline_cache_ = VK_NULL_HANDLE;
-    }
-    g_cache_loaded_bytes = initial.size();
-    g_prewarm_listed = listed_keys_.size();
-    if (wanted)
-        std::fprintf(stderr, "[gpu] pipeline cache: %zu KB of the driver's, %zu pipelines listed to build ahead (%s)\n",
-                     initial.size() >> 10, listed_keys_.size(), g_cache_dir.c_str());
-}
-
-void VulkanGsRenderer::SaveCaches() {
-    if (!PipelineCacheWanted() || !pipeline_cache_) return;
-    if (pipelines_.size() == saved_pipelines_) return;            // nothing new since
-    saved_pipelines_ = pipelines_.size();
-    const std::uint64_t stamp = ShaderStamp();
-    const std::filesystem::path dir(g_cache_dir);
-    std::size_t bytes = 0;
-    if (vkGetPipelineCacheData(g_.device, pipeline_cache_, &bytes, nullptr) == VK_SUCCESS && bytes) {
-        std::vector<char> data(sizeof stamp + bytes);
-        std::memcpy(data.data(), &stamp, sizeof stamp);
-        if (vkGetPipelineCacheData(g_.device, pipeline_cache_, &bytes, data.data() + sizeof stamp) == VK_SUCCESS) {
-            data.resize(sizeof stamp + bytes);
-            WriteWhole(dir / "pipelines.vkcache", data.data(), data.size());
-        }
-    }
-    // The keys this run asked for, in that order, then the ones listed that
-    // it has not (a run that never reached the race keeps the race's).
-    std::vector<std::uint32_t> keys;
-    std::unordered_map<std::uint32_t, bool> kept;
-    for (const std::uint32_t key : asked_order_)
-        if (kept.emplace(key, true).second) keys.push_back(key);
-    for (const std::uint32_t key : listed_keys_)
-        if (kept.emplace(key, true).second) keys.push_back(key);
-    std::ostringstream text;
-    text << "stamp " << stamp << "\n" << std::hex;
-    for (const std::uint32_t key : keys) text << key << "\n";
-    const std::string out = text.str();
-    WriteWhole(dir / "pipelines.keys", out.data(), out.size());
-}
-
 std::string RendererCounters() {
     static std::uint64_t last[8] = {};
     const std::uint64_t now[8] = {g_barriers, g_transitions, g_dispatches, g_draws, g_passes, g_feedback, g_pipelines,
@@ -4500,11 +4541,6 @@ std::string RendererBreakdown(const char* prefix) {
                   delta(g_date_batches, &last_more[2]), delta(g_aux_passes, &last_more[3]),
                   double(delta(g_pass_pixels, &last_more[4])) / 1e6);
     out += text;
-    static std::uint64_t last_shapes[5] = {};
-    std::snprintf(text, sizeof text, "\n%sbatches by shader: untextured %llu, plain texture %llu; whole shader %llu; a target through the CLUT %llu; mipmapped %llu",
-                  prefix, delta(g_shapes[0], &last_shapes[0]), delta(g_shapes[1], &last_shapes[1]),
-                  delta(g_shapes[2], &last_shapes[2]), delta(g_shapes[3], &last_shapes[3]), delta(g_shapes[4], &last_shapes[4]));
-    out += text;
     const unsigned long long local = delta(g_local_reads, &last_more[5]), barriers = delta(g_local_barriers, &last_more[6]);
     if (local) {
         std::snprintf(text, sizeof text, "; read in place %llu, %llu of them after a barrier", local, barriers);
@@ -4526,6 +4562,9 @@ std::string SubmitStats() {
     }
     return out;
 }
+
+void SetPipelineCacheDir(const std::string& dir) { g_pipeline_cache_dir = dir; }
+void SetPipelineHints(const std::uint32_t* keys, std::size_t count) { g_pipeline_hints.assign(keys, keys + count); }
 
 std::unique_ptr<GsRenderer> CreateGsRenderer(Gpu& gpu, std::string* error) {
     auto renderer = std::make_unique<VulkanGsRenderer>(static_cast<VulkanGpu&>(gpu));

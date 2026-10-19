@@ -155,6 +155,16 @@ void Gs::Words(int path, const u32* words, u32 count, u32 from) {
             i += 4 * qwords;
             continue;
         }
+        // DMA already supplies complete quadwords. Avoid assembling those
+        // through four Word calls; retain that path for fragmented packets.
+        // Word's fourth write supplies the diagnostic source address.
+        if (p.pending_count == 0 && count - i >= 4) {
+            if (from != kNoSource) dma_source_ = from + 4 * (i + 3);
+            Qword(path, u64(words[i]) | u64(words[i + 1]) << 32,
+                  u64(words[i + 2]) | u64(words[i + 3]) << 32);
+            i += 4;
+            continue;
+        }
         if (from != kNoSource) dma_source_ = from + 4 * i;
         Word(path, words[i++]);
     }
@@ -291,7 +301,12 @@ void Gs::WriteRegister(u32 address, u64 value) {
             LoadClut(tex0);
             break;
         }
-        case 0x18: case 0x19: ctx_[address - 0x18].xyoffset = value; break;
+        case 0x18: case 0x19:
+            if (trace && value != ctx_[address - 0x18].xyoffset)
+                std::fprintf(trace_out, "[gs] xyoffset_%u (%u, %u)\n", unsigned(address - 0x17),
+                             unsigned(value & 0xFFFF) / 16, unsigned((value >> 32) & 0xFFFF) / 16);
+            ctx_[address - 0x18].xyoffset = value;
+            break;
         case 0x1A: prmodecont_ = value; break;
         case 0x1B: prmode_ = value; break;
         case 0x1C: texclut_ = value; break;
@@ -367,8 +382,8 @@ void Gs::TransferBlock(const u8* data, u32 qwords) {
         u32 n = 0;
         switch (psm) {
             case PSMCT32: case PSMZ32:
-                for (u32 i = 0; i < size; i += 4)
-                    pixels[n++] = u32(bytes[i]) | u32(bytes[i + 1]) << 8 | u32(bytes[i + 2]) << 16 | u32(bytes[i + 3]) << 24;
+                std::memcpy(pixels, bytes, size);       // little-endian words, as the GS takes them
+                n = size / 4;
                 break;
             case PSMCT24: case PSMZ24:
                 // 24-bit pixels run across quadwords: gather bytes.
@@ -378,7 +393,11 @@ void Gs::TransferBlock(const u8* data, u32 qwords) {
                 }
                 break;
             case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S:
-                for (u32 i = 0; i < size; i += 2) pixels[n++] = u32(bytes[i]) | u32(bytes[i + 1]) << 8;
+                for (u32 i = 0; i < size; i += 2) {
+                    std::uint16_t half;
+                    std::memcpy(&half, bytes + i, 2);
+                    pixels[n++] = half;
+                }
                 break;
             case PSMT8: case PSMT8H:
                 for (u32 i = 0; i < size; ++i) pixels[n++] = bytes[i];

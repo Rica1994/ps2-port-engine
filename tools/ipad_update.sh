@@ -1,9 +1,12 @@
 #!/bin/bash
 # The Mac's step between iPad builds, from the game repository's root:
 #
-#   engine/tools/ipad_update.sh [--pc http://192.168.1.20:8765] [--game games/burnout3]
+#   engine/tools/ipad_update.sh [--pc http://192.168.1.20:8765] [--game games/burnout3] [--iso <disc>]
 #
 # 1. the sources: git pull, and the engine submodule to what the game names;
+#    the game's executable and its analysis, from the disc, if not there yet
+#    (engine/tools/analysis_ready.py: the disc beside the repository unless
+#    --iso says);
 # 2. the VU programs compiled ahead on the PC (engine/tools/ipad_reports.py
 #    there), when they changed: into the game's build/port/generated;
 # 3. the Xcode project brought up to date (new files, the PC's address for
@@ -14,10 +17,12 @@
 set -euo pipefail
 GAME="games/burnout3"
 PC=""
+ISO=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --pc) PC="$2"; shift 2 ;;
         --game) GAME="$2"; shift 2 ;;
+        --iso) ISO="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -36,6 +41,12 @@ echo "== the sources"
 git pull --ff-only
 git submodule update --init --recursive
 git -C engine log -1 --format='engine at %h: %s'
+
+echo "== the game's executable and its analysis"
+# Code lifted at build time (Burnout 3's mods) is lifted from them: taken from
+# the disc beside the repository the first time (about a minute), then kept.
+python3 engine/tools/analysis_ready.py --game "$GAME" ${ISO:+--iso "$ISO"} || \
+    echo "(not made: the build's own lifting step will say what it lacks)"
 
 GENERATED="$GAME/build/port/generated"
 if [ -n "$PC" ]; then

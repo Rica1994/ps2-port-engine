@@ -12,10 +12,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <set>
+#include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "ps2host/disc.h"
@@ -40,7 +43,11 @@ namespace ps2host {
    drew (the dump's picture): a GS fault or one before it, told apart.
    PS2HOST_REPLAY_GPU=1: the GPU renderer draws instead (as --gpu), each
    picture to <dir>/gpu_<n>/ (screen.bmp at the internal resolution,
-   PS2HOST_REPLAY_SCALE, default 1; screen_1x.bmp). */
+   PS2HOST_REPLAY_SCALE, default 1; screen_1x.bmp).
+   PS2HOST_REPLAY_REPEAT=n: then the stream n times more, its pictures not
+   written, timed - the GS thread's work for a capture's frames (the GS model,
+   the GPU bridge, the renderer's recording), the same every run; with
+   PS2HOST_REPLAY_SAMPLE=1 sampled too (the sampler's report after). */
 int GsReplay(const std::string& file, const std::string& out) {
     std::FILE* f = std::fopen(file.c_str(), "rb");
     if (!f) {
@@ -83,6 +90,12 @@ int GsReplay(const std::string& file, const std::string& out) {
     auto u64_at = [&](std::size_t o) { u64 v; std::memcpy(&v, data.data() + o, 8); return v; };
     int pictures = 0;
     std::vector<u32> words;
+    const std::size_t stream = at;
+    bool timing = false;                // PS2HOST_REPLAY_REPEAT's passes: nothing written
+    const int repeat = std::getenv("PS2HOST_REPLAY_REPEAT") ? std::atoi(std::getenv("PS2HOST_REPLAY_REPEAT")) : 0;
+    int pass = 0;
+    std::chrono::steady_clock::time_point started;
+    for (;;) {
     while (at < data.size()) {
         const char kind = char(data[at++]);
         if (kind == 'R') {
@@ -117,6 +130,10 @@ int GsReplay(const std::string& file, const std::string& out) {
             }
         } else if (kind == 'V') {
             g.Finish();
+            if (timing) {
+                if (gpu) GpuShadowFrame(u64(pictures), std::string());
+                continue;
+            }
             if (trace) std::fprintf(trace, "[gs] ---- vertical blank %d\n", pictures);
             if (gpu) {
                 GpuShadowFrame(u64(pictures), std::string());
@@ -131,7 +148,34 @@ int GsReplay(const std::string& file, const std::string& out) {
             return 65;
         }
     }
+    if (pass == 0 && trace) {           // the trace of the first pass alone
+        g.trace = false;
+        g.trace_out = stderr;
+        std::fclose(trace);
+        trace = nullptr;
+    }
+    if (pass == 0) {
+        if (repeat > 0 && std::getenv("PS2HOST_REPLAY_SAMPLE")) {
+            StartSampler();
+            SetSampleFrom(0);
+            SampleFrame(0);
+        }
+        started = std::chrono::steady_clock::now();
+    }
+    if (pass++ >= repeat) break;
+    timing = true;
+    at = stream;
+    }
     g.Finish();
+    if (repeat > 0) {
+        // To the last drawn: a block read back waits for the GPU (and for a
+        // renderer on a thread of its own, its queue).
+        if (gpu && g.on_memory) g.on_memory(0, 1, false);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+        std::fprintf(stderr, "gs-replay: %d passes, %.2f ms a pass (%d pictures each)\n", repeat, ms / repeat, pictures);
+        if (std::getenv("PS2HOST_REPLAY_SAMPLE"))
+            std::printf("%s", SampleReport(std::getenv("PS2HOST_SAMPLE_TOP") ? std::atoi(std::getenv("PS2HOST_SAMPLE_TOP")) : 30).c_str());
+    }
     if (gpu && g.on_memory) g.on_memory(0, 16384, false);     // what the GPU drew, into local memory first
     if (std::FILE* m = std::fopen((out + "/gsmem.bin").c_str(), "wb")) {      // local memory at the end
         std::fwrite(g.memory.data(), 1, kMemory, m);
@@ -168,9 +212,45 @@ struct CachedCall {
 constexpr std::size_t kCallCache = 1u << 14;
 CachedCall g_call_cache[kCallCache];
 
+const OverlayEntry* g_overlays = nullptr;
+std::size_t g_overlay_count = 0;
+
+// The function of the overlay whose code is in memory at `address`, if the
+// address is in an overlay and one is: its first bytes there are the original's.
+// OverrideInOverlay's: (overlay name, address) -> the host's function.
+std::map<std::pair<std::string, u32>, FunctionEntry> g_overlay_overrides;
+
+const FunctionEntry* FindInOverlay(u32 address, bool* in_overlay) {
+    for (std::size_t i = 0; i < g_overlay_count; ++i) {
+        const OverlayEntry& o = g_overlays[i];
+        if (address < o.start || address >= o.end) continue;
+        *in_overlay = true;
+        const FunctionEntry* end = o.table + o.count;
+        const FunctionEntry* at = std::lower_bound(
+            o.table, end, address, [](const FunctionEntry& e, u32 a) { return e.address < a; });
+        if (at == end || at->address != address) continue;
+        const u32* check = o.checks + 4 * (at - o.table);
+        const u32 length = at->size && at->size < 16 ? at->size : 16;
+        const u8* here = GuestMemory().Translate(address, length);
+        if (here && std::memcmp(here, check, length) == 0) {
+            if (!g_overlay_overrides.empty()) {
+                const auto mine = g_overlay_overrides.find({o.name, address});
+                if (mine != g_overlay_overrides.end()) return &mine->second;
+            }
+            return at;
+        }
+    }
+    return nullptr;
+}
+
 const FunctionEntry* Find(u32 address) {
     auto found = g_overrides.find(address);
     if (found != g_overrides.end()) return &found->second;
+    if (g_overlay_count) {
+        bool in_overlay = false;
+        const FunctionEntry* entry = FindInOverlay(address, &in_overlay);
+        if (entry || in_overlay) return entry;
+    }
     const FunctionEntry* end = g_table + g_count;
     const FunctionEntry* at = std::lower_bound(
         g_table, end, address, [](const FunctionEntry& e, u32 a) { return e.address < a; });
@@ -236,6 +316,9 @@ u32 FindSource(u32 address) {
     // Code in the executable itself that no function starts at - a tail call's
     // target the analysis missed - is its own source.
     if (address >= g_image_start && address < g_image_end) return address;
+    // So is code in an overlay's range: port.py translates it from the overlay.
+    for (std::size_t i = 0; i < g_overlay_count; ++i)
+        if (address >= g_overlays[i].start && address < g_overlays[i].end) return address;
     constexpr u32 kPattern = 32;
     Memory& memory = GuestMemory();
     const u8* here = memory.Translate(address, kPattern);
@@ -258,8 +341,24 @@ void RegisterFunctions(const FunctionEntry* table, std::size_t count) {
     ApplySdkOverrides(table, count);
 }
 
+void RegisterOverlays(const OverlayEntry* overlays, std::size_t count) {
+    g_overlays = overlays;
+    g_overlay_count = count;
+    CodeChanged();
+}
+
+void CodeChanged() {
+    if (!g_overlay_count) return;           // the executable's code never moves
+    for (CachedCall& line : g_call_cache) line = CachedCall{};
+}
+
 void Override(u32 address, GuestFunction function, const char* name) {
     g_overrides[address] = FunctionEntry{address, function, name, 0};
+    for (CachedCall& line : g_call_cache) line = CachedCall{};
+}
+
+void OverrideInOverlay(const char* overlay, u32 address, GuestFunction function, const char* name) {
+    g_overlay_overrides[{overlay, address}] = FunctionEntry{address, function, name, 0};
     for (CachedCall& line : g_call_cache) line = CachedCall{};
 }
 
@@ -269,6 +368,21 @@ const char* FunctionName(u32 address) {
 }
 
 bool Tracing() { return g_trace; }
+
+bool NotingAll() { return g_all_notes; }
+
+namespace {
+bool g_fast_disc = false, g_fast_loading_default = false;
+}  // namespace
+
+bool FastDisc() { return g_fast_disc; }
+void SetFastDisc(bool on) { g_fast_disc = on; }
+void SetFastLoadingDefault(bool on) { g_fast_loading_default = on; }
+bool g_vu_fast_default = false;
+void SetVuFastDefault(bool on) { g_vu_fast_default = on; }
+bool g_frame_pacing_default = true;
+void SetFramePacingDefault(bool on) { g_frame_pacing_default = on; }
+bool FramePacingDefault() { return g_frame_pacing_default; }
 
 Stats& RunStats() {
     static Stats stats;
@@ -550,7 +664,10 @@ void Report(const Options& options, const std::string& outcome) {
     if (!samples.empty()) std::printf("%s", samples.c_str());
     if (!GpuShadowSummary().empty()) std::printf("%s\n", GpuShadowSummary().c_str());
     std::printf("kernel services used:\n");
-    for (const auto& [service, count] : stats.syscalls)
+    std::map<s32, u64> services = stats.syscalls;
+    for (s32 i = 0; i < 0x200; ++i)
+        if (stats.syscall_counts[i]) services[i - 0x100] += stats.syscall_counts[i];
+    for (const auto& [service, count] : services)
         std::printf("  %4d  %-24s x%llu\n", service, SyscallName(service),
                     (unsigned long long)count);
     auto registers = [&](const char* title, const std::map<u32, u64>& seen) {
@@ -571,8 +688,8 @@ void Report(const Options& options, const std::string& outcome) {
         for (std::size_t i = 0; i < hot.size() && i < std::size_t(options.report_limit); ++i)
             std::printf("  %-40s x%llu\n", Describe(hot[i].second).c_str(), (unsigned long long)hot[i].first);
     }
-    registers("device registers read", stats.register_reads);
-    registers("device registers written", stats.register_writes);
+    registers("device registers read", GuestMemory().RegisterCounts(false));
+    registers("device registers written", GuestMemory().RegisterCounts(true));
     for (const auto& [run, source] : stats.discovered)
         std::printf("discovered: code at %s is a copy of %s\n", Hex(run).c_str(), Hex(source).c_str());
     if (!options.discover_path.empty()) {
@@ -674,6 +791,8 @@ int Run(const Options& options) {
         }
         LoadSettings((where / "pc_settings.ini").string());
     }
+    g_fast_disc = options.fast_disc || (!options.virtual_time && SettingOn("fast_loading", g_fast_loading_default));
+    if (g_fast_disc) std::fprintf(stderr, "[host] disc reads fast (no drive time)\n");
     // --setting KEY=VALUE: a scripted run's own (a wider picture), for this run.
     for (const std::string& setting : options.settings) {
         const auto equals = setting.find('=');
@@ -694,12 +813,16 @@ int Run(const Options& options) {
     if (!options.memcard.empty()) mc2::SetCardDirectory(options.memcard);
     if (options.vu_interpret) Vu1().use_compiled = Vu0().use_compiled = false;
     // Fast VU1 (docs/PORTING.md "Fast mode": exact but for flags nothing
-    // reads; ~15% less VU1 time) by default on a tablet, whose VU1 is the
-    // race's wall; PS2HOST_VU_EXACT=1 turns it off there.
+    // reads; ~15% less VU1 time): a game's default, and a tablet's (whose VU1
+    // is the race's wall); --vu-exact, PS2HOST_VU_EXACT=1 or the vu_fast
+    // setting turn it off.
     {
         const char* exact = std::getenv("PS2HOST_VU_EXACT");
-        Vu1().fast = options.vu_fast || (platform::kMobile && !(exact && *exact && *exact != '0'));
-        if (Vu1().fast) std::fprintf(stderr, "[host] VU1 fast mode (the MAC and STATUS flags no program reads left out)\n");
+        const bool exact_asked = options.vu_exact || (exact && *exact && *exact != '0');
+        Vu1().fast = options.vu_fast ||
+                     ((g_vu_fast_default || platform::kMobile) && !exact_asked && SettingOn("vu_fast", true));
+        if (Vu1().fast && !options.vu_fast)
+            std::fprintf(stderr, "[host] VU1 fast mode (the MAC and STATUS flags no program reads left out; --vu-exact for them)\n");
     }
     SetUntilFrame(options.until_frame);
     SetFrameTimes(options.frame_times);
@@ -722,6 +845,11 @@ int Run(const Options& options) {
     for (const auto& press : options.presses)
         if (!ScriptPress(press.button, press.from, press.to, press.pressure))
             std::fprintf(stderr, "--press: no button %s\n", press.button.c_str());
+    if (!options.record_input.empty() && !RecordInput(options.record_input))
+        std::fprintf(stderr, "--record-input: cannot write %s\n", options.record_input.c_str());
+    if (!options.replay_input.empty() && !ReplayInput(options.replay_input))
+        std::fprintf(stderr, "--replay-input: nothing to read in %s\n", options.replay_input.c_str());
+    SetPaced(options.paced);
     if (!options.frames_dir.empty())
         SetFrameDumps(options.frames_dir, options.frames_every, 200, u64(options.frames_from));
     g_watch = options.watch;
@@ -779,6 +907,22 @@ int Run(const Options& options) {
 }
 
 int Main(int argc, char** argv) {
+    // PS2HOST_CORES=N: the process held to its first N logical cores from
+    // the start, before any thread (the GPU driver's pools too) is made - a
+    // machine with that many, to measure a low-end one on a big one. Or a
+    // mask (0x5: logical cores 0 and 2 - two physical cores where the first
+    // ones are hyperthreaded pairs).
+    if (const char* cores = std::getenv("PS2HOST_CORES")) {
+        std::uint64_t mask = 0;
+        if (cores[0] == '0' && (cores[1] == 'x' || cores[1] == 'X')) {
+            mask = std::strtoull(cores + 2, nullptr, 16);
+        } else {
+            const int n = std::atoi(cores);
+            if (n > 0 && n < 64) mask = (std::uint64_t(1) << n) - 1;
+        }
+        if (mask && platform::HoldToCores(mask))
+            std::fprintf(stderr, "[host] held to cores 0x%llX (PS2HOST_CORES)\n", (unsigned long long)mask);
+    }
     Options options;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -801,6 +945,7 @@ int Main(int argc, char** argv) {
         else if (arg == "--sample-gs") options.sample = options.sample_gs = true;
         else if (arg == "--sample-vif1") options.sample = options.sample_vif1 = true;
         else if (arg == "--vif1-sync") options.vif1_sync = true;
+        else if (arg == "--fast-disc") options.fast_disc = true;
         else if (arg == "--check-guesses") options.check_guesses = true;
         else if (arg == "--vu-snapshot" && i + 3 < argc) {
             options.vu_snapshot = argv[++i];
@@ -819,6 +964,7 @@ int Main(int argc, char** argv) {
         else if (arg == "--vu-record" && i + 1 < argc) options.vu_record = argv[++i];
         else if (arg == "--vu-interpret") options.vu_interpret = true;
         else if (arg == "--vu-fast") options.vu_fast = true;
+        else if (arg == "--vu-exact") options.vu_exact = true;
         else if (arg == "--memcard" && i + 1 < argc) options.memcard = argv[++i];
         else if (arg == "--setting" && i + 1 < argc) options.settings.push_back(argv[++i]);
         else if (arg == "--audio") options.audio = true;
@@ -840,6 +986,23 @@ int Main(int argc, char** argv) {
                 options.presses.push_back({spec.substr(0, at), from, to, pressure});
             }
         }
+        else if (arg == "--key" && i + 1 < argc) {
+            // --key NAME@FROM[-TO]: a key held (six frames without TO).
+            const std::string spec = argv[++i];
+            const std::size_t at = spec.find('@');
+            bool ok = at != std::string::npos;
+            if (ok) {
+                const std::string when = spec.substr(at + 1);
+                const std::size_t dash = when.find('-');
+                const u64 from = std::stoull(when.substr(0, dash));
+                const u64 to = dash == std::string::npos ? from + 5 : std::stoull(when.substr(dash + 1));
+                ok = ScriptKey(spec.substr(0, at), from, to);
+            }
+            if (!ok) std::fprintf(stderr, "--key %s: KEY@FROM[-TO]\n", spec.c_str());
+        }
+        else if (arg == "--record-input" && i + 1 < argc) options.record_input = argv[++i];
+        else if (arg == "--replay-input" && i + 1 < argc) options.replay_input = argv[++i];
+        else if (arg == "--paced") options.paced = true;
         else if (arg == "--real-time-from" && i + 1 < argc) {
             options.real_time_from = std::stoull(argv[++i]);
             SetRealTimeFrom(options.real_time_from);

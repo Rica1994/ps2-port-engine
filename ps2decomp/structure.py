@@ -55,12 +55,16 @@ def _save_slots(code, start: int):
     """{(register name, stack offset)} the prologue saves callee-saved registers
     in: the stores of them to the stack before the first branch, jump or call.
     None when the function writes a callee-saved register it never saves - its
-    callers would see the change, so nothing about its saves can be elided."""
+    callers would see the change, so nothing about its saves can be elided.
+    A store of one the function has already set is not a save but data - in
+    0x00817820 (Resident Evil Outbreak) `daddu $s3, $a3` then `sd $s3,
+    8($sp)` passed a callee an argument on the stack, and dropping it as a
+    save left the slot's old value (1.0f) to be read as a pointer."""
     slots, saved, written = set(), set(), set()
     in_prologue = True
     for ins in code:
         if in_prologue and ins.mnemonic in ("sd", "sq", "sw") and ins.rs == 29 \
-                and (ins.rt in CALLEE_SAVED or ins.rt == 31):
+                and (ins.rt in CALLEE_SAVED or ins.rt == 31) and ins.rt not in written:
             slots.add((GPR_NAMES[ins.rt], ins.imm & 0xFFFF))
             saved.add(ins.rt)
         if ins.is_branch or ins.is_jump or ins.is_call:
@@ -665,6 +669,38 @@ def invert_empty_then(lines):
     return out
 
 
+_LABEL = re.compile(r"^L_([0-9A-F]{8}):;$")
+_GOTO = re.compile(r"goto L_([0-9A-F]{8});")
+
+
+def tick_backward_gotos(lines):
+    """A goto to a label above it is another turn of a loop, and spends budget
+    as one: `{ Tick(c, X); goto L_X; }` - unless the label is a loop header's,
+    with its Tick straight after. Without it a loop the structuring left as
+    gotos never gives the host control: Resident Evil Outbreak's 0x001A9AC0
+    polls a loader for ever, its head a one-instruction block copied onto every
+    edge into it (so no header with a Tick is ever emitted)."""
+    lines = list(lines)
+    seen, ticked = set(), set()
+    for k, line in enumerate(lines):
+        label = _LABEL.match(line.strip())
+        if label:
+            seen.add(label.group(1))
+            following = next((l.strip() for l in lines[k + 1:] if l.strip()), "")
+            if following.endswith("Tick(c, 0x%su);" % label.group(1)):
+                ticked.add(label.group(1))
+            continue
+
+        def guarded(match):
+            target = match.group(1)
+            if target not in seen or target in ticked:
+                return match.group(0)
+            return "{ Tick(c, 0x%su); goto L_%s; }" % (target, target)
+
+        lines[k] = _GOTO.sub(guarded, line)
+    return lines
+
+
 def loop_guards(lines):
     """A loop ending in `if (C) { A continue; } else { break; }` is `if (!C)
     break; A`; and a loop whose first test that is - `for (;;) { Tick; if (!C)
@@ -1032,6 +1068,6 @@ def structure_function(image: bytes, base: int, start: int, end: int,
     lines.append("    (void)out; (void)in; (void)leave;")
     body = drop_empty_else(hoist_delay_slots(fold_links(fold_addresses(fold_constants(out_lines, strings),
                                                                        strings))))
-    lines += loop_guards(loops_to_do_while(invert_empty_then(body)))
+    lines += tick_backward_gotos(loop_guards(loops_to_do_while(invert_empty_then(body))))
     lines.append("}")
     return "\n".join(lines) + "\n"

@@ -36,6 +36,7 @@
 
 #if defined(__linux__) || defined(__ANDROID__)
 #include <linux/futex.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #endif
 
@@ -280,23 +281,45 @@ void RaiseTimerResolution() {
 #endif
 }
 
-void FastThread(bool critical) {
+void FastThread(bool critical, bool raise) {
 #ifdef _WIN32
     // Not throttled (efficiency cores, lowered clocks) when the window is in
-    // the background.
+    // the background; above normal only when `raise` (cores to spare).
     THREAD_POWER_THROTTLING_STATE state{};
     state.Version = THREAD_POWER_THROTTLING_CURRENT_VERSION;
     state.ControlMask = THREAD_POWER_THROTTLING_EXECUTION_SPEED;
     state.StateMask = 0;
     SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &state, sizeof state);
-    SetThreadPriority(GetCurrentThread(), critical ? THREAD_PRIORITY_TIME_CRITICAL : THREAD_PRIORITY_ABOVE_NORMAL);
+    if (critical) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    else if (raise) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 #elif defined(__APPLE__)
     // The performance cores, scheduled first (an iPad's efficiency cores
     // would run the EE at a third of the speed).
-    (void)critical;
+    (void)critical, (void)raise;
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #else
-    (void)critical;
+    (void)critical, (void)raise;
+#endif
+}
+
+bool HoldToCores(std::uint64_t mask) {
+#ifdef _WIN32
+    return SetProcessAffinityMask(GetCurrentProcess(), DWORD_PTR(mask)) != 0;
+#elif defined(__linux__) && !defined(__ANDROID__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int i = 0; i < 64 && i < CPU_SETSIZE; ++i)
+        if (mask >> i & 1) CPU_SET(i, &set);
+    return sched_setaffinity(0, sizeof set, &set) == 0;
+#else
+    (void)mask;
+    return false;
+#endif
+}
+
+void HigherThread() {
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 #endif
 }
 

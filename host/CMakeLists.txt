@@ -35,6 +35,7 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/mcserv.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iop_vm.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iop_libs.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/iop_inet.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iopheap.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/spu2.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/audio.cpp
@@ -145,11 +146,31 @@ if(PS2HOST_VULKAN)
     target_compile_definitions(ps2host PRIVATE PS2HOST_VULKAN=1)
 endif()
 
+# AVX2: three-operand SIMD for the VU's lanes and the rest (6% of a race).
+# Off: a build for processors without it (Intel's Pentium and Celeron of
+# before 2021), SSE4.1 at least - a port ships both, the AVX2 one starting
+# the other where it must (src/cpu_check.cpp).
+option(PS2HOST_AVX2 "Build for processors with AVX2 (off: SSE4.1)" ON)
+# A game executable's entry (ps2_add_port's /ENTRY), before the runtime: the
+# processor checked by code built without AVX - a library of its own, apart
+# from ps2rt's flags - and the SSE4 build started instead where it must be.
+if(MSVC)
+    add_library(ps2_cpu_check STATIC ${CMAKE_CURRENT_LIST_DIR}/src/cpu_check.cpp)
+    if(PS2HOST_AVX2)
+        target_compile_definitions(ps2_cpu_check PRIVATE PS2HOST_BUILT_FOR_AVX2=1)
+    endif()
+endif()
+
 if(MSVC)
     # Translated code throws lifted::Abort; its chunks are large.
-    # AVX2: three-operand SIMD for the VU's lanes and the rest (6% of a race;
-    # main.cpp says so on a processor without it).
-    target_compile_options(ps2rt PUBLIC /EHsc /bigobj /W3 /wd4100 /wd4189 /arch:AVX2)
+    target_compile_options(ps2rt PUBLIC /EHsc /bigobj /W3 /wd4100 /wd4189)
+    if(PS2HOST_AVX2)
+        target_compile_options(ps2rt PUBLIC /arch:AVX2)
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        # MSVC takes SSE4.1's intrinsics without a flag; clang-cl needs the
+        # floor named (the one cpu_check.cpp holds the SSE4 build to).
+        target_compile_options(ps2rt PUBLIC /clang:-msse4.1)
+    endif()
     target_compile_definitions(ps2rt PUBLIC _CRT_SECURE_NO_WARNINGS)
     target_compile_options(ps2host PRIVATE /Z7)     # symbols for --sample, as the ports'
     target_compile_options(ps2rt PRIVATE /Z7)
@@ -174,6 +195,9 @@ else()
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     target_compile_definitions(ps2host PUBLIC PS2HOST_IOS=1)
+endif()
+if(WIN32)
+    target_link_libraries(ps2host PRIVATE ws2_32)         # the IOP's inet (iop_inet.cpp)
 endif()
 
 # The host's own tests, which need no game.
@@ -219,6 +243,9 @@ function(ps2_add_port target)
         ${generated}
         ${translated}
         ${PORT_SOURCES})
+    if(MSVC)
+        target_link_libraries(${target} PRIVATE ps2_cpu_check)
+    endif()
     target_link_libraries(${target} PRIVATE ps2host)
     if(PS2HOST_VULKAN)
         # main.cpp: SDL's entry point where the system needs one (iOS, Android).
@@ -286,7 +313,7 @@ END
         if(MSVC)
             # A windowed program: started from Explorer, no console beside the
             # game (main.cpp attaches to a terminal's when there is one).
-            target_link_options(${target} PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
+            target_link_options(${target} PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:Ps2CheckedStart)
         endif()
         if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
             ps2_ios_app(${target} "${game_title}" "${game_version}" "${game_dir}")

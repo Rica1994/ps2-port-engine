@@ -19,8 +19,10 @@
  * A function the host lacks stops the run with its name (iop_vm.cpp).
  */
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <cctype>
@@ -42,11 +44,11 @@ namespace {
 
 constexpr s32 KE_OK = 0, KE_ILLEGAL_CONTEXT = -100, KE_UNKNOWN_THID = -407;
 constexpr s32 KE_NOT_DORMANT = -414, KE_NOT_WAIT = -416, KE_CAN_NOT_WAIT = -417;
-constexpr s32 KE_SEMA_ZERO = -419, KE_EVF_COND = -421, KE_UNKNOWN_SEMID = -408;
+constexpr s32 KE_RELEASE_WAIT = -418, KE_SEMA_ZERO = -419, KE_EVF_COND = -421, KE_UNKNOWN_SEMID = -408;
 constexpr u32 WEF_OR = 1, WEF_CLEAR = 0x10;
 constexpr u64 kClockHz = 36864000;              // the IOP's system clock
 
-using Map = std::map<std::pair<std::string, u32>, Library>;
+using Map = LibraryTable;
 
 u32 A(Vm& vm, Context& c, int i) { return Arg(vm, c, i); }
 
@@ -175,6 +177,22 @@ Outcome WakeupThread(Vm& vm, Context& c) {
     return vm.reschedule && !vm.in_interrupt ? Outcome::Yield : Outcome::Return;
 }
 
+// (i)ReleaseWaitThread(id): a waiting thread's wait ends in KE_RELEASE_WAIT.
+Outcome ReleaseWaitThread(Vm& vm, Context& c) {
+    auto found = vm.threads.find(A(vm, c, 0));
+    if (found == vm.threads.end()) return Ret(c, u32(KE_UNKNOWN_THID));
+    Thread& t = found->second;
+    if (t.ready || t.wait == Wait::Dormant || t.wait == Wait::None) return Ret(c, u32(KE_NOT_WAIT));
+    if (t.wait == Wait::Sema) {
+        auto& waiting = vm.semaphores[t.object].waiting;
+        waiting.erase(std::remove(waiting.begin(), waiting.end(), t.id), waiting.end());
+    }
+    t.c.r[2] = u32(KE_RELEASE_WAIT);
+    vm.MakeReady(t);
+    Return(c, KE_OK);
+    return vm.reschedule && !vm.in_interrupt ? Outcome::Yield : Outcome::Return;
+}
+
 Outcome CancelWakeupThread(Vm& vm, Context& c) {
     u32 id = A(vm, c, 0);
     if (id == 0) id = vm.current;
@@ -183,6 +201,19 @@ Outcome CancelWakeupThread(Vm& vm, Context& c) {
     const s32 count = found->second.wakeups;
     found->second.wakeups = 0;
     return Ret(c, u32(count));
+}
+
+// WaitVblankStart / WaitVblankEnd (vblank): the thread waits until the next
+// field starts or ends - here, until the next 1/59.94 s boundary of the IOP's
+// clock, which is when the host delivers the vertical blank.
+Outcome WaitVblank(Vm& vm, Context& c) {
+    Thread* t = vm.Current();
+    if (!t) return Ret(c, u32(KE_CAN_NOT_WAIT));
+    constexpr u64 kFieldUs = 16683;
+    t->until_us = (vm.NowUs() / kFieldUs + 1) * kFieldUs;
+    Return(c, KE_OK);
+    vm.Block(c, Wait::Delay, 0);
+    return Outcome::Block;
 }
 
 Outcome DelayThread(Vm& vm, Context& c) {
@@ -230,6 +261,170 @@ Outcome SetAlarm(Vm& vm, Context& c) {
 Outcome CancelAlarm(Vm& vm, Context& c) {
     vm.alarms.erase(A(vm, c, 0));
     return Ret(c, KE_OK);
+}
+
+// look_ctype_table() (sysclib): the character classes, a byte a character as
+// the C library's ctype macros index them: upper 0x01, lower 0x02, digit 0x04,
+// space 0x08, punctuation 0x10, control 0x20, hex digit 0x40, blank 0x80. Kept
+// in IOP memory, made the first time it is asked for.
+Outcome LookCtypeTable(Vm& vm, Context& c) {
+    static u32 table = 0;
+    if (!table) {
+        table = vm.Allocate(256);
+        if (!table) return Ret(c, 0);
+        for (u32 ch = 0; ch < 256; ++ch) {
+            u32 flags = 0;
+            if (ch >= 'A' && ch <= 'Z') flags |= 0x01;
+            if (ch >= 'a' && ch <= 'z') flags |= 0x02;
+            if (ch >= '0' && ch <= '9') flags |= 0x04;
+            if (ch == ' ' || (ch >= '\t' && ch <= '\r')) flags |= 0x08;
+            if (ch > ' ' && ch < 0x7F && !(flags & 0x07)) flags |= 0x10;
+            if (ch < ' ' || ch == 0x7F) flags |= 0x20;
+            if ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F') || (ch >= 'a' && ch <= 'f'))
+                flags |= 0x40;
+            if (ch == ' ') flags |= 0x80;
+            vm.Write(table + ch, flags, 1);
+        }
+    }
+    return Ret(c, table);
+}
+
+// ---------------------------------------------------------------- message boxes
+
+constexpr s32 KE_UNKNOWN_MBXID = -410, KE_MBOX_NOMSG = -424, KE_WAIT_DELETE = -425;
+
+Outcome CreateMbx(Vm& vm, Context& c) {
+    MessageBox box;
+    box.attr = vm.Read(A(vm, c, 0), 4);          // iop_mbx_t: attr, option
+    const u32 id = vm.next_id++;
+    vm.mailboxes[id] = box;
+    return Ret(c, id);
+}
+
+Outcome DeleteMbx(Vm& vm, Context& c) {
+    auto found = vm.mailboxes.find(A(vm, c, 0));
+    if (found == vm.mailboxes.end()) return Ret(c, u32(KE_UNKNOWN_MBXID));
+    for (const auto& waiter : found->second.waiting) {
+        Thread& t = vm.threads[waiter.first];
+        t.c.r[2] = u32(KE_WAIT_DELETE);
+        vm.MakeReady(t);
+    }
+    vm.mailboxes.erase(found);
+    return Ret(c, KE_OK);
+}
+
+// SendMbx / iSendMbx(id, message): to the first thread waiting, or queued.
+Outcome SendMbx(Vm& vm, Context& c) {
+    auto found = vm.mailboxes.find(A(vm, c, 0));
+    if (found == vm.mailboxes.end()) return Ret(c, u32(KE_UNKNOWN_MBXID));
+    MessageBox& box = found->second;
+    const u32 message = A(vm, c, 1);
+    if (!box.waiting.empty()) {
+        const std::pair<u32, u32> waiter = box.waiting.front();
+        box.waiting.pop_front();
+        Thread& t = vm.threads[waiter.first];
+        vm.Write(waiter.second, message, 4);
+        t.c.r[2] = KE_OK;
+        vm.MakeReady(t);
+    } else {
+        box.messages.push_back(message);
+    }
+    Return(c, KE_OK);
+    return vm.reschedule && !vm.in_interrupt ? Outcome::Yield : Outcome::Return;
+}
+
+// ReceiveMbx(&message, id): waits for one; PollMbx: KE_MBOX_NOMSG if none.
+Outcome ReceiveMbx(Vm& vm, Context& c) {
+    const u32 where = A(vm, c, 0);
+    auto found = vm.mailboxes.find(A(vm, c, 1));
+    if (found == vm.mailboxes.end()) return Ret(c, u32(KE_UNKNOWN_MBXID));
+    MessageBox& box = found->second;
+    if (!box.messages.empty()) {
+        vm.Write(where, box.messages.front(), 4);
+        box.messages.pop_front();
+        return Ret(c, KE_OK);
+    }
+    if (!vm.Block(c, Wait::Mbx, found->first)) return Ret(c, u32(KE_CAN_NOT_WAIT));
+    box.waiting.push_back({vm.current, where});
+    return Outcome::Block;
+}
+
+Outcome PollMbx(Vm& vm, Context& c) {
+    const u32 where = A(vm, c, 0);
+    auto found = vm.mailboxes.find(A(vm, c, 1));
+    if (found == vm.mailboxes.end()) return Ret(c, u32(KE_UNKNOWN_MBXID));
+    MessageBox& box = found->second;
+    if (box.messages.empty()) return Ret(c, u32(KE_MBOX_NOMSG));
+    vm.Write(where, box.messages.front(), 4);
+    box.messages.pop_front();
+    return Ret(c, KE_OK);
+}
+
+// ---------------------------------------------------------------- hardware timers
+
+constexpr s32 KE_ILLEGAL_TIMERID = -150, KE_NO_TIMER = -151;
+
+// AllocHardTimer(source, size, prescale): an id for a timer of that clock.
+Outcome AllocHardTimer(Vm& vm, Context& c) {
+    if (vm.hard_timers.size() >= 4) return Ret(c, u32(KE_NO_TIMER));
+    HardTimer t;
+    t.source = A(vm, c, 0);
+    t.prescale = std::max(1u, A(vm, c, 2));
+    const u32 id = 0x100 + u32(vm.hard_timers.size());
+    vm.hard_timers[id] = t;
+    return Ret(c, id);
+}
+
+HardTimer* TimerOf(Vm& vm, Context& c) {
+    auto found = vm.hard_timers.find(A(vm, c, 0));
+    return found == vm.hard_timers.end() ? nullptr : &found->second;
+}
+
+Outcome FreeHardTimer(Vm& vm, Context& c) {
+    return Ret(c, vm.hard_timers.erase(A(vm, c, 0)) ? u32(KE_OK) : u32(KE_ILLEGAL_TIMERID));
+}
+
+// SetTimerHandler(id, compare, handler, common)
+Outcome SetTimerHandler(Vm& vm, Context& c) {
+    HardTimer* t = TimerOf(vm, c);
+    if (!t) return Ret(c, u32(KE_ILLEGAL_TIMERID));
+    t->compare = A(vm, c, 1);
+    t->handler = A(vm, c, 2);
+    t->common = A(vm, c, 3);
+    return Ret(c, KE_OK);
+}
+
+// SetupHardTimer(id, source, mode, prescale)
+Outcome SetupHardTimer(Vm& vm, Context& c) {
+    HardTimer* t = TimerOf(vm, c);
+    if (!t) return Ret(c, u32(KE_ILLEGAL_TIMERID));
+    t->source = A(vm, c, 1);
+    t->prescale = std::max(1u, A(vm, c, 3));
+    return Ret(c, KE_OK);
+}
+
+Outcome StartHardTimer(Vm& vm, Context& c) {
+    HardTimer* t = TimerOf(vm, c);
+    if (!t) return Ret(c, u32(KE_ILLEGAL_TIMERID));
+    t->running = true;
+    t->due_us = vm.NowUs() + HardTimerPeriodUs(*t);
+    return Ret(c, KE_OK);
+}
+
+Outcome StopHardTimer(Vm& vm, Context& c) {
+    HardTimer* t = TimerOf(vm, c);
+    if (!t) return Ret(c, u32(KE_ILLEGAL_TIMERID));
+    t->running = false;
+    return Ret(c, KE_OK);
+}
+
+// sceSifGetOtherData(receive data, EE source, IOP destination, size, mode):
+// EE memory read into IOP memory; done at once.
+Outcome SifGetOtherData(Vm& vm, Context& c) {
+    const u32 source = A(vm, c, 1), dest = A(vm, c, 2), size = A(vm, c, 3);
+    Memory& ee = GuestMemory();
+    for (u32 i = 0; i < size; ++i) vm.Write(dest + i, u32(ee.Read(source + i, 1)), 1);
+    return Ret(c, 0);
 }
 
 // ---------------------------------------------------------------- semaphores
@@ -494,6 +689,22 @@ Outcome Strtol(Vm& vm, Context& c) {
     return Ret(c, u32(value));
 }
 
+Outcome Strtoul(Vm& vm, Context& c) {
+    const u32 s = A(vm, c, 0), end = A(vm, c, 1);
+    const std::string text = vm.String(s, 256);
+    char* stop = nullptr;
+    const unsigned long value = std::strtoul(text.c_str(), &stop, int(A(vm, c, 2)));
+    if (end) vm.Write(end, s + u32(stop - text.c_str()), 4);
+    return Ret(c, u32(value));
+}
+
+Outcome Strstr(Vm& vm, Context& c) {
+    const u32 s = A(vm, c, 0);
+    const std::string text = vm.String(s, 1u << 20);
+    const std::size_t at = text.find(vm.String(A(vm, c, 1), 1u << 20));
+    return Ret(c, at == std::string::npos ? 0 : s + u32(at));
+}
+
 // Arguments of a variadic call: from argument `first` on.
 std::function<u32()> Varargs(Vm& vm, Context& c, int first) {
     auto index = std::make_shared<int>(first);
@@ -583,6 +794,12 @@ Outcome SendCmd(Vm& vm, Context& c) {
         std::fprintf(stderr, "[iop] to the EE: command %u,%s\n", unsigned(command), words.c_str());
     }
     QueueIopPacket(std::move(bytes));
+    // From an interrupt handler (sceSifSendCmd in one: Burnout 3's B3ROUTE
+    // sends each capture of the player's engine so, every 256 samples): the
+    // EE's handler runs now, as on the console. Its answer - the processed
+    // sound, DMA'd back - is there for the handler 128 samples on, not one
+    // frame on (the input ring played stale pieces: crackle).
+    if (vm.current == 0 && !(command & 0x80000000u)) ps2host::DeliverIopPacketNow();
     return Ret(c, 1);
 }
 
@@ -594,6 +811,10 @@ Outcome SetDma(Vm& vm, Context& c) {
     for (u32 k = 0; k < count; ++k) {
         const u32 src = vm.Read(list + 16 * k, 4), dest = vm.Read(list + 16 * k + 4, 4);
         const u32 size = vm.Read(list + 16 * k + 8, 4);
+        if (std::getenv("PS2HOST_SIF_LOG"))
+            std::fprintf(stderr, "[sif] IOP 0x%08X -> EE 0x%08X, %u bytes: %08X %08X %08X %08X\n",
+                         unsigned(src), unsigned(dest), unsigned(size), unsigned(vm.Read(src, 4)),
+                         unsigned(vm.Read(src + 4, 4)), unsigned(vm.Read(src + 8, 4)), unsigned(vm.Read(src + 12, 4)));
         for (u32 i = 0; i < size; ++i) ee.Write(dest + i, vm.Read(src + i, 1), 1);
     }
     return Ret(c, 1);
@@ -670,6 +891,15 @@ Outcome CdGetDiskType(Vm&, Context& c) {                          // SCECdPS2CD,
 Outcome CdDiskReady(Vm&, Context& c) { return Ret(c, 2); }         // SCECdComplete
 
 Outcome FlushDcache(Vm&, Context& c) { return Ret(c, 0); }
+// RegisterLibraryEntries(table): a module offers its functions to the modules
+// loaded after it (iop_vm.cpp links their imports to them).
+Outcome RegisterLibraryEntries(Vm& vm, Context& c) {
+    const u32 table = Arg(vm, c, 0);
+    const std::string name = vm.String(table + 12, 8);
+    vm.exports[name] = table;
+    Note("iop exports " + name, "IOP: a module exports the library " + name);
+    return Ret(c, 0);
+}
 Outcome CheckInit(Vm&, Context& c) { return Ret(c, 1); }
 Outcome GetSreg(Vm&, Context& c) { return Ret(c, 0); }
 
@@ -689,6 +919,9 @@ struct Sound {
         u64 period_us = 0, due_us = 0;
     } block[2];
     std::vector<u32> pending;       // channels whose transfer interrupt is due now
+    // The IOP's instructions at the last SoundInterrupts: while the IOP
+    // catches up, the sound goes no faster than they.
+    u64 sound_instructions = 0;
 };
 
 Sound& S() {
@@ -804,9 +1037,14 @@ Outcome SdBlockTrans(Vm& vm, Context& c) {
     Sound::Block& b = S().block[channel];
     if ((mode & 3) == 2) {                   // SD_TRANS_STOP
         b.active = false;
+        S().spu.SetInput(channel, nullptr, 0);
         return Ret(c, 0);
     }
     b.active = true;
+    // Written to the core (SD_TRANS_WRITE): its sound-data input plays the
+    // buffer, from IOP memory, as the half-buffer interrupts below pace it.
+    if ((mode & 3) == 0 && address < kRamSize && size <= kRamSize - address)
+        S().spu.SetInput(channel, vm.ram + address, size);
     b.address = address;
     b.size = size;
     b.half = 0;
@@ -817,12 +1055,16 @@ Outcome SdBlockTrans(Vm& vm, Context& c) {
 }
 
 Outcome SdBlockTransStatus(Vm&, Context& c) {
-    const Sound::Block& b = S().block[c.r[4] & 1];
-    return Ret(c, (b.half << 24) | ((b.address + b.half * (b.size / 2)) & 0xFFFFFF));
+    const u32 channel = c.r[4] & 1;
+    const Sound::Block& b = S().block[channel];
+    // A buffer the SPU2 plays: the half it is playing.
+    const u32 half = S().spu.InputActive(channel) ? S().spu.InputHalf(channel) : b.half;
+    return Ret(c, (half << 24) | ((b.address + half * (b.size / 2)) & 0xFFFFFF));
 }
 
 Outcome SdStopTrans(Vm&, Context& c) {
     S().block[c.r[4] & 1].active = false;
+    S().spu.SetInput(c.r[4] & 1, nullptr, 0);
     return Ret(c, 0);
 }
 
@@ -894,7 +1136,8 @@ const Map& Table() {
         {{"sysclib", 17}, Bzero}, {{"sysclib", 19}, Sprintf}, {{"sysclib", 20}, Strcat},
         {{"sysclib", 21}, Strchr}, {{"sysclib", 22}, Strcmp}, {{"sysclib", 23}, Strcpy},
         {{"sysclib", 27}, Strlen}, {{"sysclib", 29}, Strncmp}, {{"sysclib", 30}, Strncpy},
-        {{"sysclib", 32}, Strrchr}, {{"sysclib", 36}, Strtol}, {{"sysclib", 42}, Vsprintf},
+        {{"sysclib", 32}, Strrchr}, {{"sysclib", 34}, Strstr}, {{"sysclib", 36}, Strtol},
+        {{"sysclib", 38}, Strtoul}, {{"sysclib", 42}, Vsprintf},
         {{"intrman", 4}, Succeed}, {{"intrman", 5}, Succeed}, {{"intrman", 6}, Succeed},
         {{"intrman", 7}, Succeed}, {{"intrman", 8}, Succeed}, {{"intrman", 9}, Succeed},
         {{"intrman", 17}, CpuSuspendIntr}, {{"intrman", 18}, Succeed},
@@ -904,6 +1147,7 @@ const Map& Table() {
         {{"thbase", 8}, ExitThread}, {{"thbase", 10}, TerminateThread},
         {{"thbase", 11}, TerminateThread}, {{"thbase", 14}, ChangeThreadPriority},
         {{"thbase", 15}, ChangeThreadPriority}, {{"thbase", 16}, RotateThreadReadyQueue},
+        {{"thbase", 18}, ReleaseWaitThread}, {{"thbase", 19}, ReleaseWaitThread},
         {{"thbase", 20}, GetThreadId}, {{"thbase", 24}, SleepThread},
         {{"thbase", 25}, WakeupThread}, {{"thbase", 26}, WakeupThread},
         {{"thbase", 27}, CancelWakeupThread}, {{"thbase", 28}, CancelWakeupThread},
@@ -931,7 +1175,16 @@ const Map& Table() {
         {{"sifman", 32}, SetDmaIntr},
         {{"cdvdman", 4}, Succeed}, {{"cdvdman", 6}, CdRead}, {{"cdvdman", 8}, CdGetError},
         {{"cdvdman", 11}, CdSync}, {{"cdvdman", 12}, CdGetDiskType}, {{"cdvdman", 13}, CdDiskReady},
-        {{"loadcore", 5}, FlushDcache},
+        {{"loadcore", 5}, FlushDcache}, {{"loadcore", 6}, RegisterLibraryEntries},
+        {{"thmsgbx", 4}, CreateMbx}, {{"thmsgbx", 5}, DeleteMbx},
+        {{"thmsgbx", 6}, SendMbx}, {{"thmsgbx", 7}, SendMbx},
+        {{"thmsgbx", 8}, ReceiveMbx}, {{"thmsgbx", 9}, PollMbx},
+        {{"timrman", 4}, AllocHardTimer}, {{"timrman", 6}, FreeHardTimer},
+        {{"timrman", 20}, SetTimerHandler}, {{"timrman", 22}, SetupHardTimer},
+        {{"timrman", 23}, StartHardTimer}, {{"timrman", 24}, StopHardTimer},
+        {{"sifcmd", 23}, SifGetOtherData},
+        {{"sysclib", 8}, LookCtypeTable},
+        {{"vblank", 4}, WaitVblank}, {{"vblank", 5}, WaitVblank},
         {{"libsd", 2}, SdQuit}, {{"libsd", 4}, SdInit},
         {{"libsd", 5}, SdSetParam}, {{"libsd", 6}, SdGetParam},
         {{"libsd", 7}, SdSetSwitch}, {{"libsd", 8}, SdGetSwitch},
@@ -975,7 +1228,9 @@ std::map<std::pair<std::string, u32>, std::string> LoadNames() {
 
 Library FindLibrary(const std::string& library, u32 index) {
     const auto found = Table().find({library, index});
-    return found == Table().end() ? Library() : found->second;
+    if (found != Table().end()) return found->second;
+    const auto network = NetworkLibraries().find({library, index});
+    return network == NetworkLibraries().end() ? Library() : network->second;
 }
 
 std::string ExportName(const std::string& library, u32 index) {
@@ -984,19 +1239,23 @@ std::string ExportName(const std::string& library, u32 index) {
     return found == names.end() ? "?" : found->second;
 }
 
+void SetPcmInputVolume(u32 core, u32 percent) { S().spu.SetInputVolume(core, percent); }
+
 void EnableSound() {
     S().spu.SetOutput([](const Spu2::s16* frames, u32 count) { AudioFrames(frames, count); });
 }
 
 // Due sound interrupts: a voice transfer's completion, a block transfer's
 // half-buffer. Called by the interpreter's scheduler (iop_vm.cpp).
-void SoundInterrupts(Vm& vm) {
+bool SoundInterrupts(Vm& vm, bool idle) {
     Sound& s = S();
     std::vector<u32> due;
     due.swap(s.pending);
     const u64 now = vm.NowUs();
     for (u32 ch = 0; ch < 2; ++ch) {
         Sound::Block& b = s.block[ch];
+        // A buffer the SPU2 plays interrupts as it plays it (below).
+        if (s.spu.InputActive(ch)) continue;
         if (b.active && b.period_us && now >= b.due_us) {
             b.half ^= 1;
             b.due_us += b.period_us;
@@ -1008,12 +1267,34 @@ void SoundInterrupts(Vm& vm) {
         if (s.transfer[ch].function) vm.Call(s.transfer[ch].function, {ch, s.transfer[ch].arg});
         else if (s.transfer_callback[ch]) vm.Call(s.transfer_callback[ch], {0});
     }
+    // The SPU2 runs beside the IOP, and a stream's decoder (CRI's ADX) on the
+    // IOP keeps a half of the buffer ahead of it. The IOP here runs in bursts
+    // (between the EE's frames, or as it idles): through a burst the sound
+    // goes on only as fast as the IOP's work (36.864 MHz, an instruction a
+    // cycle), never more than 50 ms behind; once the IOP has nothing to do,
+    // to the present. Each half the input begins stops it, its interrupt
+    // delivered, so the decoder runs before the SPU2 reads on. Only while a
+    // stream plays (a block transfer's input): otherwise to the present, the
+    // sound's interrupts when the IOP's clock gives them (Burnout 3's
+    // audio-paced movies are recorded so).
+    const u64 executed = vm.instructions - s.sound_instructions;
+    s.sound_instructions = vm.instructions;
+    const u64 played = s.spu.PlayedUs();
+    const bool streaming = s.spu.InputActive(0) || s.spu.InputActive(1);
+    u64 to = idle || !played || !streaming ? now : std::min(now, played + executed * 1000 / 36864);
+    if (to + 50'000 < now) to = now - 50'000;
     // The SPU2's own interrupt: playback (or a transfer) reached IRQA.
     Timed timed(Section::Spu2);
-    s.spu.Advance(now, [&](u32 core) {
+    s.spu.Advance(to, [&](u32 core) {
         if (s.spu2.function) vm.Call(s.spu2.function, {1u << core, s.spu2.arg});
         else if (s.irq_callback) vm.Call(s.irq_callback, {0});
+    }, [&](u32 core) {
+        Sound::Block& b = s.block[core];
+        b.half = s.spu.InputHalf(core);
+        if (s.transfer[core].function) vm.Call(s.transfer[core].function, {core, s.transfer[core].arg});
+        else if (s.transfer_callback[core]) vm.Call(s.transfer_callback[core], {0});
     });
+    return s.spu.PlayedUs() + 21 < now;     // a sample (20.8 us) or more to play
 }
 
 std::string Format(Vm& vm, u32 format, const std::function<u32()>& next) {

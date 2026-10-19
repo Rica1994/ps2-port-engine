@@ -22,6 +22,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -47,6 +48,12 @@ using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 
 constexpr u32 kRing = 1u << 22;                 // words (16 MB)
+// What wakes the GS thread at once: this much waiting (16 KB), or a frame's
+// end, a privileged register, the producer waiting for it. Less waits for
+// its next look (kLookMs): woken for every few packets, it slept and woke
+// 10,000-13,000 times a second - 30% of a core in waits through gameplay.
+constexpr u32 kWakeWords = 4096;
+constexpr int kLookMs = 1;
 constexpr u32 kMaxRun = kRing / 8;              // the longest run of words one entry carries
 enum : u32 { kQword = 1, kWord = 2, kWords = 3, kPrivileged = 4, kWrap = 5, kFrame = 6 };
 
@@ -195,6 +202,7 @@ struct Feed {
     void WaitFor(u32 words) {
         const u64 at = head.load(std::memory_order_relaxed);
         if (at + words - tail.load(std::memory_order_acquire) <= kRing) return;
+        Wake();
         Timed timed(Section::GsWait);
         if (platform::kMobile) {
             BlockUntil([&] { return at + words - tail.load(std::memory_order_acquire) <= kRing; });
@@ -206,17 +214,22 @@ struct Feed {
         }
     }
 
-    void Publish(u32 words) {
-        head.store(head.load(std::memory_order_relaxed) + words, std::memory_order_release);
-        if (sleeping.load()) {
-            std::lock_guard<std::mutex> lock(mutex);
-            wake.notify_one();
-        }
+    void Publish(u32 words, bool now = false) {
+        const u64 h = head.load(std::memory_order_relaxed) + words;
+        head.store(h, std::memory_order_release);
+        if (sleeping.load() && (now || h - tail.load(std::memory_order_acquire) >= kWakeWords)) Wake();
+    }
+
+    void Wake() {
+        if (!sleeping.load()) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        wake.notify_one();
     }
 
     void Sync() {
         const u64 target = head.load(std::memory_order_relaxed);
         if (tail.load(std::memory_order_acquire) >= target) return Rethrow();
+        Wake();
         Timed timed(Section::GsWait);
         if (platform::kMobile) BlockUntil([&] { return tail.load(std::memory_order_acquire) >= target; });
         for (int spins = 0; tail.load(std::memory_order_acquire) < target; ++spins) {
@@ -233,15 +246,24 @@ struct Feed {
             u64 t = tail.load(std::memory_order_relaxed);
             u64 h = head.load(std::memory_order_acquire);
             if (t == h) {
-                // Briefly busy, then asleep until there is more.
-                for (int spins = 0; spins < 200 && t == h; ++spins) {
+                // Briefly busy, then asleep until there is more. Briefly: a
+                // pause is up to 140 cycles (Skylake on), and 200 of them each
+                // time the ring ran dry were a third of the thread's time in
+                // gameplay (20-26% of a core -> 14-16% with 16, the pictures'
+                // pacing the same). PS2HOST_GS_SPIN to measure another.
+                static const int kSpins = [] {
+                    const char* n = std::getenv("PS2HOST_GS_SPIN");
+                    return n ? std::atoi(n) : 16;
+                }();
+                for (int spins = 0; spins < kSpins && t == h; ++spins) {
                     Pause();
                     h = head.load(std::memory_order_acquire);
                 }
                 if (t == h) {
                     std::unique_lock<std::mutex> lock(mutex);
                     sleeping = true;
-                    wake.wait(lock, [&] { return stop.load() || head.load() != tail.load(); });
+                    wake.wait_for(lock, std::chrono::milliseconds(kLookMs),
+                                  [&] { return stop.load() || head.load() != tail.load(); });
                     sleeping = false;
                     if (stop.load() && head.load() == tail.load()) return;
                     continue;
@@ -342,6 +364,18 @@ void GsDrain() {
 
 void StopGsThread() {
     if (!g_feed) return;
+    // VIF1's worker first: what it still has queued (a VU1 program's XGKICKs,
+    // DIRECT) feeds the GS thread, and a feed gone under it was a crash at the
+    // run's end (GsWords between its check of g_feed and its use; seen with
+    // the car select's garage at 60 pictures a second keeping VU1 busy). The
+    // EE has stopped: nothing more is queued. A failure of the worker's at
+    // this point changes nothing - the run is over.
+    if (Vif1Async() && !OnVif1Worker()) {
+        try {
+            JoinVif1("stop");
+        } catch (...) {
+        }
+    }
     g_feed->Sync();
     g_feed->Stop();
     g_feed = nullptr;
@@ -424,7 +458,11 @@ u64 FrameDue(u64 frame) {
     // frame's VU1 work, 12 ms past its blank) still goes out on time, for
     // under a third of a frame's delay where all is quick.
     keep = std::min<u64>(std::max<u64>(keep + 500'000, 6'000'000), 25'000'000);
-    return std::max(now, ended + keep);
+    const u64 due = std::max(now, ended + keep);
+    // Its blank to its time to be shown: the host's share of what a press
+    // takes to reach the screen (the display's refresh and compositor after).
+    if (timeline::On()) timeline::Instant("due after its blank (us)", timeline::Now(), (due - ended) / 1000);
+    return due;
 }
 
 u64 GsFrameDone() { return g_gs_frame_done.load(std::memory_order_acquire); }
@@ -462,7 +500,7 @@ bool GsFrame(u64 frame) {
     e[0] = Header(kFrame, 0, 0);
     e[1] = u32(frame);
     e[2] = u32(frame >> 32);
-    g_feed->Publish(3);
+    g_feed->Publish(3, true);
     return true;
 }
 
@@ -477,7 +515,7 @@ void GsPrivileged(u32 address, u64 value) {
     e[1] = address;
     e[2] = u32(value);
     e[3] = u32(value >> 32);
-    g_feed->Publish(4);
+    g_feed->Publish(4, true);
 }
 
 }  // namespace ps2host

@@ -87,15 +87,14 @@ each texture is kept; the next run, a texture asked for brings the 48 that
 followed it last time from the store into memory - a race's textures are
 read while the race starts, as an engine streams a level's bundle.
 
-**Pipelines** (`gs_renderer.cpp`, `SetCacheDirectory`). The driver's
-pipeline cache is saved (`gpu/pipelines.vkcache`) and given back at the next
-start; the keys of every GS pipeline a run made are saved too, in the order
-it first asked for them (`gpu/pipelines.keys`), and the next start builds
-them in that order on a thread of its own before any batch asks (an
-engine's PSO precaching): on MoltenVK each is a
-Metal compile of tens of milliseconds that otherwise lands on the GS thread
-mid-race. Both files carry a stamp of the shaders and the GPU; another
-build's are not used. Written every 600 frames when something is new.
+**Pipelines** (`gs_renderer.cpp`, `SetPipelineCacheDir`; docs/GPU.md). The
+driver's pipeline cache and the keys a run drew with are kept beside the PC
+settings (on a tablet, in the caches folder with the store:
+`gpu/gpu_pipeline_cache.bin`, `gpu/gpu_pipelines.txt`); a worker thread makes
+the listed ones at the next start, before any batch asks (an engine's PSO
+precaching), and a new kind of draw is drawn with the whole shader until its
+own pipeline is made. On MoltenVK each is a Metal compile of tens of
+milliseconds that would otherwise land on the GS thread mid-race.
 
 ## Switches
 
@@ -106,7 +105,6 @@ build's are not used. Written every 600 frames when something is new.
 | `PS2HOST_ASSET_SYNC=1` | cooked and read on the GS thread: the same pictures every time (scripted tests) |
 | `PS2HOST_ASSET_EFFORT` | the encoder's effort, 0-100 (10: astcenc's "fast") |
 | `PS2HOST_CACHE_DIR` | another cache folder |
-| `PS2GPU_PIPELINE_CACHE=0` | no pipeline cache |
 
 `rgba8` cooks without loss: a scripted run with it (`PS2HOST_ASSETS=rgba8
 PS2HOST_ASSET_SYNC=1`) must give the same pictures as one without - the test

@@ -7,6 +7,7 @@
 #define PS2HOST_IOP_VM_INTERNAL_H
 
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <map>
@@ -32,7 +33,7 @@ struct Context {
     u32 pc = 0, npc = 4;
 };
 
-enum class Wait { None, Sema, Event, Sleep, Delay, Dormant, Rpc };
+enum class Wait { None, Sema, Event, Sleep, Delay, Dormant, Rpc, Mbx };
 
 struct RpcRequest {
     u32 server = 0, procedure = 0, size = 0, receive = 0, receive_size = 0;
@@ -69,21 +70,54 @@ struct EventFlag {
     u32 bits = 0, attr = 0;
 };
 
+// A message box (thmsgbx): messages are the guest's own structures, linked
+// through their first word; kept here in arrival order.
+struct MessageBox {
+    u32 attr = 0;
+    std::deque<u32> messages;
+    std::deque<std::pair<u32, u32>> waiting;     // (thread, where its message goes)
+};
+
+// A hardware timer a module took (timrman): its handler runs as an interrupt
+// every `compare` counts of its clock, and returns the next compare value (0:
+// the timer stops).
+struct HardTimer {
+    u32 source = 1, prescale = 1, compare = 0, handler = 0, common = 0;
+    bool running = false;
+    u64 due_us = 0;
+};
+
+/* The time between a hardware timer's interrupts. */
+u64 HardTimerPeriodUs(const HardTimer& t);
+
 struct Alarm {
     u64 due_us = 0;
     u32 handler = 0, arg = 0;
 };
 
-// What a library function did to the calling thread.
-enum class Outcome { Return, Block, Yield };
+// What a library function did to the calling thread. Retry: it has blocked
+// (Vm::Block) and makes the same call again, same arguments, when the thread
+// wakes - a host call that waits on something outside the IOP (a socket)
+// without holding the EE up.
+enum class Outcome { Return, Block, Yield, Retry };
 
 struct Vm;
 using Library = std::function<Outcome(Vm& vm, Context& c)>;
+using LibraryTable = std::map<std::pair<std::string, u32>, Library>;
+
+/* The IOP network libraries (inet, netcnf, inetctl) on the host's sockets,
+   iop_inet.cpp; FindLibrary looks there after its own table. */
+const LibraryTable& NetworkLibraries();
 
 struct Vm {
     u8* ram = nullptr;                          // the 2 MB, shared with the EE's view
     std::map<u32, std::pair<std::string, u32>> stubs;  // stub address -> (library, export)
     std::vector<Library> libraries;              // by id, patched into the stubs
+    // Libraries the modules export (loadcore's RegisterLibraryEntries): name ->
+    // its export table (magic, next, version, mode, the name in 8 bytes, then
+    // the functions' addresses, ending in 0). A module importing a library the
+    // host does not implement links to these.
+    std::map<std::string, u32> exports;
     std::map<u32, Thread> threads;
     u32 current = 0;                             // the running thread, 0 in a handler
     bool in_interrupt = false;
@@ -93,6 +127,8 @@ struct Vm {
     std::map<u32, Semaphore> semaphores;
     std::map<u32, EventFlag> events;
     std::map<u32, Alarm> alarms;
+    std::map<u32, MessageBox> mailboxes;
+    std::map<u32, HardTimer> hard_timers;
     std::vector<std::pair<u32, u32>> completions;  // (function, data): DMA-done callbacks due
     std::map<u32, std::pair<u32, u32>> command_handlers;   // command -> (function, data)
     std::map<u32, RpcServerEntry> rpc_servers;            // server address -> entry
@@ -106,9 +142,37 @@ struct Vm {
     u32 executing = 0;                           // the instruction being run, for messages
 
     // Memory, by IOP address (any segment; the RAM mirrors every 2 MB).
-    u8* At(u32 address, u32 size);
-    u32 Read(u32 address, u32 size);
-    void Write(u32 address, u32 value, u32 size);
+    // Inline, each size its own copy: the interpreter reads every instruction
+    // through Read, and a call with memcpy's own of a size it did not know
+    // was a tenth of the EE thread's time in gameplay.
+    u8* At(u32 address, u32 size) {
+        const u32 physical = address & 0x1FFFFFFFu;
+        if (physical < 0x00800000u) {                       // RAM and its mirrors
+            const u32 offset = physical & (kRamSize - 1);
+            if (offset + size <= kRamSize) return ram + offset;
+        }
+        return nullptr;
+    }
+    u32 Read(u32 address, u32 size) {
+        const u8* p = At(address, size);
+        if (!p) ReadFault(address);
+        if (size == 4) { u32 value; std::memcpy(&value, p, 4); return value; }
+        if (size == 2) { u16 value; std::memcpy(&value, p, 2); return value; }
+        if (size == 1) return *p;
+        u32 value = 0;
+        std::memcpy(&value, p, size);
+        return value;
+    }
+    void Write(u32 address, u32 value, u32 size) {
+        u8* p = At(address, size);
+        if (!p) WriteFault(address, value);
+        if (size == 4) std::memcpy(p, &value, 4);
+        else if (size == 2) { const u16 half = u16(value); std::memcpy(p, &half, 2); }
+        else if (size == 1) *p = u8(value);
+        else std::memcpy(p, &value, size);
+    }
+    [[noreturn]] void ReadFault(u32 address);
+    [[noreturn]] void WriteFault(u32 address, u32 value);
     std::string String(u32 address, u32 limit = 1024);
     std::string Where();
 
@@ -147,7 +211,9 @@ std::string ExportName(const std::string& library, u32 index);
 void ServeNext(Vm& vm, Thread& t);
 
 /* Due sound-hardware interrupts (iop_libs.cpp), run by the scheduler. */
-void SoundInterrupts(Vm& vm);
+// Due sound interrupts, the SPU2 run on; `idle`: the IOP has nothing to run,
+// the sound may go on to the present. True while the sound is behind it.
+bool SoundInterrupts(Vm& vm, bool idle = false);
 
 /* printf-style formatting from IOP memory: `next` yields each argument word. */
 std::string Format(Vm& vm, u32 format, const std::function<u32()>& next);

@@ -68,10 +68,12 @@ struct Thread {
     u32 id = 0;
     u32 entry = 0, stack = 0, stack_size = 0, gp = 0;
     s32 priority = 0;
+    s32 initial_priority = 0;       // CreateThread's, for ReferThreadStatus
     State state = State::Dormant;
     u64 queued = 0;                 // order among ready threads of equal priority
     u32 waiting_on = 0;             // the semaphore, while Waiting
     s32 wakeups = 0;                // WakeupThread calls not yet consumed by a sleep
+    bool suspended = false;         // SuspendThread: not run, whatever its state, until resumed
     u64 runs = 0;                   // times the scheduler switched to it, for the report
     lifted::Context context = NewContext();
     std::vector<u32> calls;         // the guest call stack, for the report
@@ -192,7 +194,7 @@ void ThreadMain(void* parameter) {
 Thread* PickReady() {
     Thread* best = nullptr;
     for (auto& [id, t] : S().threads) {
-        if (t->state != State::Ready) continue;
+        if (t->state != State::Ready || t->suspended) continue;
         if (!best || t->priority < best->priority ||
             (t->priority == best->priority && t->queued < best->queued))
             best = t.get();
@@ -282,10 +284,22 @@ u64 g_real_time_from = 0;               // SetRealTimeFrom
 // main loop ran five times a frame, its clocks with it.
 std::atomic<u32> g_intc_stat{0};
 
+void SleepUntil(std::chrono::steady_clock::time_point when);
+bool g_paced = false;                   // SetPaced
+
 // One frame's interrupts, delivered to the handlers registered for them.
 bool DeliverFrame() {
     Scheduler& s = S();
     ++s.frames;
+    if (g_paced && s.virtual_time) {
+        // No sooner than the display's next blank (NTSC's 59.94 a second): the
+        // run stays exact, only slowed to where it can be played.
+        static auto next = std::chrono::steady_clock::now();
+        next += std::chrono::nanoseconds(16683350);
+        const auto now = std::chrono::steady_clock::now();
+        if (next < now - std::chrono::milliseconds(100)) next = now;   // fell behind: no catching up
+        SleepUntil(next);
+    }
     g_intc_stat.fetch_or((1u << kVblankStart) | (1u << kVblankEnd), std::memory_order_relaxed);
     if (s.virtual_time && g_real_time_from && s.frames >= g_real_time_from) StartRealTime();
     {
@@ -311,6 +325,7 @@ void DeliverPendingDmac() {
 }
 
 void SpendBudget(lifted::Context& c) {
+    *static_cast<volatile u32*>(&c.attention) = 1;   // read at its next loop head (lifted::Tick)
     reinterpret_cast<std::atomic<s64>*>(&c.budget)->store(0);
 }
 
@@ -356,7 +371,12 @@ bool TakeVblank(Scheduler& s) {
     if (g_hitch_blanks) {
         const u64 due = g_blank_due_ns.load(std::memory_order_relaxed), now = ClockNs();
         if (due && now > due + 4'000'000) {
-            SampleOnly(due + 500'000, now);
+            // The sampler's times are the steady clock's, which the host's
+            // clock is not after --real-time-from (it carries on from the
+            // virtual one): the same span, ending now on the steady clock.
+            const u64 steady = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch()).count());
+            SampleOnly(steady - (now - due) + 500'000, steady);
             std::fprintf(stderr, "[hitch] a blank taken %.1f ms late\n", (now - due) / 1e6);
         }
         g_blank_due_ns.store(0, std::memory_order_relaxed);
@@ -401,6 +421,37 @@ std::atomic<u64> g_last_vblank_ns{0};       // LastVblankNs
    overshoot by more; sleep_until where there is none. */
 void SleepUntil(std::chrono::steady_clock::time_point when) { platform::SleepUntil(when); }
 
+/* Whether a deadline may be waited for by spinning its last stretch (a
+   sleep's wake-up can be late by a little): only with cores to spare - more
+   than three for the process. With fewer, a time-critical thread spinning
+   takes a core the game's threads need, the game falls behind, and the
+   timer, retrying the blank it has not taken, spins the more: on two cores
+   the race lost a third of its blanks and stopped for seconds at a time.
+   There the high-resolution timer's sleep is the whole wait.
+   PS2HOST_SPIN=0 or 1 decides instead. Looked at again now and then (the
+   process's cores can change). */
+bool SpareCores() {
+    // A tablet never spins: its few fast cores are the game's (its other
+    // cores are slow ones - an iPad's six are two fast and four efficient).
+    if (platform::kMobile) return false;
+    static const char* forced = std::getenv("PS2HOST_SPIN");
+    if (forced) return forced[0] == '1';
+    static std::atomic<int> looks{0};
+    static std::atomic<bool> spare{true};
+    if (looks.fetch_add(1, std::memory_order_relaxed) % 64 == 0) {
+        int cores = int(std::thread::hardware_concurrency());
+#ifdef _WIN32
+        DWORD_PTR process = 0, system = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) && process) {
+            cores = 0;
+            for (DWORD_PTR m = process; m; m &= m - 1) ++cores;
+        }
+#endif
+        spare.store(cores >= 4, std::memory_order_relaxed);
+    }
+    return spare.load(std::memory_order_relaxed);
+}
+
 void VblankTimer() {
     using clock = std::chrono::steady_clock;
     const auto period = std::chrono::microseconds(16683);      // NTSC, 59.94 Hz
@@ -414,6 +465,13 @@ void VblankTimer() {
         s64 timer = NanosToNextTimerEvent();
         const s64 alarm = NanosToNextAlarm();
         if (alarm >= 0 && (timer < 0 || alarm < timer)) timer = alarm;
+        // A timer interrupt marked due and not yet taken is due "now" until
+        // the EE takes it: waking for it again at once was this thread - the
+        // highest priority - spinning until the EE got to run. On two cores
+        // that held one while the EE, the GS and VIF1 shared the other: the
+        // race lost blanks by the thousand and stopped for seconds. It waits
+        // as a blank not yet taken does, the half millisecond's retry.
+        if (timer >= 0 && timer < 500000 && s.timer_due.load()) timer = 500000;
         const auto timer_at = timer >= 0 ? clock::now() + std::chrono::nanoseconds(timer) : clock::time_point::max();
         wake = std::min(wake, timer_at);
         const bool untaken = s.vblank_due.load() || s.timer_due.load();
@@ -433,11 +491,19 @@ void VblankTimer() {
             TimerTick();
             continue;
         }
-        // A tablet sleeps the whole way: its few fast cores are the game's, a
-        // spin to the microsecond theirs lost (the blank comes a little late).
-        if (platform::kMobile) SleepUntil(wake);
-        else if (wake - clock::now() > margin) SleepUntil(wake - margin);
-        while (!platform::kMobile && clock::now() < wake && !StopRequested() && !g_timer_stop) std::this_thread::yield();
+        // A retry for what the EE has not taken is a look again, not a
+        // deadline: slept to (the precise sleep), not spun the last of -
+        // spinning a retry's every 700 us was this thread spinning all the
+        // time the EE could not take it (a third of a core in Burnout 3's
+        // garage, the EE waiting there for VIF1's worker). A tablet sleeps
+        // the whole way (SpareCores: never there).
+        const bool deadline = !(retrying && wake == retry_at);
+        if (!SpareCores() || !deadline) {
+            SleepUntil(wake);
+        } else {
+            if (wake - clock::now() > margin) SleepUntil(wake - margin);
+            while (clock::now() < wake && !StopRequested() && !g_timer_stop) std::this_thread::yield();
+        }
         if (clock::now() >= next) {
             const auto late = clock::now() - next;
             if (late > std::chrono::milliseconds(1) && timeline::On())
@@ -494,6 +560,7 @@ constexpr s64 kIdleSliceIterations = 256;
 // deliver interrupts, or the end of the run.
 void LoopHead(lifted::Context& c, u32 address) {
     Scheduler& s = S();
+    c.attention = 0;                    // taken: what asked for it is looked at below
     if (StopRequested() || s.in_interrupt || !s.current || &c != &s.current->context)
         throw lifted::Abort{address, 2};
     const bool idle = s.virtual_time && IdleLoops().count(address) != 0;
@@ -616,6 +683,15 @@ void PostDmac(u32 channel) {
     RequestDelivery();
 }
 
+void DeliverIopPacketNow() {
+    Scheduler& s = S();
+    // RunHandlers has one interrupt context: never inside a handler. The IOP
+    // answers in order: what is due before the packet goes first.
+    if (s.in_interrupt) return;
+    while (DeliverIopReply()) {
+    }
+}
+
 void RequestDelivery() {
     Scheduler& s = S();
     if (s.in_interrupt || !s.current || s.delivery_requested) return;
@@ -730,6 +806,13 @@ void StartRealTimeThreads() {
     platform::RaiseTimerResolution();
     FastThread();
     if (platform::kMobile) SampleThisThread("EE");
+    // The EE above the threads it feeds (VIF1's worker, the GS thread): it
+    // takes the blanks, and what they do waits for it - queued, at most two
+    // frames ahead. At one priority, with fewer cores than busy threads, a
+    // blank waited for the EE's turn behind them: on two cores (Resident
+    // Evil Outbreak, J's Bar, 30 s) 200 blanks taken late and 82 pictures a
+    // period late; above them, 14-23 and 1-6. No change with cores to spare.
+    platform::HigherThread();
     if (!TimerThread().joinable()) {
         TimerThread() = std::thread([] {
             timeline::NameThread("vertical blank timer");
@@ -818,7 +901,13 @@ void RunThreads(const lifted::Context& initial, u32 entry, s64 loop_budget) {
                         iop::Run(50'000);           // a short slice: the blank may come meanwhile
                     }
                     if (IopReplyPending()) break;
-                    SleepUntil(std::chrono::steady_clock::now() + std::chrono::microseconds(200));    // (precise: SleepUntil)
+                    // Asleep until the timer marks a blank or an interrupt due
+                    // (TimerTick wakes this at once), or a millisecond: the
+                    // IOP's next slice. A fixed 200 us sleep was 5,000 wakes a
+                    // second - half a core in the kernel through gameplay -
+                    // and a longer one took the blanks late.
+                    u32 seen = g_timer_seq.load(std::memory_order_acquire);
+                    if (!s.vblank_due && !s.timer_due) platform::WaitValue(&g_timer_seq, seen, 1);
                 }
                 g_idle_ns.fetch_add(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                             std::chrono::steady_clock::now() - idle_from).count()),
@@ -861,8 +950,9 @@ std::string ThreadReport() {
     std::string out;
     for (auto& [id, t] : S().threads) {
         char line[160];
-        std::snprintf(line, sizeof line, "  thread %u: %s, priority %d, entry 0x%08X, ran %llu times\n", id,
-                      StateName(t->state), t->priority, t->entry, static_cast<unsigned long long>(t->runs));
+        std::snprintf(line, sizeof line, "  thread %u: %s%s, priority %d, entry 0x%08X, ran %llu times\n", id,
+                      StateName(t->state), t->suspended ? " (suspended)" : "", t->priority, t->entry,
+                      static_cast<unsigned long long>(t->runs));
         out += line;
         // Where it is: the innermost calls of its guest stack.
         const std::size_t from = t->calls.size() > 10 ? t->calls.size() - 10 : 0;
@@ -896,7 +986,11 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
     Memory& m = GuestMemory();
     const u32 a0 = u32(c.r[4]), a1 = u32(c.r[5]);
     switch (number) {
-        case 0xFC: case -0xFD: {                     // SetAlarm / iSetAlarm(time, callback, common)
+        // The kernel's numbers (libkernl's stubs): SetAlarm 0xFC, ReleaseAlarm
+        // 0xFD, iSetAlarm -0xFE, iReleaseAlarm -0xFF. Burnout 3's network RPC
+        // polls its replies with an alarm that re-arms itself (iSetAlarm): taken
+        // for a release, it returned 0 as the new alarm and the polling stopped.
+        case 0xFC: case -0xFC: case -0xFE: {         // SetAlarm / iSetAlarm(time, callback, common)
             // time is in horizontal blanks: 262.5 a field, NTSC.
             const u32 time = a0 & 0xFFFF;
             std::lock_guard<std::mutex> hold(s.alarms_lock);
@@ -906,7 +1000,7 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
             if (!s.in_interrupt) RequestDelivery();   // one already due runs at once
             return true;
         }
-        case 0xFE: case -0xFF: {                     // ReleaseAlarm / iReleaseAlarm(id)
+        case 0xFD: case -0xFD: case -0xFF: {         // ReleaseAlarm / iReleaseAlarm(id)
             std::lock_guard<std::mutex> hold(s.alarms_lock);
             result = s.alarms.erase(s32(a0)) ? 0 : u64(s64(-1));
             return true;
@@ -920,6 +1014,7 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
             t->stack_size = u32(m.Read(a0 + 12, 4));
             t->gp = u32(m.Read(a0 + 16, 4));
             t->priority = s32(m.Read(a0 + 20, 4));
+            t->initial_priority = t->priority;
             result = t->id;
             s.threads[t->id] = std::move(t);
             return true;
@@ -950,9 +1045,32 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
             }
             result = 0;
             return true;
-        case 0x2F:                                   // GetThreadId
+        case 0x2F: case -0x2F:                       // GetThreadId / iGetThreadId
             result = s.current ? s.current->id : 1;
             return true;
+        case 0x37: case -0x38: {                     // SuspendThread / iSuspendThread(id)
+            // A suspended thread keeps its state - ready, waiting, sleeping - but
+            // is not run until ResumeThread; a wait that ends leaves it ready and
+            // still suspended. The kernel refuses to suspend the running thread
+            // from a thread (an interrupt handler may).
+            Thread* t = Find(a0);
+            if (!t || t->state == State::Dormant || t->suspended ||
+                (t == s.current && !s.in_interrupt)) {
+                result = u64(s64(-1));
+                return true;
+            }
+            t->suspended = true;
+            result = a0;
+            return true;
+        }
+        case 0x39: case -0x3A: {                     // ResumeThread / iResumeThread(id)
+            Thread* t = Find(a0);
+            if (!t || !t->suspended) { result = u64(s64(-1)); return true; }
+            t->suspended = false;
+            result = a0;
+            if (t->state == State::Ready) Preempt(*t);
+            return true;
+        }
         case 0x29: case -0x29: {                     // ChangeThreadPriority(id, priority)
             Thread* t = a0 == 0 ? s.current : Find(a0);
             if (!t) { result = u64(-1); return true; }
@@ -986,6 +1104,32 @@ bool ThreadSyscall(lifted::Context& c, s32 number, u64& result) {
             }
             result = 0;
             return true;
+        case 0x30: case -0x31: {                     // ReferThreadStatus / iReferThreadStatus(id, status*)
+            // ee_thread_status: status, entry, stack, stack size, gp, initial
+            // and current priority, attr, option, wait type, wait id, wakeups.
+            // Status: running 0x01, ready 0x02, waiting 0x04, suspended 0x08
+            // (with waiting: 0x0C), dormant 0x10. Games read their own priority
+            // so, and wake the threads that wait.
+            Thread* t = a0 == 0 ? s.current : Find(a0);
+            if (!t) { result = u64(s64(-1)); return true; }
+            u32 status = 0, wait_type = 0, wait_id = 0;
+            switch (t->state) {
+                case State::Running: status = 0x01; break;
+                case State::Ready: status = 0x02; break;
+                case State::Waiting: status = 0x04; wait_type = 2; wait_id = t->waiting_on; break;
+                case State::Sleeping: status = 0x04; wait_type = 1; break;
+                case State::Dormant: status = 0x10; break;
+            }
+            if (t->suspended) status = status == 0x04 ? 0x0C : status == 0x10 ? 0x10 : 0x08;
+            if (a1) {
+                const u32 fields[12] = {status, t->entry, t->stack, t->stack_size, t->gp,
+                                        u32(t->initial_priority), u32(t->priority), 0, 0,
+                                        wait_type, wait_id, u32(t->wakeups)};
+                for (int i = 0; i < 12; ++i) m.Write(a1 + 4 * i, fields[i], 4);
+            }
+            result = status;
+            return true;
+        }
         case 0x33: case 0x34: case -0x34: {          // WakeupThread / iWakeupThread
             Thread* t = Find(a0);
             if (!t) { result = u64(-1); return true; }
@@ -1110,6 +1254,7 @@ u64 LostVblanks() { return g_lost_vblanks.load(std::memory_order_relaxed); }
 u64 IdleNanoseconds() { return g_idle_ns.load(std::memory_order_relaxed); }
 void SetVif1Worker(bool on) { g_vif1_worker_wanted = on; }
 void SetRealTimeFrom(u64 frame) { g_real_time_from = frame; }
+void SetPaced(bool on) { g_paced = on; }
 
 void SetFastUntil(u64 frame, unsigned factor) {
     g_fast_until = frame;
@@ -1126,8 +1271,39 @@ void SetFastForward(unsigned factor) {
     if (before > 1 && factor == 1 && !VirtualClock()) GsDrain();
 }
 unsigned FastForward() { return g_fast_forward.load(std::memory_order_relaxed); }
+
+bool RunIopBetweenSteps() {
+    Scheduler& s = S();
+    if (!s.realtime || s.in_interrupt || !s.current) return false;
+    {
+        Timed timed(Section::Iop);
+        iop::Run(50'000);
+    }
+    while (DeliverIopReply()) {
+    }
+    DeliverPendingDmac();
+    if (s.timer_due.exchange(false)) {
+        DeliverTimers();
+        DeliverAlarms();
+    }
+    Thread* best = PickReady();
+    if (best && best->priority < s.current->priority) {
+        MakeReady(*s.current);
+        GiveWay();
+    }
+    return true;
+}
+
+bool BlankDue() { return S().vblank_due.load(std::memory_order_relaxed); }
 u64 LastVblankNs() { return g_last_vblank_ns.load(std::memory_order_relaxed); }
 
-void FastThread() { platform::FastThread(false); }
+void FastThread() {
+    // Never throttled; above the rest only with cores to spare (SpareCores):
+    // on a machine with few, the EE, the GS thread and VIF1's worker together
+    // keep every core busy, and at a higher priority the threads they depend
+    // on - the GPU driver's, the window's - waited seconds for one (until
+    // Windows lifts a starved thread, after about four).
+    platform::FastThread(false, SpareCores());
+}
 
 }  // namespace ps2host

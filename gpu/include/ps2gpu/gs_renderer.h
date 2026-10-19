@@ -217,9 +217,6 @@ public:
                               std::uint32_t width, std::uint32_t height) = 0;
     /* Forgets a texture (after what is recorded has used it). */
     virtual void ReleaseTexture(std::uint64_t key) = 0;
-    /* What the renderer keeps between runs (SetCacheDirectory), written now:
-       the pipeline cache, the pipelines made. Cheap when nothing changed. */
-    virtual void SaveCaches() {}
     /* Whether a target exists for (FBP, FBW, PSM) - what a draw can sample. */
     virtual bool HasTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm) const = 0;
     /* Triangles, three vertices each, in GS order. */
@@ -301,6 +298,10 @@ public:
        CT16, CT16S, at the PS2's resolution). False if the renderer cannot -
        the caller goes through memory, as before. Pixels whose bytes the
        source does not hold are left as they are. */
+    /* Whether ConvertImage / ConvertFromDepth can be done at all (their
+       pipelines made): what the threaded renderer predicts their answers by. */
+    virtual bool Converts() const { return false; }
+    virtual bool ConvertsDepth() const { return false; }
     virtual bool ConvertImage(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t rows,
                               std::uint32_t src_fbp, std::uint32_t src_fbw, std::uint32_t src_psm) {
         (void)fbp, (void)fbw, (void)psm, (void)rows, (void)src_fbp, (void)src_fbw, (void)src_psm;
@@ -343,16 +344,21 @@ public:
     }
 };
 std::unique_ptr<GsRenderer> CreateGsRenderer(Gpu& gpu, std::string* error);
-
-/* Where the renderer keeps what it learns from one run to the next - the
-   driver's pipeline cache, and which pipelines the run made, built again on a
-   thread of their own at the next start, before a batch asks for them (an
-   engine's PSO cache): a directory, set before CreateGsRenderer. Empty (the
-   default): nothing is kept. PS2GPU_PIPELINE_CACHE=0 turns it off. */
-void SetCacheDirectory(const std::string& directory);
-/* The pipeline cache since the start: "pipelines: N built ahead of need (M of
-   them used), K asked for and not ready, the cache's X KB loaded". */
-std::string PipelineCacheReport();
+/* Where the renderer keeps what it learns between runs: a folder (the PC
+   settings'), for its pipeline cache (gpu_pipeline_cache.bin) and the
+   pipelines the game has drawn with (gpu_pipelines.txt) - made again at the
+   start, from the cache, so none is built in the middle of a race. Set
+   before CreateGsRenderer; "" (a scripted run) keeps nothing. */
+void SetPipelineCacheDir(const std::string& dir);
+/* Pipelines a game is known to draw with (keys as gpu_pipelines.txt has
+   them), made by the renderer's worker from the start as the last runs'
+   are - a player's first run then makes none in the middle of a race. Keys
+   of an older engine are only made in vain. Set before CreateGsRenderer. */
+void SetPipelineHints(const std::uint32_t* keys, std::size_t count);
+/* `inner` on a thread of its own (threaded_renderer.cpp): what only hands
+   work over is queued and made there in order; what answers or reads waits
+   for the queue to empty first. One caller thread. */
+std::unique_ptr<GsRenderer> MakeThreadedGsRenderer(std::unique_ptr<GsRenderer> inner);
 
 /* How often the CPU has waited for the GPU to finish what was submitted, and
    for how long in all: "N submissions, S s waiting". */

@@ -39,6 +39,20 @@ python engine/tools/port.py --game games/<g>                      # build and ru
 python engine/tools/port.py --game games/<g> run -- --trace       # log every call
 ```
 
+A port is built for processors with AVX2 (`PS2HOST_AVX2`, on by default:
+the VU's lanes and the rest in three-operand SIMD, 6% of a race). For those
+without it - Intel's Pentium and Celeron of before 2021 (Pentium Silver,
+Celeron N, the Pentium Gold of desktops) - `port.py --game games/<g> --sse4
+build` builds `<name>-sse4.exe` (SSE4.1, in `build/port/cmake-sse4`, copied
+beside the main one); a release ships both. The executable's entry
+(`src/cpu_check.cpp`, a library of its own built without AVX) checks the
+processor before anything else runs - the runtime's start and static
+constructors are AVX2 code too - and on one without AVX2 starts the SSE4
+build beside it with the same command line, or says what is needed
+(`PS2HOST_TEST_NO_AVX2=1` takes that way on a processor with it). `port.py`
+builds with a compiler per 2.5 GB of memory: a file of compiled VU code
+takes one 2 GB and more.
+
 Options for finding out why boot stops, passed after `run --`:
 
 | option | what it shows |
@@ -64,8 +78,12 @@ Options for finding out why boot stops, passed after `run --`:
 | `--audio` | the SPU2's mixed output on the sound device, reverb included |
 | `--sample-gs` | `--sample` on the GS thread instead (the GS model, the GPU bridge, their submissions) |
 | `--sample-vif1` | `--sample` on VIF1's worker (real time: VIF1, VU1 and what they feed the GS) |
+| `PS2HOST_SAMPLE_STACKS=text` | with a `--sample*`: the whole stacks (function and line) of the samples whose innermost function's name holds the text - who calls what is hot |
+| `PS2HOST_GPU_THREAD=0` | the GPU renderer's Vulkan recording on the GS thread, as before; by default it has a thread of its own (`threaded_renderer.cpp`: draws and uploads queued in order, what answers or reads waits for the queue) - `PS2HOST_GPU_THREAD_LOG=1` says every 60 frames what waited for the queue |
+| `PS2HOST_REPLAY_BENCH=n` | with `--gs-replay` and `PS2HOST_REPLAY_GPU=1`: a capture's GS stream played n times over, without trace or pictures, and the time a pass took (and in all, to the last drawn) - the GS thread's work on a fixed sample; `--sample` before `--gs-replay` profiles it. Mind that the bridge starts from nothing there: images the game had made before the capture are missing (Burnout 3's race: a texture in the depth buffer's top byte, then decoded rather than sampled) |
 | `--vif1-sync` | in real time, VIF1 and VU1 on the EE's thread as under `--virtual-time` (vif1_worker.cpp) |
-| `--press BUTTON@FRAME` | hold a pad button for 6 frames from that frame (cross, circle, start, up, ...); `BUTTON@FROM-TO` holds it from one frame to another (`cross@17650-19400`: accelerate through a race); repeatable |
+| `--press BUTTON@FRAME` | hold a pad button for 6 frames from that frame (cross, circle, start, up, ...); `BUTTON@FROM-TO` holds it from one frame to another (`cross@17650-19400`: accelerate through a race); `padN:BUTTON@FRAME` is scripted controller N's (from 1), a device of its own that a game can give player 2 (`SetPortDevices`); repeatable |
+| `--key KEY@FRAME` | hold a keyboard key the same way (a letter or digit, enter, escape, space, up, lshift, ... or a virtual key's number, `0x20`): a game's own keys (`SetKeyboardMapper`) in a scripted run; `KEY@FROM-TO` too; repeatable |
 | `--real-time-from N` | a `--virtual-time` run goes on in real time from frame N - the clock carrying on, the blanks' timer and VIF1's worker started - so a scripted run gets exactly to what is to be measured, then is measured as played (with the player's settings beside the executable) |
 | `--fast-until N[:F]` | in real time, the vertical blanks F times as fast (8 unless said) until frame N, then at their rate: a scripted run's way to the part measured (`PS2HOST_PROFILE_FROM`). Faster than the EE keeps up with, the game falls behind its frame count and the presses miss: Burnout 3's race script holds at 2 |
 | `PS2HOST_PROFILE=FILE`, `PS2HOST_PROFILE_FROM=N` | the frame-pacing profiler (`ps2host/timeline.h`): every thread's work and every picture's way to the screen, as a timeline (Chrome's trace format: ui.perfetto.dev), from frame N; at the end a summary - the present intervals' percentiles, the frames dropped or late, and what was busy before each |
@@ -73,7 +91,8 @@ Options for finding out why boot stops, passed after `run --`:
 | `--memcard DIR` | a memory card in slot 1, kept as a directory: the game's saves are files there (`ps2host/mc2.h` answers libmc2's handlers; the port binds them). Without it the slot is empty |
 | `--setting KEY=VALUE` | a PC setting for this run, not saved (`--setting aspect=16:9`: a scripted run in a wider picture); any number of them |
 | `--vu-record FILE`, `--vu-interpret` | record the VU microprograms a run starts, for compiling ahead of time; run them interpreted (see below) |
-| `--vu-fast` | compiled VU1 programs leave out the MAC and STATUS flags no instruction of theirs can read ("Fast mode" below): exact but for those flags, ~15% less VU1 time; exact is the default but on a tablet (`PS2HOST_VU_EXACT=1` there) |
+| `--vu-fast` | compiled VU1 programs leave out the MAC and STATUS flags no instruction of theirs can read ("Fast mode" below): exact but for those flags, ~15% less VU1 time; exact is the default unless the game's port chooses it (`SetVuFastDefault`), or on a tablet |
+| `--vu-exact` | VU1's exact flags even where the game's port or a tablet defaults to fast mode (`PS2HOST_VU_EXACT=1` too) |
 | `--audio-wav FILE` | the same output recorded to a WAV file, for checking sound without listening |
 | `PS2HOST_AUDIO_LOG=1`, `PS2HOST_AUDIO_MUTE=1`, `PS2HOST_SPU_LOG=1`, `PS2HOST_SPU_NO_REVERB=1` | sound, looked into: every two seconds how the SPU2's samples came (the longest wait between batches) and what the device made of them (ran out, dropped, fewest buffers queued); the device played unheard; once a second the voices sounding, their volumes fixed or sweeping, the main volumes; the reverb left out |
 | `--watch-write ADDR` | every store to a guest address, with the function making it and four of its callers |
@@ -93,7 +112,9 @@ It is a windowed program, so no console opens beside it: started from a
 terminal it writes to that one, and started with no arguments to a log named
 after it (`burnout3.log`), which an error message points to.
 
-F1 (or L3 + R3 on a controller) opens the engine's PC settings panel over
+F1 shows or hides an FPS counter (the pictures shown a second; setting
+`fps_counter`, off by default). F9 (or L3 + R3 on a controller) opens the
+engine's PC settings panel over
 any game (`host/src/pc_menu.cpp`): resolution, aspect ratio, fullscreen,
 v-sync, frame pacing and the texture pack, applied at once and saved in
 `pc_settings.ini`; the game gets no input while it is open. A port can also
@@ -355,6 +376,15 @@ function already translated runs that translation directly.
 
 These translations are not verified - the interpreter never runs them - and the
 generated source says so.
+
+**Overlays** - code a game loads from its disc over free memory, several of them
+at the same address in turn - are decompiled as games of their own
+(ARCHITECTURE.md, *Overlays*) and listed in the game's `game.json`
+(`"overlays": ["overlays/game", ...]`). port.py builds each overlay's
+translations in a namespace of its own, and a table of its functions with the
+first 16 bytes of each one's original code. A call into an overlay's range runs
+the function of the overlay whose code is in memory there; a FlushCache, which
+a program issues after loading code, makes calls look again.
 
 ## Overrides
 

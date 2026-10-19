@@ -47,7 +47,13 @@ void RaiseTimerResolution();
 /* The calling thread before others: `critical` for the ones asleep almost
    always that must wake on time (the vertical blank's timer, the
    presenter); otherwise above normal. */
-void FastThread(bool critical);
+void FastThread(bool critical, bool raise = true);
+/* The calling thread above normal priority (Windows: HIGHEST): the EE's,
+   which the threads it feeds wait for. Elsewhere nothing more than FastThread. */
+void HigherThread();
+/* The process held to the logical cores in `mask` (PS2HOST_CORES: a small
+   machine measured on a big one). False where it cannot be (iOS, macOS). */
+bool HoldToCores(std::uint64_t mask);
 
 /* Waits while `*value == seen`, for up to `timeout_ms`; WakeValue wakes every
    waiter on it (WaitOnAddress / WakeByAddressAll on Windows). */

@@ -121,7 +121,13 @@ network, and the Mac takes the PC's results with one command:
    ```sh
    engine/tools/ipad_update.sh --pc http://<the PC's address>:8765    # the first time; then without --pc
    ```
-   It pulls the sources, takes the compiled VU programs from the PC when they
+   It pulls the sources, takes the game's executable from the disc beside
+   the repository and analyses it the first time (`analysis_ready.py`, about
+   a minute: code a port lifts at build time - Burnout 3's mods - is lifted
+   from them; `--iso <disc>` when the disc is elsewhere; it also lifts the
+   few functions the game's list has that sources made by an older engine
+   lack, and writes the overlays' table those sources predate), takes the compiled
+   VU programs from the PC when they
    changed, and brings the Xcode project up to date - with the PC's address
    built into the app (CMake's `PS2_REPORT_URL`). Then Run.
 3. The first run asks whether the app may use the local network: allow it.
@@ -155,7 +161,7 @@ store at every later run (`docs/ASSETS.md`). The first race after an update
 cooks; the races after it use the store. `[perf]   pipelines:` and
 `[perf]   assets (ASTC 4x4):` in the log say what each did.
 `PS2HOST_ASSETS=off` in the scheme turns the textures' part off (for an A/B
-with an input recording), `PS2GPU_PIPELINE_CACHE=0` the pipelines'.
+with an input recording).
 
 ### Leaving a run
 

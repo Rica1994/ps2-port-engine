@@ -75,13 +75,16 @@ else()
 endif()
 file(MAKE_DIRECTORY ${PS2GPU_SHADER_DIR})
 set(PS2GPU_SHADER_HEADERS)
-foreach(shader gs.vert gs.frag date.vert date.frag swizzle.comp decode.comp depth_load.frag patch.comp fxaa.comp downsample.comp touch.vert touch.frag reinterpret.comp)
+foreach(shader gs.vert gs.frag date.vert date.frag swizzle.comp decode.comp depth_load.frag patch.comp fxaa.comp downsample.comp
+               smaa_edges.comp smaa_weights.comp smaa_blend.comp touch.vert touch.frag reinterpret.comp)
     string(REPLACE "." "_" name ${shader})
     set(out ${PS2GPU_SHADER_DIR}/${name}.h)
     add_custom_command(OUTPUT ${out}
         COMMAND ${PS2GPU_GLSLANG} -V --target-env ${PS2GPU_SPIRV_ENV} --vn spirv_${name}
+                -I${CMAKE_CURRENT_LIST_DIR}/third_party/smaa
                 -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader}
         DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+                ${CMAKE_CURRENT_LIST_DIR}/shaders/smaa_common.glsl ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa/SMAA.glsl
                 ${PS2GPU_GLSLANG_DEP}
         COMMENT "glslang ${shader}")
     list(APPEND PS2GPU_SHADER_HEADERS ${out})
@@ -104,6 +107,15 @@ add_custom_command(OUTPUT ${out}
             ${PS2GPU_GLSLANG_DEP}
     COMMENT "glslang swizzle.comp (a target's image)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
+# The texture decode straight into a texture's image (a storage image).
+set(out ${PS2GPU_SHADER_DIR}/decode_image_comp.h)
+add_custom_command(OUTPUT ${out}
+    COMMAND ${PS2GPU_GLSLANG} -V --target-env ${PS2GPU_SPIRV_ENV} -DTO_IMAGE --vn spirv_decode_image_comp
+            -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/decode.comp
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/decode.comp ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
+            ${PS2GPU_GLSLANG_DEP}
+    COMMENT "glslang decode.comp (into a texture's image)")
+list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # ...and from a depth buffer, sampled.
 set(out ${PS2GPU_SHADER_DIR}/swizzle_depth_comp.h)
 add_custom_command(OUTPUT ${out}
@@ -112,14 +124,6 @@ add_custom_command(OUTPUT ${out}
     DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp ${CMAKE_CURRENT_LIST_DIR}/shaders/gs_address.glsl
             ${PS2GPU_GLSLANG_DEP}
     COMMENT "glslang swizzle.comp (a depth buffer)")
-list(APPEND PS2GPU_SHADER_HEADERS ${out})
-# The texture decode straight into the texture's image.
-set(out ${PS2GPU_SHADER_DIR}/decode_image_comp.h)
-add_custom_command(OUTPUT ${out}
-    COMMAND ${PS2GPU_GLSLANG} -V --target-env ${PS2GPU_SPIRV_ENV} -DIMAGE_OUT --vn spirv_decode_image_comp
-            -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/decode.comp
-    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/decode.comp ${PS2GPU_GLSLANG_DEP}
-    COMMENT "glslang decode.comp (into the texture's image)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # One image from a depth buffer over the same memory (a Z16 view of it).
 set(out ${PS2GPU_SHADER_DIR}/reinterpret_depth_comp.h)
@@ -153,13 +157,15 @@ add_library(ps2gpu STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/gpu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/gs_renderer.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/vulkan_setup.cpp
-    ${CMAKE_CURRENT_LIST_DIR}/src/touch_controls.cpp)
+    ${CMAKE_CURRENT_LIST_DIR}/src/touch_controls.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/threaded_renderer.cpp)
 add_dependencies(ps2gpu ps2gpu_shaders)
-target_include_directories(ps2gpu PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include PRIVATE ${PS2GPU_SHADER_DIR})
+target_include_directories(ps2gpu PUBLIC ${CMAKE_CURRENT_LIST_DIR}/include PRIVATE ${PS2GPU_SHADER_DIR}
+                           ${CMAKE_CURRENT_LIST_DIR}/third_party/smaa)
 target_compile_features(ps2gpu PUBLIC cxx_std_17)
 target_link_libraries(ps2gpu PUBLIC SDL3::SDL3-static PRIVATE volk::volk Vulkan::Headers)
 if(MSVC)
-    target_compile_options(ps2gpu PRIVATE /W3)
+    target_compile_options(ps2gpu PRIVATE /W3 /Z7)        # symbols for --sample, as ps2host has
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     target_compile_definitions(ps2gpu PRIVATE PS2GPU_IOS=1)

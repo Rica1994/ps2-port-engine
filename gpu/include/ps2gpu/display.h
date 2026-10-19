@@ -59,6 +59,9 @@ public:
        longest, in milliseconds. */
     struct Pacing { std::uint64_t presents = 0; double mean_ms = 0, jitter_ms = 0, longest_ms = 0; };
     virtual Pacing TakePacing() { return {}; }
+    /* Pictures shown a second, over the last half second or so: the FPS
+       counter's (F1), apart from TakePacing so it takes nothing from it. */
+    virtual double PresentsPerSecond() const { return 0.0; }
 
     /* Vertical sync: each picture waits for the screen's refresh (no
        tearing, FIFO), or goes at once (IMMEDIATE, or MAILBOX where that is
@@ -77,10 +80,10 @@ public:
        shape, filled. Letterboxed or pillarboxed in the window otherwise. */
     virtual void SetAspect(float aspect) { (void)aspect; }
     /* Anti-aliasing: the picture shown as drawn (the default); its edges
-       smoothed (FXAA) before it is scaled to the window; or, drawn larger
-       than shown (supersampling), averaged down to the shown size rather
-       than scaled. */
-    enum class AntiAliasing { kOff, kFxaa, kDownsample };
+       smoothed (FXAA, or SMAA's three passes) before it is scaled to the
+       window; or, drawn larger than shown (supersampling), averaged down to
+       the shown size rather than scaled. */
+    enum class AntiAliasing { kOff, kFxaa, kDownsample, kSmaa };
     virtual void SetAntiAliasing(AntiAliasing mode) { (void)mode; }
     /* The window's shape in the screen's pixels, width over height (0 when
        not known). */
@@ -96,6 +99,8 @@ public:
     virtual bool TakeCapture() { return false; }
     /* Tab since the last call: the texture pack turned on or off. */
     virtual bool TakeTexturePackToggle() { return false; }
+    /* F1 since the last call: the FPS counter turned on or off. */
+    virtual bool TakeFpsToggle() { return false; }
 
     /* Whether the window has the keyboard, and whether a key is down - by SDL
        scancode (SDL_SCANCODE_*), which names keys by position. */
@@ -110,12 +115,30 @@ public:
                                         // Triangle Circle Cross Square)
         std::uint8_t sticks[4] = {0x80, 0x80, 0x80, 0x80};   // right X, Y, left X, Y; 0x80 centred
         std::uint8_t l2 = 0, r2 = 0;    // the triggers' travel, 0-255
+        std::uint8_t family = 0;        // whose it is (its buttons' names): ControllerFamily
     };
+    enum ControllerFamily : std::uint8_t { kOtherController, kPlayStationController, kXboxController };
     virtual bool Pad(PadState* state) const { (void)state; return false; }
+    /* Every controller plugged in, in the order they were (SDL's id, the
+       name it gives, its family) - and one's own state by its id: false when
+       it is gone. */
+    struct ControllerInfo {
+        std::uint32_t id = 0;
+        std::string name;
+        std::uint8_t family = 0;
+    };
+    virtual std::vector<ControllerInfo> Controllers() const { return {}; }
+    virtual bool PadOf(std::uint32_t id, PadState* state) const { (void)id, (void)state; return false; }
     /* The controller's motors, 0-65535 each (the low-frequency, large one;
        the high-frequency, small one), until set again - 0, 0 stops them.
-       Taken up by the window's own thread (Pump). */
+       Taken up by the window's own thread (Pump). SetRumble sets every
+       controller's, SetRumbleOf one's. */
     virtual void SetRumble(std::uint16_t large, std::uint16_t small) { (void)large, (void)small; }
+    virtual void SetRumbleOf(std::uint32_t id, std::uint16_t large, std::uint16_t small) {
+        (void)id, (void)large, (void)small;
+    }
+    /* The controllers SetTriggerEffects is for: none named, every one. */
+    virtual void SetTriggerTargets(std::vector<std::uint32_t> ids) { (void)ids; }
     /* A controller's adaptive triggers (a DualSense's; others have none):
        off, a resistance from `start` (0-255 of the travel) of `force`
        (0-255), or a vibration from `start` of `force` at `frequency` (Hz),

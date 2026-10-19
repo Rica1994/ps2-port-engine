@@ -193,6 +193,30 @@ class TestLinks(unittest.TestCase):
         self.assertEqual(structure.fold_links(lines), lines)
 
 
+class TestBackwardGotos(unittest.TestCase):
+    def test_a_goto_back_spends_budget(self):
+        lines = ["    a0 = s0;",
+                 "L_001A9B70:;",
+                 "    out(); Call(c, 0x00128B18u, 0x001A9B78u); in();",
+                 "    if (v0 != v1) {",
+                 "            a0 = s0;",
+                 "            goto L_001A9B70;",
+                 "    }"]
+        out = structure.tick_backward_gotos(lines)
+        self.assertEqual(out[5], "            { Tick(c, 0x001A9B70u); goto L_001A9B70; }")
+        self.assertEqual(out[:5] + out[6:], lines[:5] + lines[6:])
+
+    def test_a_goto_forward_is_left(self):
+        lines = ["    if (a0 == 0ull) {", "        goto L_00100020;", "    }", "L_00100020:;",
+                 "    v0 = a0;"]
+        self.assertEqual(structure.tick_backward_gotos(lines), lines)
+
+    def test_a_loop_header_with_its_tick_is_not_ticked_twice(self):
+        lines = ["L_00100010:;", "    Tick(c, 0x00100010u);", "    a0 = a0 + 1;",
+                 "    if (a0 != a1) goto L_00100010;"]
+        self.assertEqual(structure.tick_backward_gotos(lines), lines)
+
+
 class TestSaveSlots(unittest.TestCase):
     PROLOGUE = [0x27BDFFE0, 0x7FB00000]          # addiu $sp, -0x20; sq $s0, 0($sp)
     EPILOGUE = [0x7BB00000, 0x03E00008, 0x27BD0020]  # lq $s0, 0($sp); jr $ra; addiu $sp, 0x20
@@ -211,6 +235,12 @@ class TestSaveSlots(unittest.TestCase):
 
     def test_a_128_bit_load_into_a_saved_register_keeps_the_saves(self):
         self.assertIsNone(self.slots([0x78900010]))                 # lq $s0, 0x10($a0)
+
+    def test_a_store_after_the_register_is_set_is_data_not_a_save(self):
+        # daddu $s0, $a3, $zero; sd $s0, 8($sp): before the first call, but
+        # $s0 is no longer the caller's - an argument the callee reads from
+        # the stack (0x00817898 in Resident Evil Outbreak's single.bin).
+        self.assertEqual(self.slots([0x00E0802D, 0xFFB00008]), {("s0", 0)})
 
 
 if __name__ == "__main__":

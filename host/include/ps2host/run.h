@@ -48,8 +48,8 @@ inline lifted::Context NewContext() {
 /* What the run touched, for the report at the end. */
 struct Stats {
     std::map<u32, u64> calls;                  /* function -> times called */
-    std::map<s32, u64> syscalls;               /* service -> times called */
-    std::map<u32, u64> register_reads, register_writes;   /* device register -> count */
+    std::map<s32, u64> syscalls;               /* service -> times called, beyond the array's */
+    u64 syscall_counts[0x200] = {};            /* service + 0x100 -> times called */
     std::vector<u32> stopped_in;               /* the stack when the run stopped */
     std::vector<u32> interrupted_in;           /* ...and, if that was a handler, the thread's */
     std::vector<std::string> notes;            /* one line per first-time event */
@@ -65,6 +65,8 @@ bool Tracing();
 void Note(const std::string& key, const std::string& text);
 /* Whether a Note under `key` would be logged (so its text is worth making). */
 bool Noting(const std::string& key);
+// --notes: every event noted, repeats included (Noting's answer for any key).
+bool NotingAll();
 
 /* Threads (threads.cpp): run the program's first thread from `entry` under the
    kernel's scheduler; returns only by throwing why the run ended. */
@@ -110,6 +112,11 @@ bool IopReplyPending();
 /* A packet from the IOP to the EE (a module's sceSifSendCmd): queued, and
    delivered as the SIF0 interrupt at the next safe point. */
 void QueueIopPacket(std::vector<u8> packet);
+/* A module's command sent from an IOP interrupt handler (sceSifSendCmd in
+   one): delivered now, with the answers due before it, unless the EE is in
+   an interrupt itself - so the EE's handler for it runs before the IOP goes
+   on, as on the console, where it takes microseconds. */
+void DeliverIopPacketNow();
 /* A host RPC server's: its answer (the RPC end) reaches the EE `ns` later, on
    the host clock (virtual under --virtual-time) - a device's time, such as a
    CD read's. */
@@ -123,6 +130,9 @@ void QueueRpcEnd(const std::vector<u8>& request, u32 server, u32 buffer, u32 cbu
 void InstallIopServers();
 void InstallFileIo();
 void InstallLoadFile();
+/* The release of the IOP's SDK modules ("2800"): the ROM's, or the replacement
+   image's the IOP was rebooted with. Four characters, not terminated. */
+const char* IopRelease();
 /* The IOP rebooted with a replacement image from the disc (IOPRPnnn.IMG):
    the releases of its modules - loadfile's answers its version check. */
 void UseIopImage(const std::string& path);
@@ -202,6 +212,16 @@ void GsPrivileged(u32 address, u64 value);
    thread once the frame's packets are taken, so the EE need not wait for
    them. False when there is no handler: the EE syncs and does it itself. */
 void SetGsFrameHandler(std::function<void(u64)> handler);
+/* A game's choice (default off; real time, --gpu): a frame's picture is
+   taken at its blank's end, not its start - when the GS stream has moved
+   past the displayed buffer (the first draw to another, or the next frame's
+   end). What the game does to the displayed buffer in the blank - a copy of
+   its finished frame there (Burnout 3), DISPFB flipped by its vertical blank
+   handler - the console's CRTC shows in the very next field; taken at the
+   blank's start, every picture went out a frame late. For a game that draws
+   its next frame into the displayed buffer itself, the picture would go out
+   only at the next frame's end: it keeps this off. */
+void SetPresentAtBlankEnd(bool on);
 /* VIF1, VU1 and what feeds the GS on a thread of their own, in real time
    (vif1_worker.cpp): Vif1Run queues a command the worker runs in order (at
    once without the worker, or on it); JoinVif1 waits until all have run. */
@@ -213,6 +233,15 @@ void SetVif1Worker(bool on);
    screen counting frames while it loads (a game's hook turns it on and
    off). */
 void SetFastForward(unsigned factor);
+/* Real time, from a guest thread (a game's override): the IOP runs a short
+   slice and what it answered is delivered - its replies, due timers, a
+   better thread woken - as in the EE's idle wait, so a loading step the game
+   takes once a frame can be taken again within the frame (the vertical
+   blanks, and what the screen shows, at their own pace). False, at once,
+   outside real time: there the step waits for its frame. */
+bool RunIopBetweenSteps();
+/* Real time: the next vertical blank is due (the EE has not taken it yet). */
+bool BlankDue();
 /* --fast-until N[:F]: in real time, the blanks F times as fast (8 unless
    said) until frame N - a scripted run's way to what is to be measured -
    then at their rate. Faster than the EE keeps up with, the game falls
@@ -349,10 +378,11 @@ bool WindowVsync();
    so - auto's the window's now. */
 void SetWindowAspect(const std::string& aspect);
 float PictureAspect();
-/* Anti-aliasing (the "antialiasing" setting): "off", the default; "fxaa",
-   the picture's edges smoothed before it is scaled to the window; "ssaa2" or
-   "ssaa4", supersampling - drawn at 2 or 4 times the internal resolution
-   (SupersamplingFactor) and averaged down to the window's size. */
+/* Anti-aliasing (the "antialiasing" setting): "off", the default; "fxaa"
+   or "smaa" (SMAA 1x, gpu/third_party/smaa), the picture's edges smoothed
+   before it is scaled to the window; "ssaa2" or "ssaa4", supersampling -
+   drawn at 2 or 4 times the internal resolution (SupersamplingFactor) and
+   averaged down to the window's size. */
 void SetWindowAntiAliasing(const std::string& mode);
 u32 SupersamplingFactor();
 /* A line after the window's title (a game's tool says what it is doing);
@@ -395,13 +425,49 @@ bool HostKeyDown(int key);
 /* The window's game controller, as a DualShock 2 reads (window.cpp): false
    when none is plugged in. `buttons` bit n is input n held; the sticks are
    right X, Y, left X, Y (0x80 centred); l2, r2 the triggers' travel. */
+enum class ControllerFamily : u8 { kOther, kPlayStation, kXbox };
 struct HostPadState {
     u16 buttons = 0;
     u8 sticks[4] = {0x80, 0x80, 0x80, 0x80};
     u8 l2 = 0, r2 = 0;
     u8 pressure[16] = {};       // each input's pressure (a controller filter's to change; 0xFF pressed)
+    ControllerFamily family = ControllerFamily::kOther;     // whose: its buttons' names and marks
+    u8 port = 0;                // the controller port it drives (a controller filter's to tell players apart)
 };
 bool HostPad(HostPadState* state);
+/* The players' devices: the keyboard, each controller plugged in (in the
+   order they were) and each scripted one (--press padN:...), by an id that
+   stays while it is there. HostDevicePad reads one controller as HostPad
+   does (false: gone, or the keyboard). */
+constexpr u32 kKeyboardDevice = 0;
+constexpr u32 kScriptedDevice = 0xFFFF0000u;        // + n: --press padN:BUTTON@FRAME
+struct HostDevice {
+    u32 id = kKeyboardDevice;
+    std::string name;           // "Keyboard", the controller's own name
+    ControllerFamily family = ControllerFamily::kOther;
+};
+std::vector<HostDevice> HostDevices();
+bool HostDevicePad(u32 id, HostPadState* state);
+/* Which devices drive each controller port, 0 and 1 (players 1 and 2). By
+   default port 0 has every device - the keyboard, every controller, every
+   scripted press - and port 1 none: nothing plugged in. SetPortDevices
+   seats a port's players: port 1 then has a controller plugged in. While
+   SetPortsSplit(true) - a game's two players playing - each port is driven
+   by its own devices alone, its rumble theirs, the trigger effects
+   (HostTriggerEffects) port 0's; otherwise (its menus) every device drives
+   both ports, as player 1 - the game's screens for player 2 (its car's
+   choice) answering any. ResetPortDevices: the default again. */
+void SetPortDevices(u32 port, const std::vector<u32>& devices);
+void SetPortsSplit(bool on);
+/* The window's controllers alone (window.cpp; HostDevices adds the rest),
+   one's state, one's motors, and the controllers trigger effects are for
+   (none: every one). */
+std::vector<HostDevice> WindowControllers();
+bool WindowControllerPad(u32 id, HostPadState* state);
+void HostRumbleOf(u32 id, u8 large, u8 small);
+void HostTriggerTargets(const std::vector<u32>& ids);
+void ResetPortDevices();
+bool PortsAssigned();
 /* The mouse over the window (window.cpp), in the picture's terms: x and y
    from 0 to 1 across the game's picture as shown (past them outside it);
    `held` the buttons down (bit 0 left, 1 middle, 2 right), and since the last
@@ -449,13 +515,42 @@ InputDevice LastInputDevice(u64* frame = nullptr);
    each time the pad is read (once a frame, on the EE's thread, at the
    vertical blank): what the mouse means, say. */
 void SetPadHook(u16 (*hook)());
-/* --press: hold `button` (cross, start, up, ...) for 6 frames from `frame`. */
+/* --press: hold `button` (cross, start, up, ...) for 6 frames from `frame` -
+   the player's, on port 0; `padN:button` scripted controller N's (from 1), a
+   device of its own (HostDevices) a game can give a port (SetPortDevices). */
 bool ScriptPress(const std::string& button, u64 from, u64 to, u8 pressure = 0xFF);
+/* --key: hold a key (a Win32 virtual key) from frame `from` to `to`, as if
+   the player held it in a window with the focus - a game's own keys
+   (SetKeyboardMapper) tested in a scripted run. `key` is a letter or digit,
+   a name (enter, escape, space, backspace, tab, up, down, left, right,
+   lshift, rshift, lctrl, rctrl) or a virtual key's number (0x20). */
+bool ScriptKey(const std::string& key, u64 from, u64 to);
+/* Whether a scripted key is held now (HostKeyDown), and whether there are
+   any (a scripted run's keys count as the focused window's). */
+bool ScriptedKeyDown(int key);
+bool KeysScripted();
+/* --record-input FILE: every pad report the game reads that differs from the
+   one before, as `frame byte byte ...` lines - buttons, sticks and pressures,
+   whatever gave them. --replay-input FILE: those reports instead of the pad's,
+   each from its frame on. With --virtual-time a recorded session replays
+   exactly: a bug met by playing becomes a scripted run. False when the file
+   cannot be opened or read. */
+bool RecordInput(const std::string& path);
+bool ReplayInput(const std::string& path);
+/* --paced: a --virtual-time run's vertical blanks no closer than the
+   display's, so a person can play it (and record it) at the game's speed. */
+void SetPaced(bool on);
 /* A game's own controls: the controller's state each pad read, before the
    game sees it - its buttons (DualShock 2 inputs, libpad's order) and their
    pressures to change as the filter likes; the keyboard and scripted presses
    are not given to it. LastInputDevice sees what the player pressed. */
 void SetControllerFilter(void (*filter)(HostPadState* pad));
+/* A game's own keys: the DualShock 2 inputs the keyboard holds (bit n: input
+   n), asked each pad read in place of the host's keys (Backspace Select,
+   Enter Start, the arrows the D-pad, 1 3 Q E L2 R2 L1 R1, V C X Z Triangle
+   Circle Cross Square) - a game whose player chooses them. Read with
+   HostKeyDown while WindowFocused. */
+void SetKeyboardMapper(u16 (*mapper)());
 /* --mouse FRAME:X,Y[,L|R|U|D]: the mouse at (X, Y) of the picture (0 to 1)
    from that frame - and its left or right button clicked, or the wheel
    turned up or down, then. With any, the window's own mouse is not read. */
@@ -479,6 +574,32 @@ void DeliverTimers();
 u64 ClockNs();
 void SetVirtualClock(bool on);
 bool VirtualClock();
+/* Disc reads: in a drive's time (a 24x CD's, after a seek - the console's), or
+   fast, as quickly as a PC reads the image (cdvd.cpp). Fast with --fast-disc,
+   or in real time when the player's "fast_loading" setting says so - off
+   unless the game's port defaults it on (SetFastLoadingDefault), as a game may
+   time things by its reads (Mister Mosquito's stage loader does). Scripted
+   runs keep the drive's time, so their pictures stay as recorded. */
+bool FastDisc();
+/* Fast or not from now on: a settings menu's "fast_loading" taking effect at
+   once (a scripted run's stays the drive's). */
+void SetFastDisc(bool on);
+void SetFastLoadingDefault(bool on);
+/* VU1's fast mode (--vu-fast: no MAC/STATUS flags where nothing can read
+   them - the same pictures, less VU1 time) as the default, for a game whose
+   scripted runs draw every picture the same with it; --vu-exact turns it
+   off again. */
+void SetVuFastDefault(bool on);
+/* Frame pacing (the "frame_pacing" setting: pictures shown evenly spaced,
+   a little more delay) when the player has not chosen: on, unless the game's
+   port defaults it off. */
+void SetFramePacingDefault(bool on);
+bool FramePacingDefault();
+/* The GPU pipelines a game is known to draw with (the keys of a
+   gpu_pipelines.txt a run kept beside its settings), made from the start in
+   the background - none made in the middle of a player's first race
+   (ps2gpu::SetPipelineHints). Called as the game's overrides register. */
+void SetGpuPipelineHints(const u32* keys, std::size_t count);
 void AdvanceClock(u64 ns);
 /* Run the INTC handlers for `cause`, if it is enabled (threads.cpp). */
 void RaiseIntc(u32 cause);
