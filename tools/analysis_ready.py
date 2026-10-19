@@ -84,31 +84,56 @@ def main(argv=None) -> int:
 
 
 def lift_missing(game) -> None:
-    """Functions the game's list (config/functions.csv) has in src/lifted that
-    the lifted sources here lack - sources lifted by an older engine, which
-    refused what the newer one lifts unverified - lifted now into
-    src/lifted/lifted_missing.cpp and put in the dispatch table. Without them
-    a run stops where the game first calls one (Burnout 3's 0x002FC820, from
-    a sound interrupt since v0.12's SPU2)."""
+    """Functions the lifted sources here call, or the game's list
+    (config/functions.csv) has in src/lifted, that they lack - sources lifted
+    by an older engine, which refused what the newer one lifts unverified,
+    and functions the PC's runs never reached (its port.py lifts what a run
+    stops at for the next build; the Mac takes the PC's sources as they
+    are) - lifted now into src/lifted/lifted_missing.cpp and put in the
+    dispatch table. Without them a run stops where the game first calls one:
+    Burnout 3's 0x002FC820 (from a sound interrupt since v0.12's SPU2), its
+    0x0024B0C0 (a countdown at boot that a slow first start - pipelines
+    built again after an engine update - runs out)."""
     import csv
     import re
 
     lifted_dir = game.path(os.path.join(os.path.dirname(game.generated), "lifted"))
+    generated_dir = game.path(game.generated)
     table = game.path(os.path.join(game.build, "port", "generated", "dispatch.cpp"))
     listed = game.path(game.status)
     if not (os.path.isdir(lifted_dir) and os.path.isfile(table) and os.path.isfile(listed)):
         return
     own = os.path.join(lifted_dir, "lifted_missing.cpp")
     defined = set()
-    for name in os.listdir(lifted_dir):
-        if name.endswith(".cpp") and os.path.join(lifted_dir, name) != own:
-            with open(os.path.join(lifted_dir, name), encoding="utf-8", errors="replace") as handle:
-                defined.update(int(m.group(1), 16) for m in
-                               re.finditer(r"^void F_([0-9A-F]{8})\(lifted::Context& c\) \{", handle.read(), re.M))
+    called = set()
+    sources = [os.path.join(lifted_dir, n) for n in os.listdir(lifted_dir) if n.endswith(".cpp")]
+    if os.path.isdir(generated_dir):
+        sources += [os.path.join(generated_dir, n) for n in os.listdir(generated_dir) if n.endswith(".cpp")]
+    discovered = os.path.join(os.path.dirname(table), "discovered.cpp")
+    if os.path.isfile(discovered):
+        sources.append(discovered)
+    for path in sources:
+        if path == own:
+            continue
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+        defined.update(int(m.group(1), 16) for m in
+                       re.finditer(r"^void F_([0-9A-F]{8})\(lifted::Context& c\) \{", text, re.M))
+        called.update(int(m.group(1), 16) for m in re.finditer(r"(?:Call|TailCall)\(c, 0x([0-9A-F]{8})u", text))
+    with open(table, encoding="utf-8") as handle:
+        text = handle.read()
+    entries = {int(m.group(1), 16): m.group(2) for m in
+               re.finditer(r"^    \{0x([0-9A-F]{8})u, (\w+), ", text, re.M)}
     with open(listed, newline="", encoding="utf-8") as handle:
-        wanted = sorted(int(row["address"], 16) for row in csv.DictReader(handle)
-                        if row["source"] == "src/lifted/")
-    missing = [a for a in wanted if a not in defined]
+        wanted = {int(row["address"], 16) for row in csv.DictReader(handle) if row["source"] == "src/lifted/"}
+    # Called but not in the table, or in it with nothing to run - and what
+    # an earlier run lifted (the table names them now).
+    wanted |= {a for a in called if entries.get(a, "nullptr") == "nullptr"}
+    if os.path.isfile(own):
+        with open(own, encoding="utf-8", errors="replace") as handle:
+            wanted |= {int(m.group(1), 16) for m in
+                       re.finditer(r"^void F_([0-9A-F]{8})\(lifted::Context& c\) \{", handle.read(), re.M)}
+    missing = sorted(a for a in wanted if a not in defined)
     if not missing:
         return
     from ps2decomp import lift
@@ -120,19 +145,34 @@ def lift_missing(game) -> None:
     lift.use_sections(_other_sections(elf, section))
     lift.use_function_starts(sorted(functions))
     image = elf.section_data(section)
-    out = ["/* Lifted by engine/tools/analysis_ready.py: functions the game's list",
-           " * has in src/lifted that these sources lacked. NOT VERIFIED.",
-           " * Generated - do not edit. */", "",
+    out = ["/* Lifted by engine/tools/analysis_ready.py: functions these sources",
+           " * call, or the game's list has in src/lifted, that they lacked.",
+           " * NOT VERIFIED. Generated - do not edit. */", "",
            '#include "ps2rt/lifted.h"', "", "using namespace generated;", "using namespace lifted;", ""]
     done = []
-    for address in missing:
+    bodies = {}
+    queue = list(missing)
+    seen = set(queue)
+    while queue:
+        address = queue.pop(0)
         f = functions.get(address)
-        if not f or f["end"] <= address:
-            print("0x%08X: not a function in this analysis; left out" % address)
+        if not f or f["end"] <= address or not (section.addr <= address and f["end"] <= section.addr + len(image)):
+            continue                    # (not a function this analysis knows in the code: left as it is)
+        try:
+            body = lift.lift_function(image, section.addr, address, f["end"], f.get("chunks", ()))
+        except lift.Refused as refused:
+            print("0x%08X: not lifted (%s)" % (address, refused))
             continue
-        out += ["/* NOT VERIFIED: lifted where the sources lacked it */",
-                lift.lift_function(image, section.addr, address, f["end"], f.get("chunks", ()))]
+        bodies[address] = body
         done.append(address)
+        # What it calls in turn, lacking too.
+        for m in re.finditer(r"(?:Call|TailCall)\(c, 0x([0-9A-F]{8})u", body):
+            callee = int(m.group(1), 16)
+            if callee not in seen and callee not in defined and entries.get(callee, "nullptr") == "nullptr":
+                seen.add(callee)
+                queue.append(callee)
+    for address in sorted(bodies):         # (in address order: the same text each run)
+        out += ["/* NOT VERIFIED: lifted where the sources lacked it */", bodies[address]]
     source = "\n".join(out) + "\n"
     old = ""
     if os.path.isfile(own):
@@ -141,22 +181,38 @@ def lift_missing(game) -> None:
     if source != old:           # the same text: not touched, nothing built again
         with open(own, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(source)
-    with open(table, encoding="utf-8") as handle:
-        text = handle.read()
     patched = False
     for address in done:
         entry = "{0x%08Xu, nullptr, nullptr, " % address
+        name = "F_%08X" % address
         if entry in text:
-            text = text.replace(entry, "{0x%08Xu, F_%08X, nullptr, " % (address, address), 1)
-            declaration = "void F_%08X(lifted::Context& c);\n" % address
+            text = text.replace(entry, "{0x%08Xu, %s, nullptr, " % (address, name), 1)
+        elif address not in entries:
+            # A new entry, in address order (the table is searched by halves).
+            size = functions[address]["end"] - address
+            line = "    {0x%08Xu, %s, nullptr, %uu},\n" % (address, name, size)
+            later = [a for a in entries if a > address]
+            if later:
+                at = text.index("    {0x%08Xu, " % min(later))
+            else:
+                at = text.index("};", text.index("kGuestFunctions[] = {"))
+            text = text[:at] + line + text[at:]
+            entries[address] = name
+            count = re.search(r"kGuestFunctionCount = (\d+);", text)
+            if count:
+                text = text[:count.start(1)] + str(int(count.group(1)) + 1) + text[count.end(1):]
+        else:
+            continue
+        declaration = "void %s(lifted::Context& c);\n" % name
+        if declaration not in text:
             first = text.index("void F_")
             text = text[:first] + declaration + text[first:]
-            patched = True
+        patched = True
     if patched:
         with open(table, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
     if source != old or patched:
-        print("lifted %d function(s) the sources lacked: %s" % (len(done), ", ".join("0x%08X" % a for a in done)))
+        print("lifted %d function(s) the sources lacked: %s" % (len(done), ", ".join("0x%08X" % a for a in sorted(done))))
 
 
 if __name__ == "__main__":

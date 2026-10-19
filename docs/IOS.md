@@ -127,8 +127,8 @@ network, and the Mac takes the PC's results with one command:
    the repository and analyses it the first time (`analysis_ready.py`, about
    a minute: code a port lifts at build time - Burnout 3's mods - is lifted
    from them; `--iso <disc>` when the disc is elsewhere; it also lifts the
-   few functions the game's list has that sources made by an older engine
-   lack, and writes the overlays' table those sources predate), takes the compiled
+   few functions the game's list has, or the sources call, that sources made by an older engine
+   or on a PC whose runs never reached them lack, and writes the overlays' table those sources predate), takes the compiled
    VU programs from the PC when they
    changed, and brings the Xcode project up to date - with the PC's address
    built into the app (CMake's `PS2_REPORT_URL`). Then Run.
