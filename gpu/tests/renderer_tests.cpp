@@ -786,6 +786,118 @@ void Converted(ps2gpu::GsRenderer& renderer) {
         }
 }
 
+/* DepthIntoView against the draw it stands for, the renderer's own way: the
+   32-bit target made into its 16-bit view, the depth buffer into a Z16 one,
+   a decal sprite of the Z16 view's texels drawn into the 16-bit view under
+   FBMSK, and the target made back from the view. Z24 (its words' top bytes
+   from memory) and Z32, CT16 and CT16S views, a sprite's texels moved by a
+   whole offset, FBMSK keeping half or none of the bits. */
+void DepthIntoViewDrawn(ps2gpu::GsRenderer& renderer) {
+    if (!renderer.DrawsDepthIntoView()) {
+        Check(false, "DepthIntoView's pipeline made");
+        return;
+    }
+    std::uint32_t seed = 4242;
+    auto random_bytes = [&](std::vector<std::uint8_t>& bytes) {
+        for (auto& b : bytes) {
+            seed = seed * 1664525u + 1013904223u;
+            b = std::uint8_t(seed >> 24);
+        }
+    };
+    const std::uint32_t fbw = 2, blocks = 128;          // 128x64 32-bit, 128x128 16-bit
+    std::uint32_t fbp = 0x180;
+    for (std::uint32_t zpsm : {0x31u, 0x30u})
+        for (std::uint32_t view : {0x02u, 0x0Au})
+            for (std::uint32_t fbmsk : {0x3FFFu, 0x0u}) {
+                fbp += 8;
+                const std::uint32_t zfbp = fbp + 4;
+                std::vector<std::uint8_t> frame(blocks * 256), z(blocks * 256);
+                random_bytes(frame);
+                random_bytes(z);
+                if (zpsm == 0x31)
+                    for (std::size_t i = 0; i < z.size(); i += 4) z[i + 2] &= 0x7F;
+                renderer.MemoryWrite(zfbp * 32, zfbp * 32 + blocks, z.data());
+                renderer.DepthFromMemory(zfbp, 128, 64, fbw, zpsm);
+                renderer.MemoryWrite(fbp * 32, fbp * 32 + blocks, frame.data());
+                renderer.TargetFromMemory(fbp, fbw, 0x00, 128, 64);
+                // The sprite: the view's [8, 40) x [4, 100), its texels 6 left and 3 up.
+                const int du = -6, dv = -3;
+                ps2gpu::DepthIntoViewParams p;
+                p.bp = fbp * 32;
+                p.bw = fbw;
+                p.view_psm = view;
+                p.cols = 128;
+                p.rows = 64;
+                p.vx0 = 8;
+                p.vy0 = 4;
+                p.vx1 = 40;
+                p.vy1 = 100;
+                p.du = du;
+                p.dv = dv;
+                p.tw = p.th = 128;
+                p.tbp = zfbp * 32;
+                p.tbw = fbw;
+                p.tpsm = 0x32;
+                p.zbp = zfbp * 32;
+                p.zbw = fbw;
+                p.zpsm = zpsm;
+                p.zwidth = 128;
+                p.zheight = 64;
+                p.ta0 = 0;
+                p.ta1 = 0x80;
+                p.keep = 0;
+                for (std::uint32_t i = 0; i < 15; ++i)
+                    if ((fbmsk | ~0x80F8F8F8u) & (1u << ((i / 5) * 8 + 3 + i % 5))) p.keep |= 1u << i;
+                const bool made = renderer.DepthIntoView(p);
+                std::vector<std::uint32_t> got, want;
+                std::uint32_t w = 0, h = 0;
+                renderer.ReadTarget(fbp, fbw, 0x00, &got, &w, &h);
+                // The long way, from the same start.
+                renderer.TargetFromMemory(fbp, fbw, 0x00, 128, 64);
+                renderer.TargetFromMemory(fbp, fbw, view, 128, 128);
+                renderer.ConvertImage(fbp, fbw, view, 128, fbp, fbw, 0x00);
+                renderer.TargetFromMemory(zfbp, fbw, 0x32, 128, 128);
+                renderer.ConvertFromDepth(zfbp, fbw, 0x32, 128, zfbp, 128, 64, fbw, zpsm);
+                ps2gpu::GsDrawState state;
+                state.fbp = fbp;
+                state.fbw = fbw;
+                state.psm = view;
+                state.fbmsk = fbmsk;
+                state.width = 128;
+                state.height = 128;
+                state.scissor_x1 = 127;
+                state.scissor_y1 = 127;
+                state.sprite_prim = true;
+                state.textured = true;
+                state.texture_target = true;
+                state.tex_fbp = zfbp;
+                state.tex_fbw = fbw;
+                state.tex_target_psm = 0x32;
+                state.tex_format = 2;
+                state.tfx = ps2gpu::TextureFunction::Decal;
+                state.tcc = true;
+                state.tw = state.th = 128;
+                state.wms = state.wmt = 1;
+                state.ta0 = 0;
+                state.ta1 = 0x80;
+                const float x0 = 8, x1 = 40, y0 = 4, y1 = 100;
+                const float s0 = (x0 + du + 0.5f) / 128, s1 = (x1 + du + 0.5f) / 128;
+                const float t0 = (y0 + dv + 0.5f) / 128, t1 = (y1 + dv + 0.5f) / 128;
+                const ps2gpu::GsVertex v[6] = {
+                    {x0, y0, 0, 0x80, 0x80, 0x80, 0x80, s0, t0, 1}, {x1, y0, 0, 0x80, 0x80, 0x80, 0x80, s1, t0, 1},
+                    {x0, y1, 0, 0x80, 0x80, 0x80, 0x80, s0, t1, 1}, {x1, y0, 0, 0x80, 0x80, 0x80, 0x80, s1, t0, 1},
+                    {x1, y1, 0, 0x80, 0x80, 0x80, 0x80, s1, t1, 1}, {x0, y1, 0, 0x80, 0x80, 0x80, 0x80, s0, t1, 1}};
+                renderer.DrawTriangles(state, v, 6);
+                renderer.Flush();
+                renderer.ConvertImage(fbp, fbw, 0x00, 64, fbp, fbw, view);
+                renderer.ReadTarget(fbp, fbw, 0x00, &want, &w, &h);
+                char what[112];
+                std::snprintf(what, sizeof what, "Z16 texels of a %02X depth buffer into a %02X view, FBMSK %X, as drawn",
+                              unsigned(zpsm), unsigned(view), unsigned(fbmsk));
+                Check(made && !got.empty() && got == want, what);
+            }
+}
+
 /* Write-backs of part of an image (Columns, and a rectangle not a multiple
    of 16 wide - a 16-bit word's two pixels are x and x + 8): the pixels inside
    reach memory, the ones beside them leave memory as it was. */
@@ -865,6 +977,7 @@ int main() {
     TargetFromMemory(*renderer);
     PartlyMaskedChannels(*renderer);
     Converted(*renderer);
+    DepthIntoViewDrawn(*renderer);
     PartWrittenBack(*renderer);
     if (g_failures) std::printf("gpu renderer tests: %d failed\n", g_failures);
     else std::printf("gpu renderer tests: all passed (%s)\n", gpu->Describe().c_str());

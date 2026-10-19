@@ -156,6 +156,20 @@ its display buffer at that frame's start is not drawn either
 (`SetDisplayCopyUnseen`; the `[gpu] frame` line counts the draws left out;
 `PS2HOST_UNSEEN_COPY=0` draws them).
 
+Since 19 Oct evening a race picture costs the GPU less, the pictures the
+same: the depth haze is one compute pass over the frame instead of two
+conversions, a render pass of 16-bit sprites and a conversion back
+(`PS2HOST_DEPTH_INTO_VIEW=0` for the old way); a texture no longer counts
+the page past its last one as its own (a glow image drawn there every
+picture had one texture decoded again two or three times a picture, the
+glow image written back each time); a CLUT loaded from an image just drawn
+writes back one page of it; targets read as PSMT4HL/HH go through the CLUT
+in the shader (docs/GPU.md). On the
+CPU, VU0's macro mode no longer switches FPCR around each instruction on
+arm64 - a fifth of the EE thread on the A12 - and rounds toward zero by
+correcting the nearest result instead (`runtime/include/ps2rt/vu_rtz.h`,
+the same bits: VuMacroWithoutModeIsTheMode).
+
 `PS2GPU_PROBE=1` (or `2`) in the scheme measures the GS shader rather than
 playing: `1` draws every pixel in its vertices' colour alone, `2` reads
 textures at the nearest texel without the GS's addressing and filter. The

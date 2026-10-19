@@ -1,0 +1,125 @@
+#version 450
+// A depth buffer's Z16 texels drawn into a 16-bit view of a 32-bit target,
+// one compute pass over the target itself (gs_renderer.cpp's DepthIntoView):
+// what Burnout 3's race does once a picture for its haze - ten 8x896 sprites
+// with a PSMZ16 texture of its depth buffer, decal, into a CT16 view of the
+// frame under an FBMSK (its depth's high bits into the frame's green and
+// alpha). Drawn the GS's way that took the frame made into a 16-bit view,
+// the depth buffer into a Z16 one, the sprites, and the frame made back
+// (reinterpret.comp, three passes and a render pass on an A12's tiles);
+// here each pixel of the 32-bit target makes its two 16-bit halves itself,
+// as the sprites would have them:
+//  - the view's pixel whose half it is (the CT16 layout inverted), inside
+//    the sprite's rectangle (the scissor's already);
+//  - its texel, the pixel moved by the sprite's whole-texel offset;
+//  - that texel's 16 bits at its Z16 address, from the depth buffer's pixel
+//    holding them (sampled Z / 2^32, a Z24 word's top byte from memory);
+//  - decal: the texel's 15 colour bits as they are, alpha's bit TEXA's
+//    TA1 or TA0 (AEM: 0 for black) at or above 0x80;
+//  - the bits FBMSK keeps (in 16-bit positions) from the target.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D depth;
+layout(set = 1, binding = 0, rgba8) uniform image2D target;
+layout(std430, set = 2, binding = 0) readonly buffer Memory { uint mem[]; };
+
+layout(push_constant) uniform Params {
+    uint bp, bw;            // the target and its view: base (blocks), width (64-pixel units)
+    uint view_psm;          // the view's: CT16, CT16S
+    uint x0, y0, cols, rows;    // the target's pixels looked at: [x0, x0 + cols) x [y0, y0 + rows)
+    uint vx0, vy0, vx1, vy1;    // the view's pixels drawn: [vx0, vx1) x [vy0, vy1)
+    int du, dv;             // a view pixel's texel: (x + du, y + dv)
+    uint tw, th;            // the texture's size: texels wrap (REPEAT) or clamp (CLAMP) within it
+    uint wrap;              // bit 0 S repeats, bit 1 T repeats (else clamped)
+    uint tbp, tbw, tpsm;    // the texture: Z16, Z16S
+    uint zbp, zbw, zpsm;    // the depth buffer: Z24, Z32
+    uint zwidth, zheight;
+    uint ta0, ta1, aem;
+    uint keep;              // the 16 bits each half keeps
+} p;
+
+const uint PSMCT16S = 0x0Au, PSMZ24 = 0x31u, PSMZ16S = 0x3Au;
+const uint kMask = (4u << 20) - 1u;
+
+const uint kBlock16Inv[32] = uint[](0, 4, 1, 5, 8, 12, 9, 13, 2, 6, 3, 7, 10, 14, 11, 15, 16, 20, 17, 21, 24, 28, 25, 29, 18, 22, 19, 23, 26, 30, 27, 31);
+const uint kBlock16SInv[32] = uint[](0, 4, 1, 5, 16, 20, 17, 21, 8, 12, 9, 13, 24, 28, 25, 29, 2, 6, 3, 7, 18, 22, 19, 23, 10, 14, 11, 15, 26, 30, 27, 31);
+const uint kBlockZ32Inv[32] = uint[](20, 21, 28, 29, 22, 23, 30, 31, 4, 5, 12, 13, 6, 7, 14, 15, 16, 17, 24, 25, 18, 19, 26, 27, 0, 1, 8, 9, 2, 3, 10, 11);
+const uint kColumn32Inv[64] = uint[](0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15, 16, 17, 24, 25, 18, 19, 26, 27, 20, 21, 28, 29, 22, 23, 30, 31, 32, 33, 40, 41, 34, 35, 42, 43, 36, 37, 44, 45, 38, 39, 46, 47, 48, 49, 56, 57, 50, 51, 58, 59, 52, 53, 60, 61, 54, 55, 62, 63);
+const uint kColumn16Inv[128] = uint[](0, 8, 1, 9, 16, 24, 17, 25, 2, 10, 3, 11, 18, 26, 19, 27, 4, 12, 5, 13, 20, 28, 21, 29, 6, 14, 7, 15, 22, 30, 23, 31, 32, 40, 33, 41, 48, 56, 49, 57, 34, 42, 35, 43, 50, 58, 51, 59, 36, 44, 37, 45, 52, 60, 53, 61, 38, 46, 39, 47, 54, 62, 55, 63, 64, 72, 65, 73, 80, 88, 81, 89, 66, 74, 67, 75, 82, 90, 83, 91, 68, 76, 69, 77, 84, 92, 85, 93, 70, 78, 71, 79, 86, 94, 87, 95, 96, 104, 97, 105, 112, 120, 113, 121, 98, 106, 99, 107, 114, 122, 115, 123, 100, 108, 101, 109, 116, 124, 117, 125, 102, 110, 103, 111, 118, 126, 119, 127);
+
+// gs_address.glsl's Address for a 32-bit (CT32) and a 16-bit Z (Z16, Z16S) layout.
+uint Address32(uint bp, uint bw, uint x, uint y) {
+    const uint bx = (x >> 3u) & 7u, by = (y >> 3u) & 3u;
+    const uint b = (bx & 1u) | ((bx & 2u) << 1u) | ((bx & 4u) << 2u) | ((by & 1u) << 1u) | ((by & 2u) << 2u);
+    const uint block = bp + 32u * ((y / 32u) * max(bw, 1u) + x / 64u) + b;
+    const uint column = (x & 1u) | ((x & 6u) << 1u) | ((y & 1u) << 1u) | ((y & 6u) << 3u);
+    return (block * 256u + column * 4u) & kMask;
+}
+
+uint AddressZ16(uint bp, uint bw, bool s, uint x, uint y) {
+    const uint bx = (x >> 4u) & 3u, by = (y >> 3u) & 7u;
+    uint b = ((bx & 1u) << 1u) | (by & 1u);
+    b |= s ? ((bx & 2u) << 3u) | ((by & 2u) << 2u) | (by & 4u)
+           : ((bx & 2u) << 2u) | ((by & 2u) << 1u) | ((by & 4u) << 2u);
+    b ^= 24u;
+    const uint block = bp + 32u * ((y / 64u) * max(bw, 1u) + x / 64u) + b;
+    const uint column = ((x & 1u) << 1u) | ((x & 6u) << 2u) | ((x & 8u) >> 3u) | ((y & 1u) << 2u) | ((y & 6u) << 4u);
+    return (block * 256u + column * 2u) & kMask;
+}
+
+// The view's pixel whose 16 bits lie at byte address `a`; false before its base.
+bool ViewPixel(uint a, out uvec2 at) {
+    const uint page = a / 8192u, base = p.bp / 32u;
+    if (page < base) return false;
+    const uint bw = max(p.bw, 1u);
+    const uint px = (page - base) % bw, py = (page - base) / bw;
+    const uint block = (a % 8192u) / 256u;
+    const uint i = p.view_psm == PSMCT16S ? kBlock16SInv[block] : kBlock16Inv[block];
+    const uint j = kColumn16Inv[(a % 256u) / 2u];
+    at = uvec2(px * 64u + (i % 4u) * 16u + j % 16u, py * 64u + (i / 4u) * 8u + j / 16u);
+    return true;
+}
+
+// The 16 bits at byte address `a` (even), from the depth buffer; false outside it.
+bool DepthHalf(uint a, out uint h) {
+    const uint page = a / 8192u, base = p.zbp / 32u;
+    if (page < base) return false;
+    const uint bw = max(p.zbw, 1u);
+    const uint px = (page - base) % bw, py = (page - base) / bw;
+    const uint i = kBlockZ32Inv[(a % 8192u) / 256u];
+    const uint j = kColumn32Inv[(a % 256u) / 4u];
+    const uint x = px * 64u + (i % 8u) * 8u + j % 8u, y = py * 32u + (i / 8u) * 8u + j / 8u;
+    if (x >= p.zwidth || y >= p.zheight) return false;
+    uint v = uint(clamp(texelFetch(depth, ivec2(x, y), 0).r * 4294967296.0, 0.0, 4294967040.0));
+    if (p.zpsm == PSMZ24) v = (mem[(a & kMask) >> 2] & 0xFF000000u) | (v & 0xFFFFFFu);
+    h = (v >> ((a & 2u) * 8u)) & 0xFFFFu;
+    return true;
+}
+
+uint Coordinate(int c, uint size, bool repeat) {
+    return repeat ? uint(c) & (size - 1u) : uint(clamp(c, 0, int(size) - 1));
+}
+
+// The half at byte address `a`, as the sprites leave it (`old` where they do not draw).
+uint Half(uint a, uint old) {
+    uvec2 v;
+    if (!ViewPixel(a, v) || v.x < p.vx0 || v.x >= p.vx1 || v.y < p.vy0 || v.y >= p.vy1) return old;
+    const uint s = Coordinate(int(v.x) + p.du, p.tw, (p.wrap & 1u) != 0u);
+    const uint t = Coordinate(int(v.y) + p.dv, p.th, (p.wrap & 2u) != 0u);
+    uint h;
+    if (!DepthHalf(AddressZ16(p.tbp, p.tbw, p.tpsm == PSMZ16S, s, t), h)) return old;
+    const uint alpha = (h & 0x8000u) != 0u ? p.ta1 : ((p.aem != 0u && (h & 0x7FFFu) == 0u) ? 0u : p.ta0);
+    const uint made = (h & 0x7FFFu) | (alpha >= 0x80u ? 0x8000u : 0u);
+    return (old & p.keep) | (made & ~p.keep & 0xFFFFu);
+}
+
+void main() {
+    const uint x = p.x0 + gl_GlobalInvocationID.x, y = p.y0 + gl_GlobalInvocationID.y;
+    if (gl_GlobalInvocationID.x >= p.cols || gl_GlobalInvocationID.y >= p.rows) return;
+    const uint a = Address32(p.bp, p.bw, x, y);
+    const uint old = packUnorm4x8(imageLoad(target, ivec2(x, y)));
+    const uint lo = Half(a, old & 0xFFFFu), hi = Half(a + 2u, old >> 16);
+    const uint made = lo | (hi << 16);
+    if (made != old) imageStore(target, ivec2(x, y), unpackUnorm4x8(made));
+}

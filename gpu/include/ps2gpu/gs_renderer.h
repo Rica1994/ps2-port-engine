@@ -98,7 +98,7 @@ struct GsDrawState {
        read it as the GS would - TEXA's alpha, 16-bit colour to 5 bits. */
     bool texture_target = false;
     std::uint32_t tex_fbp = 0, tex_fbw = 0, tex_target_psm = 0;
-    std::uint32_t tex_format = 0;                        /* 0 32-bit, 1 24-bit, 2 16-bit, 4 PSMT8H through the CLUT */
+    std::uint32_t tex_format = 0;                        /* 0 32-bit, 1 24-bit, 2 16-bit, through the CLUT 4 PSMT8H, 5 PSMT4HL, 6 PSMT4HH (CSA in bits 24-28) */
     std::uint32_t ta0 = 0, ta1 = 0x80;                   /* TEXA */
     bool aem = false;
 
@@ -131,6 +131,24 @@ struct GsDrawState {
     bool depth = false;
     std::uint32_t zbp = 0, ztst = 1;
     bool depth_write = true;                             /* !ZBUF.ZMSK */
+};
+
+/* DepthIntoView's draw (haze.comp's push constants): the target CT32 at
+   bp (blocks) / bw, its 16-bit view's PSM; the target's pixels looked at;
+   the view's pixels drawn; a view pixel's texel (x + du, y + dv), wrapping
+   (wrap bit 0 S, bit 1 T) or clamped in tw x th; the Z16 texture at tbp
+   (blocks) / tbw / tpsm over the depth buffer at zbp (blocks) / zbw / zpsm
+   (zwidth x zheight); TEXA; the 16 bits each half keeps (FBMSK's). */
+struct DepthIntoViewParams {
+    std::uint32_t bp = 0, bw = 1, view_psm = 0x02;
+    std::uint32_t x0 = 0, y0 = 0, cols = 0, rows = 0;
+    std::uint32_t vx0 = 0, vy0 = 0, vx1 = 0, vy1 = 0;
+    std::int32_t du = 0, dv = 0;
+    std::uint32_t tw = 1, th = 1, wrap = 0;
+    std::uint32_t tbp = 0, tbw = 1, tpsm = 0x32;
+    std::uint32_t zbp = 0, zbw = 1, zpsm = 0x31, zwidth = 0, zheight = 0;
+    std::uint32_t ta0 = 0, ta1 = 0x80, aem = 0;
+    std::uint32_t keep = 0;
 };
 
 /* A texture in GS local memory, and how its texels expand: TEX0's TBP0 (in
@@ -314,6 +332,17 @@ public:
                                   std::uint32_t zbp, std::uint32_t width, std::uint32_t height, std::uint32_t zfbw,
                                   std::uint32_t zpsm) {
         (void)fbp, (void)fbw, (void)psm, (void)rows, (void)zbp, (void)width, (void)height, (void)zfbw, (void)zpsm;
+        return false;
+    }
+    /* A depth buffer's Z16 texels drawn into a 16-bit view of a 32-bit
+       target in one pass over the target (DepthIntoViewParams): what
+       nearest-sampled, decal sprites of a PSMZ16 texture over the depth
+       buffer's memory, a whole texel a pixel, would draw into the view - the
+       view and the Z16 texture never made. False if the renderer cannot (the
+       caller draws them as before); DrawsDepthIntoView whether it can at all. */
+    virtual bool DrawsDepthIntoView() const { return false; }
+    virtual bool DepthIntoView(const DepthIntoViewParams& params) {
+        (void)params;
         return false;
     }
     /* TargetFromMemory / DepthFromMemory for rows [first_row, first_row +

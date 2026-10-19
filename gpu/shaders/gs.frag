@@ -34,7 +34,8 @@ layout(set = 0, binding = 0) uniform sampler2D texture_image;
 // texture rather than four (Sample).
 layout(set = 0, binding = 1) uniform usampler2D texture_words;
 // The GPU's CLUT (decode.comp's), 256 entries as the GS expands them: a target
-// read as PSMT8H (tex_format 4) indexes it by its alpha byte.
+// read as PSMT8H (tex_format 4) indexes it by its alpha byte, PSMT4HL and
+// PSMT4HH (5, 6; CSA in bits 24-28) by a nibble of it.
 layout(std430, set = 1, binding = 0) readonly buffer Clut { uint clut[256]; };
 
 layout(push_constant) uniform Params {
@@ -53,7 +54,7 @@ layout(push_constant) uniform Params {
     uint wms, wmt;      // CLAMP: 0 REPEAT, 1 CLAMP, 2 REGION_CLAMP, 3 REGION_REPEAT
     uint minu, maxu, minv, maxv;
     uint tw, th;        // TEX0's size (0: the image's own)
-    uint tex_format;    // a target read as 0 32-bit, 1 24-bit, 2 16-bit texels, 4 PSMT8H through the CLUT
+    uint tex_format;    // a target read as 0 32-bit, 1 24-bit, 2 16-bit texels, 4 PSMT8H (5, 6 PSMT4HL/HH) through the CLUT
     uint texa;          // TEXA: TA0 in bits 0-7, TA1 8-15, AEM 16
     uint image_size;    // the bound image's size in its pixels, width in bits 0-15, height 16-31 - not
                         // asked of the image (textureSize: a sampler's message per pixel on some GPUs)
@@ -112,8 +113,12 @@ ivec2 TextureSize() {
 // target read as PSMT8H through the CLUT.
 vec4 Expand(vec4 t) {
     if (!Has(kExpand)) return t;
-    if (p.tex_format == 4u) {                       // PSMT8H: the alpha byte indexes the CLUT
-        const uint c = clut[uint(t.a) & 255u];
+    const uint through = p.tex_format & 0xFFu;
+    if (through >= 4u && through <= 6u) {           // PSMT8H: the alpha byte indexes the CLUT
+        uint i = uint(t.a) & 255u;
+        // PSMT4HL, PSMT4HH: its low or high nibble, CSA's 16 entries.
+        if (through != 4u) i = (((p.tex_format >> 24) & 31u) * 16u + (through == 5u ? i & 15u : i >> 4)) & 255u;
+        const uint c = clut[i];
         return vec4(float(c & 255u), float((c >> 8) & 255u), float((c >> 16) & 255u), float(c >> 24));
     }
     bool black = t.r + t.g + t.b == 0.0;

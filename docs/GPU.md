@@ -176,7 +176,25 @@ proved itself in PCSX2's hardware renderers, made smaller:
      when the GPU holds the blocks newer - the race reads its targets' alpha
      as PSMT8H textures and its depth buffer as PSMZ16, which brought 13 GB
      back to the CPU over 9,550 frames before. The least recently used of
-     2,048 released;
+     2,048 released. A texture's blocks reach to the end of its last page,
+     no further (its reach was its rows at TBW's width and a page more: the
+     race's 128x64 PSMT4HH texture at 2C80 took in a glow image beside it,
+     drawn every picture: decoded again two or three times a picture, the
+     glow image written back for it each time);
+   * *targets through the CLUT*: a target read as PSMT8H, PSMT4HL or
+     PSMT4HH indexes the GPU's CLUT in the shader by its alpha byte or a
+     nibble of it (CSA's 16 entries); a CLUT loaded from an image just drawn
+     writes back that image's CLUT page alone;
+   * *depth into a 16-bit view*: the race's haze - a decal sprite a texel a
+     pixel of its depth buffer read as PSMZ16, into a CT16 view of its frame
+     under FBMSK 0x3FFF, ten 8x896 strips a picture - is one compute pass
+     over the frame itself (`shaders/haze.comp`, `GsRenderer::DepthIntoView`,
+     the bridge's DepthIntoView): each 32-bit pixel makes its two halves as
+     the sprites would (the CT16 and Z16 layouts inverted, a Z24 word's top
+     byte from GPU memory). Before, the frame was made into its view, the
+     depth buffer into a Z16 one, the sprites drawn, and the frame made back
+     (`PS2HOST_DEPTH_INTO_VIEW=0`; checked against that way by
+     DepthIntoViewDrawn, and by the scripted race's pictures);
    * *FBMSK exactly*: the mask is taken in the target's own format (a 16-bit
      target's five bits a channel are the top of the image's bytes), and a
      channel masked only in part is drawn in two passes with logic ops - AND

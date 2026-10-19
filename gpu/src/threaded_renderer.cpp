@@ -34,6 +34,7 @@ public:
         scale_ = inner_->Scale();
         converts_ = inner_->Converts();
         converts_depth_ = inner_->ConvertsDepth();
+        depth_into_view_ = inner_->DrawsDepthIntoView();
         open_.reserve(kChunk + 4096);
         thread_ = std::thread([this] { Run(); });
     }
@@ -255,6 +256,19 @@ public:
         End();
         return done != 0;
     }
+    // Predicted as ConvertFromDepth: the target and the depth buffer made, at the PS2's resolution.
+    bool DepthIntoView(const DepthIntoViewParams& params) override {
+        const auto made = targets_.find(TargetKey(params.bp / 32, params.bw, 0x00));
+        const std::uint32_t done = depth_into_view_ && (params.zpsm == 0x30 || params.zpsm == 0x31) &&
+                                   params.cols && params.rows && made != targets_.end() &&
+                                   depths_.count(DepthKey(params.zbp / 32, params.zwidth, params.zheight)) &&
+                                   ScaleOf(made->second.w) == 1 && ScaleOf(params.zwidth) == 1 ? 1 : 0;
+        Op(kDepthIntoView, sizeof params + 4);
+        Put(&params, sizeof params);
+        Put(&done, 4);
+        End();
+        return done != 0;
+    }
     // A cooked texture (the asset cache's): its bytes along, as UploadTexture's.
     bool UploadCooked(std::uint64_t key, std::uint32_t format, std::uint32_t width, std::uint32_t height,
                       const std::uint8_t* data, std::size_t bytes, std::uint32_t flags) override {
@@ -272,6 +286,7 @@ public:
     bool CookedFormat(std::uint32_t format) const override { return inner_->CookedFormat(format); }
     bool Converts() const override { return converts_; }
     bool ConvertsDepth() const override { return converts_depth_; }
+    bool DrawsDepthIntoView() const override { return depth_into_view_; }
     // Whether the GPU had caught up as the renderer's thread last ended a
     // frame (asked of the renderer there, without waiting).
     bool GpuCaughtUp() override { return caught_up_.load(std::memory_order_acquire); }
@@ -340,7 +355,7 @@ private:
         kDraw, kDrawSame, kFlush, kKick, kUploadTexture, kUseReplacement, kUploadDepth, kUploadTarget,
         kReleaseTexture, kMemoryWrite, kMemoryPatch, kTargetFromMemory, kDepthFromMemory, kTextureFromMemory,
         kClutFromMemory, kClutRows, kReloadKeepsColour, kTargetRowsFromMemory, kDepthRowsFromMemory,
-        kTargetToMemory, kDepthToMemory, kColumns, kConvertImage, kConvertFromDepth, kUploadCooked,
+        kTargetToMemory, kDepthToMemory, kColumns, kConvertImage, kConvertFromDepth, kDepthIntoView, kUploadCooked,
     };
     // A target's or depth buffer's scale (VulkanGsRenderer::ScaleOf): its
     // width at the PS2's resolution, or the renderer's.
@@ -476,6 +491,14 @@ private:
                     if (r.ConvertFromDepth(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]) != (a[9] != 0)) ++wrong_;
                     break;
                 }
+                case kDepthIntoView: {
+                    DepthIntoViewParams params;
+                    std::uint32_t done;
+                    std::memcpy(&params, at, sizeof params);
+                    std::memcpy(&done, at + sizeof params, 4);
+                    if (r.DepthIntoView(params) != (done != 0)) ++wrong_;
+                    break;
+                }
                 case kUploadCooked: {
                     const auto key = Take<std::uint64_t>(at);
                     std::uint32_t a[4];
@@ -590,7 +613,7 @@ private:
 
     std::unique_ptr<GsRenderer> inner_;
     std::uint32_t scale_ = 1;
-    bool converts_ = false, converts_depth_ = false;
+    bool converts_ = false, converts_depth_ = false, depth_into_view_ = false;
     std::atomic<bool> caught_up_{true};
     std::unordered_map<std::uint64_t, Size> targets_;
     std::unordered_set<std::uint64_t> depths_;

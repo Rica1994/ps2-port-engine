@@ -76,7 +76,7 @@ endif()
 file(MAKE_DIRECTORY ${PS2GPU_SHADER_DIR})
 set(PS2GPU_SHADER_HEADERS)
 foreach(shader gs.vert gs.frag date.vert date.frag swizzle.comp decode.comp depth_load.frag patch.comp fxaa.comp downsample.comp
-               smaa_edges.comp smaa_weights.comp smaa_blend.comp touch.vert touch.frag reinterpret.comp)
+               smaa_edges.comp smaa_weights.comp smaa_blend.comp touch.vert touch.frag reinterpret.comp haze.comp)
     string(REPLACE "." "_" name ${shader})
     set(out ${PS2GPU_SHADER_DIR}/${name}.h)
     add_custom_command(OUTPUT ${out}

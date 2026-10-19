@@ -55,6 +55,7 @@
 #include "decode_image_comp.h"
 #include "reinterpret_comp.h"
 #include "reinterpret_depth_comp.h"
+#include "haze_comp.h"
 #include "patch_comp.h"
 
 namespace ps2gpu {
@@ -295,6 +296,13 @@ constexpr std::uint32_t kMaxScale = 8;      // 4 the resolution's, twice that su
    it does not store. (Read as a 16-bit pixel's bits, Burnout 3's FBMSK
    0x3FFF wrote alpha's top two bits alone, not its byte: its depth into the
    picture's alpha - the haze, the sun's halo - came out wrong.) */
+/* A target sampled through the CLUT (GsDrawState::tex_format): PSMT8H 4,
+   PSMT4HL 5, PSMT4HH 6 (CSA in bits 24-28). */
+bool ThroughClut(std::uint32_t tex_format) {
+    const std::uint32_t f = tex_format & 0xFFu;
+    return f >= 4 && f <= 6;
+}
+
 std::uint32_t KeptBits(std::uint32_t fbmsk, std::uint32_t psm) {
     if (psm == 0x02 || psm == 0x0A || psm == 0x32 || psm == 0x3A) return fbmsk | ~0x80F8F8F8u;
     if (psm == 0x01 || psm == 0x31) return fbmsk | 0xFF000000u;
@@ -449,6 +457,8 @@ public:
                       const std::uint8_t* data, std::size_t bytes, std::uint32_t flags) override;
     bool Converts() const override { return reinterpret_pipeline_ != VK_NULL_HANDLE; }
     bool ConvertsDepth() const override { return reinterpret_depth_pipeline_ != VK_NULL_HANDLE; }
+    bool DrawsDepthIntoView() const override { return haze_pipeline_ != VK_NULL_HANDLE; }
+    bool DepthIntoView(const DepthIntoViewParams& params) override;
     bool CookedFormat(std::uint32_t format) const override {
         return format == 0 || (format == 4 && g_.bc) || (format == 5 && g_.astc);
     }
@@ -1125,6 +1135,9 @@ private:
     VkShaderModule reinterpret_depth_ = VK_NULL_HANDLE;     /* ...from a depth buffer: ConvertFromDepth */
     VkPipelineLayout reinterpret_depth_layout_ = VK_NULL_HANDLE;
     VkPipeline reinterpret_depth_pipeline_ = VK_NULL_HANDLE;
+    VkShaderModule haze_ = VK_NULL_HANDLE;                  /* depth's Z16 texels into a 16-bit view: DepthIntoView */
+    VkPipelineLayout haze_layout_ = VK_NULL_HANDLE;
+    VkPipeline haze_pipeline_ = VK_NULL_HANDLE;
     /* The same for a colour format, direction and scale (InitMemory): by
        kSpecialisedFormats' index, to memory or not, scale - 1. */
     static constexpr std::uint32_t kSpecialisedFormats[4] = {0x00, 0x01, 0x02, 0x0A};    // CT32, CT24, CT16, CT16S
@@ -1696,6 +1709,19 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
             vkCreateComputePipelines(g_.device, cache_, 1, &rp, nullptr, &reinterpret_depth_pipeline_) !=
                 VK_SUCCESS)
             reinterpret_depth_pipeline_ = VK_NULL_HANDLE;   // (ConvertFromDepth declines)
+        // DepthIntoView: the same sets, its own push constants.
+        VkShaderModuleCreateInfo hi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        hi.codeSize = sizeof spirv_haze_comp;
+        hi.pCode = spirv_haze_comp;
+        vkCreateShaderModule(g_.device, &hi, nullptr, &haze_);
+        const VkPushConstantRange haze_push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DepthIntoViewParams)};
+        rl.pPushConstantRanges = &haze_push;
+        vkCreatePipelineLayout(g_.device, &rl, nullptr, &haze_layout_);
+        rp.stage.module = haze_;
+        rp.layout = haze_layout_;
+        if (!haze_ || !haze_layout_ ||
+            vkCreateComputePipelines(g_.device, cache_, 1, &rp, nullptr, &haze_pipeline_) != VK_SUCCESS)
+            haze_pipeline_ = VK_NULL_HANDLE;                // (DepthIntoView declines)
     }
     {
         VkShaderModuleCreateInfo pi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -2197,6 +2223,41 @@ bool VulkanGsRenderer::ConvertFromDepth(std::uint32_t fbp, std::uint32_t fbw, st
         vkCmdPushConstants(cmd, reinterpret_depth_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
         ++g_dispatches;
         vkCmdDispatch(cmd, (d.width + 7) / 8, (made_rows + 7) / 8, 1);
+        g_.Mark(cmd, kProfSwizzle);
+        MemoryBarrier(cmd);
+    });
+    return true;
+}
+
+bool VulkanGsRenderer::DepthIntoView(const DepthIntoViewParams& params) {
+    if (!haze_pipeline_ || (params.zpsm != 0x30 && params.zpsm != 0x31) || !params.cols || !params.rows) return false;
+    auto made = targets_.find(Key{params.bp / 32, params.bw, 0x00});
+    auto from = depths_.find(Key{params.zbp / 32, params.zwidth, params.zheight});
+    if (made == targets_.end() || from == depths_.end()) return false;
+    Image& d = made->second;
+    Image& z = from->second;
+    if (d.scale != 1 || z.scale != 1) return false;
+    DepthIntoViewParams within = params;       // (inside the image: the rest is no pixel of it)
+    within.cols = params.x0 < d.width ? std::min(params.cols, d.width - params.x0) : 0;
+    within.rows = params.y0 < d.height ? std::min(params.rows, d.height - params.y0) : 0;
+    Flush();
+    Work(kWorkConvert, {&z, &d}, {&d});
+    WorkLabel("depth into view: C %X/%u/00 from Z %X/%u/%02X", unsigned(params.bp / 32), unsigned(params.bw),
+              unsigned(params.zbp / 32), unsigned(params.zbw), unsigned(params.zpsm));
+    g_.Record([&](VkCommandBuffer cmd) {
+        g_.Mark(cmd, kProfSwizzle);
+        drawn_ = DrawState{};
+        Transition(cmd, z, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        Transition(cmd, d, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        MemoryBarrier(cmd);
+        const VkDescriptorSet sets[3] = {DepthSampledSet(z), StorageSet(d), swizzle_set_};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, haze_pipeline_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, haze_layout_, 0, 3, sets, 0, nullptr);
+        vkCmdPushConstants(cmd, haze_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof within, &within);
+        ++g_dispatches;
+        if (within.cols && within.rows) vkCmdDispatch(cmd, (within.cols + 7) / 8, (within.rows + 7) / 8, 1);
         g_.Mark(cmd, kProfSwizzle);
         MemoryBarrier(cmd);
     });
@@ -3844,7 +3905,7 @@ void VulkanGsRenderer::Flush() {
             } else if (why >= 0) {
                 EndPass(cmd, why);
             }
-            if (clut_ring_ && source && state_.tex_format == 4 && clut_dirty_) ClutSnapshot(cmd);
+            if (clut_ring_ && source && ThroughClut(state_.tex_format) && clut_dirty_) ClutSnapshot(cmd);
             // Local read: a batch reading what the open pass drew since its last
             // barrier needs one first (MoltenVK: the Metal pass stored and begun
             // again). Emulated, the pass ends and the next takes a fresh copy.
@@ -4053,7 +4114,7 @@ void VulkanGsRenderer::Flush() {
             else if (state_.textured) PassReads(&texture->image);
             if (shader_blend && feedback_ && !in_place) PassReads(feedback_);
             if (snapshot) PassReads(snapshot);
-            if (source && state_.tex_format == 4) {
+            if (source && ThroughClut(state_.tex_format)) {
                 if (clut_ring_) pass_clut_slots_ |= 1u << clut_draw_slot_;
                 else pass_reads_clut_ = true;
             }
@@ -4372,13 +4433,13 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (input_set_layout_) vkDestroyDescriptorSetLayout(g_.device, input_set_layout_, nullptr);
     // The swizzle on images and depth buffers, the memory patch, depth loads.
     for (VkPipeline p : {swizzle_image_pipeline_, patch_pipeline_, swizzle_depth_pipeline_, depth_load_pipeline_,
-                         reinterpret_pipeline_, reinterpret_depth_pipeline_})
+                         reinterpret_pipeline_, reinterpret_depth_pipeline_, haze_pipeline_})
         if (p) vkDestroyPipeline(g_.device, p, nullptr);
     for (VkPipelineLayout l : {swizzle_image_layout_, patch_layout_, swizzle_depth_layout_, depth_load_layout_,
-                               reinterpret_layout_, reinterpret_depth_layout_})
+                               reinterpret_layout_, reinterpret_depth_layout_, haze_layout_})
         if (l) vkDestroyPipelineLayout(g_.device, l, nullptr);
     for (VkShaderModule m : {swizzle_image_, patch_, swizzle_depth_, depth_load_vert_, depth_load_frag_, reinterpret_,
-                              reinterpret_depth_})
+                              reinterpret_depth_, haze_})
         if (m) vkDestroyShaderModule(g_.device, m, nullptr);
     for (VkDescriptorSetLayout l : {image_set_layout_, depth_set_layout_})
         if (l) vkDestroyDescriptorSetLayout(g_.device, l, nullptr);

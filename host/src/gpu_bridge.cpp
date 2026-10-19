@@ -108,6 +108,21 @@ u32 PixelBits(u32 psm) {
     }
 }
 
+/* One past the last block a TW x TH texture at TBP / TBW reads (by whole
+   pages: its last page's every block). Was its rows' blocks at TBW's width
+   and a page more: the race's 128x64 PSMT4HH texture at 2C80 (TBW 3) then
+   reached two pages past its own, into a 64x512 glow image drawn every
+   picture - written back each time it was decoded. A texture wider than
+   its buffer (it wraps into the rows below) keeps the old reach. */
+u32 TextureEnd(u32 tbp, u32 tbw, u32 tw, u32 th, u32 bits) {
+    const u32 pw = bits == 32 ? 64 : 128 >> (bits == 16 ? 1 : 0), ph = bits == 4 ? 128 : bits == 32 ? 32 : 64;
+    const u32 across = std::max(1u, tbw) * 64 / pw;
+    if (!across || tw > across * pw)
+        return std::min(16384u, tbp + std::max(1u, std::max(1u, tbw) * 64 * th * bits / 8 / 256 + 32));
+    const u32 last = (th - 1) / ph * across + (tw - 1) / pw;
+    return std::min(16384u, tbp + (last + 1) * 32);
+}
+
 bool Is16(u32 psm) { return psm == gs::PSMCT16 || psm == gs::PSMCT16S || psm == gs::PSMZ16 || psm == gs::PSMZ16S; }
 /* A 24-bit format: it never writes its words' top byte. */
 bool Is24(u32 psm) { return psm == gs::PSMCT24 || psm == gs::PSMZ24; }
@@ -306,6 +321,7 @@ struct Bridge {
     std::map<u32, u64> texture_downloads;   // by the texture's TEX0 PSM << 16 | TBW
     u64 write_backs = 0, reloads = 0, decodes = 0;
     u64 converts = 0;               // images made from a twin without memory (ConvertFromTwin)
+    u64 depth_into_view = 0;        // sprites of depth into a 16-bit view drawn into its 32-bit target (DepthIntoView)
     // Why images went back to memory (WriteBack's `why`, kWb*) and came back
     // (Owned::why), colour/depth apart; and, by what asked it, which image
     // went back for what - the [perf] report's "write-backs by why" lines.
@@ -1227,8 +1243,16 @@ bool LoadClut(Bridge& b, u64 tex0, u64 texa) {
     }
     Timed timed(Section::GpuSync);
     const TimelineStep step("sync: a CLUT load");
+    // The CLUT's page alone of an image drawn over it (the race's glow loads
+    // 256 entries from a 64x512 image it just drew: the image's other pages
+    // stay as they are, newer than memory).
+    Pages clut_pages;
+    for (u32 page = cbp / 32; page <= (cbp + 7) / 32 && page < 512; ++page) clut_pages.set(page);
     for (auto& [key, o] : b.owned)
-        if (o.gpu_newer && o.dirty_begin < cbp + 8 && cbp < o.dirty_end) WriteBack(b, o, kWbClut);
+        if (o.gpu_newer && o.dirty_begin < cbp + 8 && cbp < o.dirty_end) {
+            if ((o.dirty_pages & clut_pages).any()) WriteBackPages(b, o, clut_pages, kWbClut, "");
+            else WriteBack(b, o, kWbClut);      // (its pages not known to hold the drawing: all of it, as before)
+        }
     Coherent(b, cbp, cbp + 8, true);
     ps2gpu::GsClutLoad load;
     load.cbp = cbp;
@@ -1459,8 +1483,7 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         for (u32 n = 0; n < mips.count; ++n) {
             const u32 h = std::max(1u, th >> n);
             t.begin = std::min(t.begin, mips.tbp[n]);
-            t.end = std::max(t.end, std::min(16384u, mips.tbp[n] + std::max(1u, std::max(1u, mips.tbw[n]) * 64 * h *
-                                                                                    PixelBits(psm) / 8 / 256 + 32)));
+            t.end = std::max(t.end, TextureEnd(mips.tbp[n], mips.tbw[n], std::max(1u, tw >> n), h, PixelBits(psm)));
         }
         b.IndexTexture(&t, true);
         // Its image's memory: RGBA texels, a third more for the levels, in
@@ -1794,6 +1817,137 @@ bool UnseenFrame() {
     return drawn_only && FrameLeftOut(g_present_frame);
 }
 
+/* FBMSK's kept bits (RGBA32 positions, as the GS masks before a 16-bit
+   format) as the bits of a 16-bit pixel they keep: R 3-7, G 11-15, B 19-23
+   and alpha's 31 are what a 16-bit pixel stores. */
+u32 KeptBits16(u32 fbmsk) {
+    u32 keep = 0;
+    for (u32 i = 0; i < 15; ++i)
+        if (fbmsk & (1u << ((i / 5) * 8 + 3 + i % 5))) keep |= 1u << i;
+    if (fbmsk & 0x80000000u) keep |= 0x8000u;
+    return keep;
+}
+
+/* A sprite of a depth buffer's Z16 texels into a 16-bit view of a 32-bit
+   target, drawn into the target alone (GsRenderer::DepthIntoView): Burnout
+   3's haze, ten 8x896 strips a picture into a CT16 view of its frame, under
+   FBMSK 0x3FFF, of a PSMZ16 texture over its depth buffer. Drawn as a
+   target and a texture each went through a view: the frame made into its
+   CT16 view, the depth buffer into a Z16 one (a convert each), the strips
+   drawn - a render pass on a tile GPU - and the frame made from the view
+   again (a third). Here one pass over the strips' pages of the frame, the
+   pictures the same. Only for exactly that kind of draw: a sprite at whole
+   pixels with a texel a pixel at texel centres inside the texture and the
+   depth buffer, decal with the texel's alpha, nearest, no fog, alpha test
+   or depth, a blend that gives the source, FBA off, the frame's own CT32
+   image and the depth buffer known, and nothing but the depth buffer newer
+   than memory over the texture. PS2HOST_DEPTH_INTO_VIEW=0: drawn as before. */
+bool DepthIntoView(Bridge& s, const gs::Gs::DrawCall& call, const ps2gpu::GsVertex* v, std::size_t n, u32 x0,
+                   u32 x1, u32 y0, u32 y1) {
+    static const bool on = [] {
+        const char* e = std::getenv("PS2HOST_DEPTH_INTO_VIEW");
+        return !(e && *e == '0');
+    }();
+    const gs::Context& c = *call.context;
+    const u32 psm = Bits(c.frame, 24, 6), tpsm = Bits(c.tex0, 20, 6);
+    if (!on || (psm != gs::PSMCT16 && psm != gs::PSMCT16S) || (tpsm != gs::PSMZ16 && tpsm != gs::PSMZ16S)) return false;
+    if ((call.prim & 7) != 6 || n != 6 || !((call.prim >> 4) & 1) || ((call.prim >> 5) & 1) || s.Dumping()) return false;
+    if (!s.renderer->DrawsDepthIntoView() || s.renderer->Scale() != 1 || (c.fba & 1)) return false;
+    // Decal, the texel's alpha; nearest, no mipmaps (MMAG, MMIN 0, MXL 0).
+    if (Bits(c.tex0, 35, 2) != 1 || !Bits(c.tex0, 34, 1) || Bits(c.tex1, 5, 4) != 0 || Bits(c.tex1, 2, 3) != 0)
+        return false;
+    // The alpha test passing all (or failing all with FB_ONLY: drawn all the
+    // same), no depth test or write, no destination alpha test.
+    const bool ate = Bits(c.test, 0, 1), date = Bits(c.test, 14, 1), zte = Bits(c.test, 16, 1);
+    const u32 atst = Bits(c.test, 1, 3), afail = Bits(c.test, 12, 2);
+    if (ate && !(atst == 1 || (atst == 0 && afail == 1))) return false;
+    if (date || (zte && !(Bits(c.test, 17, 2) == 1 && Bits(c.zbuf, 32, 1)))) return false;
+    // Blending to the source colour: A and B the same, D the source; PABE off.
+    if ((call.prim >> 6) & 1) {
+        const u32 alpha = u32(c.alpha);
+        if ((alpha & 3) != ((alpha >> 2) & 3) || ((alpha >> 6) & 3) != 0 || call.pabe) return false;
+    }
+    const u32 wms = Bits(c.clamp, 0, 2), wmt = Bits(c.clamp, 2, 2);
+    if (wms > 1 || wmt > 1) return false;
+    // Whole pixels, a texel a pixel at texel centres: u = x + du + 0.5.
+    const u32 tw = 1u << std::min(Bits(c.tex0, 26, 4), 10u), th = 1u << std::min(Bits(c.tex0, 30, 4), 10u);
+    double du = 0, dv = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!(v[i].q > 0) || v[i].x != std::floor(v[i].x) || v[i].y != std::floor(v[i].y)) return false;
+        const double u = double(v[i].s) / double(v[i].q) * tw - v[i].x - 0.5;
+        const double w = double(v[i].t) / double(v[i].q) * th - v[i].y - 0.5;
+        if (u != std::floor(u) || w != std::floor(w) || (i && (u != du || w != dv))) return false;
+        du = u;
+        dv = w;
+    }
+    if (x0 >= x1 || y0 >= y1) return true;              // (nothing drawn)
+    const u32 fbp = Bits(c.frame, 0, 9), fbw = std::max(1u, Bits(c.frame, 16, 6));
+    auto frame_found = s.owned.find(std::make_tuple(fbp, fbw, u32(gs::PSMCT32), false));
+    if (frame_found == s.owned.end() || !frame_found->second.width) return false;
+    const u32 tbp = Bits(c.tex0, 0, 14), tbw = Bits(c.tex0, 14, 6);
+    if (tbp % 32) return false;
+    Owned* z = nullptr;
+    for (u32 zpsm : {u32(gs::PSMZ24), u32(gs::PSMZ32)}) {
+        auto found = s.owned.find(std::make_tuple(tbp / 32, tbw, zpsm, true));
+        if (found != s.owned.end() && found->second.width) {
+            z = &found->second;
+            break;
+        }
+    }
+    if (!z) return false;
+    // The texels read inside the texture and the depth buffer (its Z16 view: twice its rows).
+    const long long s0 = (long long)x0 + (long long)du, s1 = (long long)x1 + (long long)du;
+    const long long t0 = (long long)y0 + (long long)dv, t1 = (long long)y1 + (long long)dv;
+    if (s0 < 0 || t0 < 0 || s1 > (long long)std::min(tw, z->width) || t1 > (long long)std::min(th, 2 * z->height))
+        return false;
+    // Nothing but the depth buffer newer than memory over the texels' blocks.
+    const auto texels = Blocks(tbp / 32, tbw, tpsm, u32(t1));
+    for (auto& [key, other] : s.owned)
+        if (&other != z && other.gpu_newer && other.dirty_begin < texels.second && texels.first < other.dirty_end)
+            return false;
+    Owned& frame = frame_found->second;
+    // The frame's rows under the view's: a page is 64 rows of the view, 32 of the frame.
+    const u32 py0 = y0 / 64, py1 = (y1 + 63) / 64, px0 = x0 / 64, px1 = (x1 + 63) / 64;
+    const u32 fx0 = px0 * 64, fx1 = px1 * 64, fy0 = py0 * 32, fy1 = py1 * 32;
+    if (fx1 > frame.width || fy1 > frame.height) return false;     // (the view's pixels past the frame's)
+    Use(s, fbp, fbw, gs::PSMCT32, false, frame.width, frame.height, fy1, true);
+    Use(s, z->fbp, z->fbw, z->psm, true, z->width, z->height, 1, false);
+    Coherent(s, texels.first, texels.second, true);     // (a Z24 word's top byte from GPU memory)
+    ps2gpu::DepthIntoViewParams p;
+    p.bp = fbp * 32;
+    p.bw = fbw;
+    p.view_psm = psm;
+    p.x0 = fx0;
+    p.y0 = fy0;
+    p.cols = fx1 - fx0;
+    p.rows = fy1 - fy0;
+    p.vx0 = x0;
+    p.vy0 = y0;
+    p.vx1 = x1;
+    p.vy1 = y1;
+    p.du = int(du);
+    p.dv = int(dv);
+    p.tw = tw;
+    p.th = th;
+    p.wrap = (wms == 0 ? 1u : 0u) | (wmt == 0 ? 2u : 0u);
+    p.tbp = tbp;
+    p.tbw = tbw;
+    p.tpsm = tpsm;
+    p.zbp = z->fbp * 32;
+    p.zbw = z->fbw;
+    p.zpsm = z->psm;
+    p.zwidth = z->width;
+    p.zheight = z->height;
+    p.ta0 = Bits(call.texa, 0, 8);
+    p.ta1 = Bits(call.texa, 32, 8);
+    p.aem = Bits(call.texa, 15, 1);
+    p.keep = KeptBits16(u32(c.frame >> 32) | ~0x80F8F8F8u);
+    if (!s.renderer->DepthIntoView(p)) return false;
+    ++s.depth_into_view;
+    Drew(s, frame, fx0, fx1, fy1, fy0);
+    return true;
+}
+
 void OnDraw(const gs::Gs::DrawCall& call) {
     // Timed only past the fast path below: two clock reads a primitive were
     // a twentieth of the GS thread.
@@ -1965,6 +2119,10 @@ void OnDraw(const gs::Gs::DrawCall& call) {
             draw_rows = std::max(1u, y1);
         }
     }
+    if (s.primary && DepthIntoView(s, call, v, n, x0, x1, y0, y1)) {
+        fast.valid = false;
+        return;
+    }
     if (s.primary) target = &Use(s, state.fbp, state.fbw, state.psm, false, state.width, state.height, draw_rows, true);
     if (state.textured) {
         const u32 tex_psm = Bits(c.tex0, 20, 6), tbp_blocks = Bits(c.tex0, 0, 14);
@@ -1981,9 +2139,16 @@ void OnDraw(const gs::Gs::DrawCall& call) {
             return !(v && *v == '0');
         }();
         const bool z16 = (tex_psm == gs::PSMZ16 || tex_psm == gs::PSMZ16S) && s.primary && z16_views;
+        // ...and read as PSMT4HL / PSMT4HH (the race's reflection map: a 4-bit
+        // index in its alpha's low or high nibble, through CSA's 16 entries),
+        // 5 and 6: written back to memory and decoded from it each picture
+        // before, a write-back that ended a pass.
+        const bool four_high = (tex_psm == gs::PSMT4HL || tex_psm == gs::PSMT4HH) && s.primary;
         const u32 tex_format = tex_psm == gs::PSMCT32 ? 0 : tex_psm == gs::PSMCT24 ? 1
                              : (tex_psm == gs::PSMCT16 || tex_psm == gs::PSMCT16S || z16) ? 2
-                             : (tex_psm == gs::PSMT8H && s.primary) ? 4 : 3;
+                             : (tex_psm == gs::PSMT8H && s.primary) ? 4
+                             : four_high ? (tex_psm == gs::PSMT4HL ? 5 : 6) : 3;
+        const bool through_clut = tex_format >= 4;
         state.tw = tw;
         state.th = th;
         if (z16 && tbp_blocks % 32 == 0) {
@@ -2005,7 +2170,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
         // (render to texture).
         if ((s.primary || s.targets_as_textures) && tex_format != 3 && tbp_blocks % 32 == 0) {
             const u32 candidates[2] = {tex_format == 2 ? tex_psm : gs::PSMCT32,
-                                       tex_format == 2 ? tex_psm : tex_format == 4 ? gs::PSMCT32 : gs::PSMCT24};
+                                       tex_format == 2 ? tex_psm : through_clut ? gs::PSMCT32 : gs::PSMCT24};
             const u32 tex_fbw = Bits(c.tex0, 14, 6);
             for (u32 psm : candidates) {
                 u32 tex_fbp = tbp_blocks / 32;
@@ -2030,11 +2195,11 @@ void OnDraw(const gs::Gs::DrawCall& call) {
                     Owned& source = s.owned[std::make_tuple(tex_fbp, tex_fbw, psm, false)];
                     Pages sampled;
                     if (SampledPages(source, c.clamp, tw, th, v, n, &sampled))
-                        Sample(s, source, sampled, tex_format == 4 && !Is16(psm));
+                        Sample(s, source, sampled, through_clut && !Is16(psm));
                     else Use(s, tex_fbp, tex_fbw, psm, false, source.width, source.height, 1, false);   // sampling grows nothing
                     tex_source = &source;
                 }
-                if (tex_format == 4 && b_clut_rows_cpu_only(s)) {
+                if (through_clut && b_clut_rows_cpu_only(s)) {
                     // The CLUT rows only the CPU has, over to the GPU's first.
                     s.renderer->ClutRows(gs::TheGs().Clut().data(), s.clut_cpu & ~s.clut_gpu);
                     s.clut_gpu |= s.clut_cpu;
@@ -2045,7 +2210,7 @@ void OnDraw(const gs::Gs::DrawCall& call) {
                 state.tex_target_psm = psm;
                 break;
             }
-            state.tex_format = tex_format;
+            state.tex_format = tex_format >= 5 ? tex_format | Bits(c.tex0, 56, 5) << 24 : tex_format;   // (CSA)
             state.ta0 = Bits(call.texa, 0, 8);
             state.ta1 = Bits(call.texa, 32, 8);
             state.aem = Bits(call.texa, 15, 1) != 0;
@@ -2679,13 +2844,14 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
         // ended without warning): nothing written while nothing is new.
         if (frame % 600 == 0) assets::Save();
         if (frame % 100 == 0)
-            std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads (%llu made from a twin), %llu decodes, %zu images, %zu textures (%llu MB, %llu evicted), %llu unseen draws left out\n",
+            std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads (%llu made from a twin), %llu decodes, %zu images, %zu textures (%llu MB, %llu evicted), %llu unseen draws left out, %llu depth-into-view sprites\n",
                          static_cast<unsigned long long>(frame), static_cast<unsigned long long>(s.serial),
                          static_cast<unsigned long long>(s.write_backs), static_cast<unsigned long long>(s.reloads),
                          static_cast<unsigned long long>(s.converts),
                          static_cast<unsigned long long>(s.decodes), s.owned.size(), s.textures.size(),
                          static_cast<unsigned long long>(s.texture_bytes >> 20), static_cast<unsigned long long>(s.evictions),
-                         static_cast<unsigned long long>(s.unseen_draws));
+                         static_cast<unsigned long long>(s.unseen_draws),
+                         static_cast<unsigned long long>(s.depth_into_view));
         // PS2HOST_PERF=1: a tablet's report on any machine.
         static const bool perf_report = platform::kMobile || std::getenv("PS2HOST_PERF") != nullptr;
         if (perf_report) {
