@@ -23,6 +23,7 @@
 #include "ps2host/vif.h"
 #include "ps2host/path3.h"
 #include "ps2host/texture_pack.h"
+#include "ps2host/asset_cache.h"
 #include "ps2host/vu.h"
 #include "ps2host/vu_core.h"
 #include "ps2rt/generated.h"
@@ -580,6 +581,71 @@ void GpuMemorySwizzlesAsTheGs() {
 // Textures decoded on the GPU from its copy of local memory (--gpu, when the
 // GPU holds their blocks) must come out texel for texel as the GS model
 // decodes them: every format, CLUTs (CSA for 4-bit ones), TEXA, region modes.
+/* The asset cache: encoders judged as the GPU reads them, a store that keeps
+   what was cooked across a reopening, a store cut short read without its
+   last record, refusals remembered. */
+void TexturesCookAndKeep() {
+    using namespace ps2host;
+    // A cut-out texture as Burnout 3's are: opaque at 0x7F, none at 0.
+    const u32 w = 64, h = 32;
+    std::vector<u32> rgba(w * h);
+    for (u32 y = 0; y < h; ++y)
+        for (u32 x = 0; x < w; ++x)
+            rgba[y * w + x] = (x * 4) | (y * 8) << 8 | 0x40u << 16 | ((x / 8 + y / 8) % 3 ? 0x7Fu : 0u) << 24;
+    for (const codec::Format f : {codec::kRgba8, codec::kBc7, codec::kAstc4x4}) {
+        std::vector<u8> out;
+        std::vector<u32> back;
+        const bool ok = codec::Encode(f, rgba.data(), w, h, 10, &out) &&
+                        out.size() == codec::Size(f, w, h) &&
+                        codec::Decode(f, out.data(), out.size(), w, h, &back) && back.size() == rgba.size();
+        const std::string what = std::string(codec::Name(f)) + ": encoded and decoded back";
+        Check(ok, what.c_str());
+        if (f == codec::kRgba8) Check(ok && back == rgba, "RGBA8 cooks without loss");
+    }
+    std::vector<u32> broken = rgba;
+    broken[5] = (broken[5] & 0xFFFFFF) | 0x01000000u;           // a cut-out texel made faintly visible
+    Check(!codec::Compare(rgba.data(), broken.data(), broken.size()).Acceptable(), "an alpha of 0 must stay 0");
+    Check(codec::Compare(rgba.data(), rgba.data(), rgba.size()).Acceptable(), "a texture is close to itself");
+
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "ps2host_assets_test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    assets::Options o;
+    o.directory = dir;
+    o.format = codec::kAstc4x4;
+    o.synchronous = true;
+    assets::Open(o);
+    assets::State state;
+    assets::Cook(42, rgba, w, h);
+    auto cooked = assets::Find(42, &state);
+    Check(cooked && state == assets::State::Ready && cooked->format == codec::kAstc4x4 && cooked->alpha_top == 0x7F,
+          "cooked to ASTC, its alpha stretched from 0x7F");
+    std::vector<u32> noise(w * h);
+    for (u32 i = 0; i < noise.size(); ++i) noise[i] = (i * 2654435761u) | 0x80000000u;   // alpha 0x80-0xFF: no
+    assets::Cook(43, noise, w, h);
+    assets::Find(43, &state);
+    Check(state == assets::State::Rejected, "noise with alpha either side of 0x80 is drawn decoded");
+    assets::Close();
+    assets::Open(o);
+    cooked = assets::Find(42, &state);
+    std::vector<u32> back;
+    Check(cooked && state == assets::State::Ready &&
+              codec::Decode(cooked->format, cooked->data.data(), cooked->data.size(), w, h, &back),
+          "read back from the store after reopening it");
+    assets::Find(43, &state);
+    Check(state == assets::State::Rejected, "a refusal is remembered in the store");
+    assets::Close();
+    const std::filesystem::path store = dir / "textures.astc.store";
+    std::filesystem::resize_file(store, std::filesystem::file_size(store, ec) - 10, ec);
+    assets::Open(o);
+    assets::Find(43, &state);
+    Check(state == assets::State::Unknown, "a record cut short is dropped");
+    cooked = assets::Find(42, &state);
+    Check(cooked != nullptr, "the records before it are kept");
+    assets::Close();
+    std::filesystem::remove_all(dir, ec);
+}
+
 void GpuDecodesTexturesAsTheGs() {
     using namespace ps2host::gs;
     std::string error;
@@ -645,6 +711,49 @@ void GpuDecodesTexturesAsTheGs() {
         for (std::size_t i = 0; i < back.size() && i < decoded.size(); ++i) wrong += back[i] != decoded[i];
         const std::string what = std::string(k.name) + ": decoded on the GPU as the GS model decodes it";
         Check(read && back.size() == decoded.size() && decoded.size() == 64 * 64 && wrong == 0, what.c_str());
+        // The asset cache's CPU decode of the whole image (its content's id
+        // is a hash of it): the GPU's, texel for texel.
+        {
+            MipLevels one;
+            one.tbp[0] = tbp;
+            one.tbw[0] = tbw;
+            std::vector<u32> image;
+            gs.DecodeImage(tex0, k.clamp, texa, one, 1, &image);
+            const std::string cpu = std::string(k.name) + ": the whole image decoded on the CPU as on the GPU";
+            Check(read && image == back, cpu.c_str());
+        }
+        // Mipmapped: levels 1 and 2 below level 0 in one image, on both.
+        if (k.psm == PSMCT32 || k.psm == PSMT8) {
+            MipLevels mips;
+            mips.count = 3;
+            mips.tbp[0] = tbp;
+            mips.tbw[0] = tbw;
+            mips.tbp[1] = 0x800;
+            mips.tbw[1] = 1;
+            mips.tbp[2] = 0x900;
+            mips.tbw[2] = 1;
+            ps2gpu::GsTextureDecode levels = d;
+            levels.levels = 3;
+            for (u32 n = 0; n < 3; ++n) {
+                levels.level_tbp[n] = mips.tbp[n];
+                levels.level_tbw[n] = mips.tbw[n];
+            }
+            renderer->TextureFromMemory(key + 1000, levels);
+            std::vector<u32> gpu_levels, image;
+            const bool got = renderer->ReadTexture(key + 1000, &gpu_levels, &w, &h);
+            gs.DecodeImage(tex0, k.clamp, texa, mips, 3, &image);
+            // Each level's own texels (the rest of its rows is not drawn).
+            u32 differ = 0, y0 = 0;
+            for (u32 n = 0; n < 3 && got && image.size() == gpu_levels.size(); ++n) {
+                const u32 lw2 = 64 >> n, lh2 = 64 >> n;
+                for (u32 y = 0; y < lh2; ++y)
+                    for (u32 x = 0; x < lw2; ++x) differ += image[(y0 + y) * 64 + x] != gpu_levels[(y0 + y) * 64 + x];
+                y0 += lh2;
+            }
+            const std::string m = std::string(k.name) + ": mipmap levels decoded on the CPU as on the GPU";
+            Check(got && image.size() == gpu_levels.size() && image.size() == 64 * (64 + 32 + 16) && differ == 0,
+                  m.c_str());
+        }
         ++key;
         if (k.psm != PSMT8 && k.psm != PSMT4 && k.psm != PSMT8H && k.psm != PSMT4HL && k.psm != PSMT4HH) continue;
         // The same through a CLUT the GPU loads from its own copy of memory
@@ -1289,6 +1398,7 @@ int main() {
     GsFillsTopLeft();
     GsTakesImagesInBlocks();
     TexturePackNamesAsPcsx2();
+    TexturesCookAndKeep();
 #if PS2HOST_VULKAN
     GpuMemorySwizzlesAsTheGs();
     GpuDecodesTexturesAsTheGs();

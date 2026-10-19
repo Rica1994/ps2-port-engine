@@ -144,6 +144,19 @@ the log's `[frame skip]` line every ten seconds says which and the cost
 (`PS2HOST_FRAMESKIP_MODE=lag` for the lag alone, as before). `--skip-cycle=0xT:0xA,0xB,...` (and `--skip-seconds=N`) in a script
 line measures what each drawing function costs (`host/src/host.cpp`).
 
+### What the app keeps between runs
+
+The app keeps what it derives in its Library/Caches folder (the system may
+clear it; nothing there is the player's): the GS pipelines a run made, built
+again ahead of need at the next start, and the textures the game keeps using,
+cooked to ASTC on the efficiency cores and judged to look the same, then
+drawn cooked - a quarter of the memory and of the GPU's reading - from the
+store at every later run (`docs/ASSETS.md`). The first race after an update
+cooks; the races after it use the store. `[perf]   pipelines:` and
+`[perf]   assets (ASTC 4x4):` in the log say what each did.
+`PS2HOST_ASSETS=off` in the scheme turns the textures' part off (for an A/B
+with an input recording), `PS2GPU_PIPELINE_CACHE=0` the pipelines'.
+
 ### Leaving a run
 
 **Select + Start** held two seconds quits the app (its log sent first). The

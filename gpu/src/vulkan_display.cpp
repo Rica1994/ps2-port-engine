@@ -466,6 +466,7 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     features.features.dualSrcBlend = supported.dualSrcBlend;
     features.features.logicOp = supported.logicOp;
     features.features.textureCompressionBC = supported.textureCompressionBC;     // texture packs' DDS
+    features.features.textureCompressionASTC_LDR = supported.textureCompressionASTC_LDR;  // cooked textures
     features.pNext = needs.chain;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &features;

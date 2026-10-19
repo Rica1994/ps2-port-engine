@@ -495,6 +495,27 @@ std::filesystem::path UserDirectory() {
 #endif
 }
 
+std::filesystem::path CacheDirectory() {
+    std::filesystem::path dir;
+    if (const char* named = std::getenv("PS2HOST_CACHE_DIR"); named && *named) {
+        dir = named;
+    } else {
+#if defined(__APPLE__) && defined(PS2HOST_IOS)
+        const char* home = std::getenv("HOME");
+        dir = home ? std::filesystem::path(home) / "Library" / "Caches" / "ps2port"
+                   : std::filesystem::current_path() / "cache";
+#elif defined(__ANDROID__) && defined(PS2HOST_VULKAN)
+        const char* internal = SDL_GetAndroidInternalStoragePath();
+        dir = std::filesystem::path(internal ? internal : ".") / "cache";
+#else
+        dir = ExecutableDirectory() / "cache";
+#endif
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 void ShowMessage(const std::string& title, const std::string& text, bool error) {
 #ifdef _WIN32
     MessageBoxA(nullptr, text.c_str(), title.c_str(), MB_OK | (error ? MB_ICONERROR : MB_ICONWARNING));

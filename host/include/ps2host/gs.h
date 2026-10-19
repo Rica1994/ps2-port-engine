@@ -184,6 +184,12 @@ public:
     void DecodeTexture(std::vector<u32>* pixels, u32* width, u32* height) const;
     /* The CLUT as the last TEX0 loaded it. */
     const std::array<u32, 256>& Clut() const { return *clut_; }
+    /* A texture's image as the GPU renderer decodes one (decode.comp, the
+       same texels as TexelAt): TEX0's TW x TH through CLAMP's modes, TEXA
+       and the CLUT held now; levels 1 to `levels` - 1 (MIPTBP's, `mips`)
+       below level 0, each at the left edge, the image TW wide. */
+    void DecodeImage(u64 tex0, u64 clamp, u64 texa, const MipLevels& mips, u32 levels,
+                     std::vector<u32>* image) const;
     /* Changes whenever a CLUT is loaded. */
     u64 clut_loads() const { return clut_loads_; }
     /* Which frame buffer is displayed: FBP (as FRAME has it), FBW, PSM. */

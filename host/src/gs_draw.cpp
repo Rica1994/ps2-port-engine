@@ -270,6 +270,39 @@ void Gs::DecodeTexture(std::vector<u32>* pixels, u32* width, u32* height) const 
     *height = s.th;
 }
 
+void Gs::DecodeImage(u64 tex0, u64 clamp, u64 texa, const MipLevels& mips, u32 levels,
+                     std::vector<u32>* image) const {
+    Setup s{};
+    s.tbp = Bits(tex0, 0, 14);
+    s.tbw = Bits(tex0, 14, 6);
+    s.tpsm = Bits(tex0, 20, 6);
+    s.tw = 1u << std::min(10u, Bits(tex0, 26, 4));
+    s.th = 1u << std::min(10u, Bits(tex0, 30, 4));
+    s.csa = Bits(tex0, 56, 5);
+    s.texa = texa;
+    s.wms = Bits(clamp, 0, 2);
+    s.wmt = Bits(clamp, 2, 2);
+    s.minu = Bits(clamp, 4, 10);
+    s.maxu = Bits(clamp, 14, 10);
+    s.minv = Bits(clamp, 24, 10);
+    s.maxv = Bits(clamp, 34, 10);
+    s.levels = mips;
+    s.clut = clut_;
+    levels = std::clamp(levels, 1u, 7u);
+    u32 height = 0;
+    for (u32 n = 0; n < levels; ++n) height += std::max(1u, s.th >> n);
+    image->assign(std::size_t(s.tw) * height, 0);
+    u32 y0 = 0;
+    for (u32 n = 0; n < levels; ++n) {
+        const u32 w = std::max(1u, s.tw >> n), h = std::max(1u, s.th >> n);
+        for (u32 v = 0; v < h; ++v) {
+            u32* row = image->data() + std::size_t(y0 + v) * s.tw;
+            for (u32 u = 0; u < w; ++u) row[u] = TexelAt(s, int(u), int(v), int(n));
+        }
+        y0 += h;
+    }
+}
+
 bool Gs::Displayed(u32* fbp, u32* fbw, u32* psm) const {
     int circuit = Bits(pmode_, 1, 1) ? 1 : Bits(pmode_, 0, 1) ? 0 : -1;
     if (circuit < 0) {

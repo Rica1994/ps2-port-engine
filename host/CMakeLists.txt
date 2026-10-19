@@ -85,7 +85,10 @@ foreach(entry
         "bcdec.h|https://raw.githubusercontent.com/iOrange/bcdec/80859ed3b7afb1c527a2a99d70c61457bea72d0c/bcdec.h|134520764d96f70a27db814173616c89ad85db95fbd3328417c7a8c77e7ca189"
         "stb_image.h|https://raw.githubusercontent.com/nothings/stb/2c980bb59875b0d32144a71867fbdebb2f77cd20/stb_image.h|594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3"
         # (public domain; the overlay's text where there is no GDI: window.cpp)
-        "font8x8_basic.h|https://raw.githubusercontent.com/dhepper/font8x8/8e279d2d864e79128e96188a6b9526cfa3fbfef9/font8x8_basic.h|49d8df366296b203ca3211bc0672cf2a762135bf12710735b6292756b19dffd5")
+        "font8x8_basic.h|https://raw.githubusercontent.com/dhepper/font8x8/8e279d2d864e79128e96188a6b9526cfa3fbfef9/font8x8_basic.h|49d8df366296b203ca3211bc0672cf2a762135bf12710735b6292756b19dffd5"
+        # (MIT; the asset cache's BC7 encoder: texture_codec.cpp)
+        "bc7enc.h|https://raw.githubusercontent.com/richgel999/bc7enc/f66c2e489b07138f2673a2fb3d27c1aa1d565c48/bc7enc.h|6a129cd608eebf9f2796dd1ad4659f8c4fbe2a2ace371b728fc4ece92f449c90"
+        "bc7enc.c|https://raw.githubusercontent.com/richgel999/bc7enc/f66c2e489b07138f2673a2fb3d27c1aa1d565c48/bc7enc.c|817bfa5d30a2c4702e8c387ebb5a69398034c95905f580a6b8cd4261da901058")
     string(REPLACE "|" ";" parts "${entry}")
     list(GET parts 0 name)
     list(GET parts 1 url)
@@ -101,6 +104,38 @@ if(NOT MSVC)
         COMPILE_OPTIONS "$<IF:$<CXX_COMPILER_ID:GNU>,-Wno-narrowing,-Wno-c++11-narrowing>")
 endif()
 target_sources(ps2host PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/texture_pack.cpp)
+
+# The asset cache (asset_cache.cpp, texture_codec.cpp): textures cooked once
+# and kept - to ASTC with Arm's astcenc (Apache-2.0; its sources built here,
+# its own CMake not used: one target for every platform, SIMD by architecture)
+# and to BC7 with bc7enc (MIT).
+include(FetchContent)
+FetchContent_Declare(astcenc
+    GIT_REPOSITORY https://github.com/ARM-software/astc-encoder.git
+    GIT_TAG 5.3.0
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR do-not-build)
+FetchContent_MakeAvailable(astcenc)
+file(GLOB astcenc_sources ${astcenc_SOURCE_DIR}/Source/astcenc_*.cpp)
+add_library(ps2astcenc STATIC ${astcenc_sources})
+target_include_directories(ps2astcenc PUBLIC ${astcenc_SOURCE_DIR}/Source)
+set_target_properties(ps2astcenc PROPERTIES POSITION_INDEPENDENT_CODE ON)
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" ps2_processor)
+if(IOS OR ANDROID OR CMAKE_OSX_ARCHITECTURES MATCHES "arm64" OR ps2_processor MATCHES "^(arm64|aarch64)")
+    target_compile_definitions(ps2astcenc PUBLIC ASTCENC_NEON=1 ASTCENC_SSE=0 ASTCENC_AVX=0 ASTCENC_POPCNT=0 ASTCENC_F16C=0)
+elseif(ps2_processor MATCHES "^(x86_64|amd64|x64|i[3-6]86|x86)$" OR MSVC)
+    target_compile_definitions(ps2astcenc PUBLIC ASTCENC_NEON=0 ASTCENC_SSE=41 ASTCENC_AVX=0 ASTCENC_POPCNT=1 ASTCENC_F16C=0)
+    if(NOT MSVC)
+        target_compile_options(ps2astcenc PRIVATE -msse4.1 -mpopcnt)
+    endif()
+else()
+    target_compile_definitions(ps2astcenc PUBLIC ASTCENC_NEON=0 ASTCENC_SSE=0 ASTCENC_AVX=0 ASTCENC_POPCNT=0 ASTCENC_F16C=0)
+endif()
+add_library(ps2bc7enc STATIC ${third_party_dir}/bc7enc.c)
+target_include_directories(ps2bc7enc PUBLIC ${third_party_dir})
+target_sources(ps2host PRIVATE ${CMAKE_CURRENT_LIST_DIR}/src/texture_codec.cpp
+                               ${CMAKE_CURRENT_LIST_DIR}/src/asset_cache.cpp)
+target_link_libraries(ps2host PRIVATE ps2astcenc ps2bc7enc)
 
 # The window through SDL3 and Vulkan (engine/gpu), with GDI as the fallback.
 option(PS2HOST_VULKAN "Present the picture through SDL3 and Vulkan" ON)

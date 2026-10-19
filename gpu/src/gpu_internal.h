@@ -219,6 +219,7 @@ public:
        tile-based GPU are its defaults there (gs_renderer.cpp). */
     bool portability = false;
     bool bc = false;                /* textureCompressionBC: texture packs' DDS uploaded as they are */
+    bool astc = false;              /* textureCompressionASTC_LDR: cooked textures (the asset cache) */
     bool owns_device = true;
 
 private:

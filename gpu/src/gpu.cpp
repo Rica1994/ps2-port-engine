@@ -95,6 +95,8 @@ bool VulkanGpu::Init(std::string* error) {
     logic_op = supported.logicOp == VK_TRUE && !NoLogicOp();
     features.features.textureCompressionBC = supported.textureCompressionBC;     // texture packs' DDS
     bc = supported.textureCompressionBC == VK_TRUE;
+    features.features.textureCompressionASTC_LDR = supported.textureCompressionASTC_LDR;  // cooked textures (assets)
+    astc = supported.textureCompressionASTC_LDR == VK_TRUE;
     features.pNext = needs.chain;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &features;
@@ -181,6 +183,7 @@ bool VulkanGpu::InitShared(VkInstance shared_instance, VkPhysicalDevice shared_g
     vkGetPhysicalDeviceFeatures(shared_gpu, &supported);
     logic_op = supported.logicOp == VK_TRUE && !NoLogicOp();
     bc = supported.textureCompressionBC == VK_TRUE;     // (the Display enables it too)
+    astc = supported.textureCompressionASTC_LDR == VK_TRUE;
     DeviceRequirements needs;                           // ...as the Display made the device
     DeviceRequirementsFor(shared_gpu, false, &needs);
     local_read = needs.local_read;

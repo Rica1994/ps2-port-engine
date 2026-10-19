@@ -193,6 +193,20 @@ public:
     virtual void UseReplacement(std::uint64_t key, std::uint64_t id) { (void)key, (void)id; }
     /* Whether block-compressed replacements can be uploaded as they are. */
     virtual bool BlockCompression() const { return false; }
+    /* A cooked texture (the asset cache's): the image TextureFromMemory
+       would decode under `key` - the same size, its mipmap levels below
+       level 0 the same way - in `format`: 0 RGBA8, 4 BC7, 5 ASTC 4x4
+       (ps2host::codec::Format). Drawn exactly as a decoded texture is; false
+       if the GPU cannot take the format (CookedFormat). `flags` bits 0-7: its
+       alpha stored stretched so that this value is 255 (block compression
+       keeps the ends of the range exact), scaled back as it is read; 0 for
+       alpha as it is. */
+    virtual bool UploadCooked(std::uint64_t key, std::uint32_t format, std::uint32_t width, std::uint32_t height,
+                              const std::uint8_t* data, std::size_t bytes, std::uint32_t flags = 0) {
+        (void)key, (void)format, (void)width, (void)height, (void)data, (void)bytes, (void)flags;
+        return false;
+    }
+    virtual bool CookedFormat(std::uint32_t format) const { (void)format; return false; }
     /* A depth buffer's contents, one Z per pixel, rows top-down: what local
        memory holds there (the GS's Z, unsigned). */
     virtual void UploadDepth(std::uint32_t zbp, std::uint32_t width, std::uint32_t height,
@@ -203,6 +217,9 @@ public:
                               std::uint32_t width, std::uint32_t height) = 0;
     /* Forgets a texture (after what is recorded has used it). */
     virtual void ReleaseTexture(std::uint64_t key) = 0;
+    /* What the renderer keeps between runs (SetCacheDirectory), written now:
+       the pipeline cache, the pipelines made. Cheap when nothing changed. */
+    virtual void SaveCaches() {}
     /* Whether a target exists for (FBP, FBW, PSM) - what a draw can sample. */
     virtual bool HasTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm) const = 0;
     /* Triangles, three vertices each, in GS order. */
@@ -326,6 +343,16 @@ public:
     }
 };
 std::unique_ptr<GsRenderer> CreateGsRenderer(Gpu& gpu, std::string* error);
+
+/* Where the renderer keeps what it learns from one run to the next - the
+   driver's pipeline cache, and which pipelines the run made, built again on a
+   thread of their own at the next start, before a batch asks for them (an
+   engine's PSO cache): a directory, set before CreateGsRenderer. Empty (the
+   default): nothing is kept. PS2GPU_PIPELINE_CACHE=0 turns it off. */
+void SetCacheDirectory(const std::string& directory);
+/* The pipeline cache since the start: "pipelines: N built ahead of need (M of
+   them used), K asked for and not ready, the cache's X KB loaded". */
+std::string PipelineCacheReport();
 
 /* How often the CPU has waited for the GPU to finish what was submitted, and
    for how long in all: "N submissions, S s waiting". */

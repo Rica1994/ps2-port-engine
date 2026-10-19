@@ -111,7 +111,16 @@ vec4 Expand(vec4 t) {
     return t;
 }
 
-vec4 Fetch(ivec2 at) { return Expand(floor(texelFetch(texture_image, at, 0) * 255.0 + 0.5)); }
+// A cooked texture (the asset cache's, GsRenderer::UploadCooked) whose alpha
+// was stored stretched - its largest as 255, so a block-compressed format
+// keeps the GS's "opaque" and "none" exactly (tex_format bit 12; bits 13-20
+// the alpha 255 stands for): scaled back, as asset_cache.cpp's Unstretch.
+vec4 Cooked(vec4 t) {
+    if ((p.tex_format & 0x1000u) != 0u) t.a = floor((t.a * float((p.tex_format >> 13) & 255u) + 127.0) / 255.0);
+    return t;
+}
+
+vec4 Fetch(ivec2 at) { return Expand(Cooked(floor(texelFetch(texture_image, at, 0) * 255.0 + 0.5))); }
 
 vec4 Texel(int u, int v) {
     const int k = Fine() ? int(p.scale) : 1;
@@ -240,7 +249,7 @@ vec4 Sample(vec2 uv) {
 vec4 SimpleTexel(int u, int v, ivec2 size) {
     ivec2 at = ivec2(Wrap(u, size.x, p.wms, p.minu, p.maxu, 1), Wrap(v, size.y, p.wmt, p.minv, p.maxv, 1)) & 2047;
     at = min(at, textureSize(texture_image, 0) - 1);
-    vec4 t = floor(texelFetch(texture_image, at, 0) * 255.0 + 0.5);
+    vec4 t = Cooked(floor(texelFetch(texture_image, at, 0) * 255.0 + 0.5));
     if (kShape == 4u) {                             // a target as PSMT8H: its alpha byte through the CLUT
         const uint c = clut[uint(t.a) & 255u];
         return vec4(float(c & 255u), float((c >> 8) & 255u), float((c >> 16) & 255u), float(c >> 24));
@@ -327,7 +336,7 @@ void main() {
         if (kShape == 0u && ((p.bilinear >> 12) & 1u) != 0u) {
             // FAST SAMPLING (gs_renderer.cpp): the GPU's sampler, REPEAT or
             // CLAMP and the filter set by it; the texel's levels as the GS's.
-            t = floor(texture(texture_image, coordinate.xy / coordinate.z) * 255.0 + 0.5);
+            t = Cooked(floor(texture(texture_image, coordinate.xy / coordinate.z) * 255.0 + 0.5));
         } else if (Replaced()) {
             const vec2 k = vec2(ReplacedSize(0)) / vec2(TextureSize());
             const vec2 r = coordinate.xy / coordinate.z * vec2(TextureSize()) * k;

@@ -58,8 +58,10 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
+#include "ps2host/asset_cache.h"
 #include "ps2host/gs.h"
 #include "ps2host/platform.h"
 #include "ps2host/profile.h"
@@ -72,6 +74,8 @@
 #if PS2HOST_VULKAN
 #include "ps2gpu/display.h"
 #include "ps2gpu/gs_renderer.h"
+#define XXH_INLINE_ALL
+#include "xxhash.h"
 #endif
 
 namespace ps2host {
@@ -206,6 +210,18 @@ struct Cached {
     std::size_t owned_seen = 0;
     std::list<u64>::iterator lru;
     u64 bytes = 0;                  // its decoded image's memory, about (all levels, RGBA)
+    // The asset cache (asset_cache.h): its content's id as last decoded from
+    // the CPU's memory (0: none), whether its image now is the cooked one, or
+    // is awaited (being read from the store or cooked: swapped in when there).
+    u64 asset = 0;
+    bool cooked = false, cook_waiting = false;
+    // Decoded from the CPU's memory and not yet known to the asset cache:
+    // made known once it has been drawn unchanged from `asset_from` for a
+    // second (a texture the game sends once and keeps).
+    bool asset_ready = false;
+    u64 asset_from = 0;
+    u32 texels = 0;                 // TW x TH
+    u64 rgba_bytes = 0;             // `bytes` as decoded (cooked, `bytes` is the cooked image's)
 };
 
 struct Bridge {
@@ -292,6 +308,24 @@ struct Bridge {
     u64 unchanged = 0;              // textures invalidated whose texels proved the same
     u64 gpu_decodes = 0;            // textures decoded on the GPU from its copy of local memory
     u64 replacements = 0;           // a texture pack's in their place (texture_pack.h)
+    // The asset cache: content ids by what the cache's key and the blocks'
+    // hash said (a content seen again needs no decode to be known), how
+    // many were decoded on the CPU to be known, how many textures were
+    // drawn cooked (uploaded, or swapped in once cooked or read).
+    std::unordered_map<u64, u64> asset_ids;
+    // Contents decoded (by the same key and hash): when first, and how many
+    // times. A texture sent again and again is known - and cooked - once its
+    // content has come back six times over at least a second. A movie's
+    // frames are left alone: its 64x64 tiles go through a few places in
+    // turn, each shown for two frames - and seen again only if the movie
+    // plays again (one run's attract loop made 52,000 such textures known,
+    // a second's work encoding them every second, none worth keeping).
+    struct Seen {
+        u64 first = 0;
+        u32 times = 0;
+    };
+    std::unordered_map<u64, Seen> asset_seen;
+    u64 asset_decodes = 0, cooked_uploads = 0, cooked_swaps = 0;
     // The CLUT, in rows of 16 entries (bit r for row r): which the GS model
     // holds as loaded (a load from blocks the CPU has), which the GPU's copy
     // holds (loaded from GPU memory, where the GPU drew them, or sent over).
@@ -1248,6 +1282,127 @@ bool Replace(Bridge& b, Cached& t) {
     return true;
 }
 
+// ------------------------------------------------------------------ the asset cache
+
+// The GPU memory a cooked image takes, about (the renderer's pieces).
+u64 PieceBytes(u64 bytes) {
+    u64 piece = 64 << 10;
+    while (piece < bytes) piece <<= 1;
+    return piece;
+}
+
+// The texture's cooked image drawn from now on, in place of its decoded one.
+bool UploadAsset(Bridge& b, Cached& t, const assets::Cooked& cooked) {
+    if (!b.renderer->UploadCooked(t.renderer_key, cooked.format, cooked.width, cooked.height, cooked.data.data(),
+                                  cooked.data.size(), cooked.alpha_top))
+        return false;
+    ++g_mutations;
+    t.cooked = true;
+    t.cook_waiting = false;
+    const u64 bytes = PieceBytes(cooked.data.size());
+    b.texture_bytes = b.texture_bytes - std::min(b.texture_bytes, t.bytes) + bytes;
+    t.bytes = bytes;
+    return true;
+}
+
+// Back to its decoded image's size (TextureFromMemory makes an RGBA one again).
+void Decoded(Bridge& b, Cached& t) {
+    t.cooked = t.cook_waiting = false;
+    if (t.bytes != t.rgba_bytes) {
+        b.texture_bytes = b.texture_bytes - std::min(b.texture_bytes, t.bytes) + t.rgba_bytes;
+        t.bytes = t.rgba_bytes;
+    }
+}
+
+/* A texture's content made known to the asset cache: its id (the image
+   decoded on the CPU, hashed - remembered by the cache's key and the blocks'
+   hash, `known`), then its cooked image drawn if there is one ready (true),
+   or its cooking or its read from the store started, to be swapped in when
+   done (AwaitAsset). The CPU's copy of its blocks and CLUT rows is current. */
+bool KnowAsset(Bridge& b, Cached& t, const gs::Context& c, u64 texa, u32 tw, u32 th, const gs::MipLevels& mips,
+               u64 known) {
+    u32 height = 0;
+    for (u32 n = 0; n < mips.count; ++n) height += std::max(1u, th >> n);
+    std::vector<u32> image;
+    u64 id = 0;
+    auto found = b.asset_ids.find(known);
+    if (found != b.asset_ids.end()) {
+        id = found->second;
+    } else {
+        Timed timed(Section::GpuSync);
+        gs::TheGs().DecodeImage(c.tex0, c.clamp, texa, mips, mips.count, &image);
+        id = XXH3_64bits_withSeed(image.data(), image.size() * 4, u64(tw) << 32 | height);
+        if (!id) id = 1;
+        if (b.asset_ids.size() >= (1u << 16)) b.asset_ids.clear();
+        b.asset_ids[known] = id;
+        ++b.asset_decodes;
+    }
+    t.asset = id;
+    assets::State state = assets::State::Unknown;
+    const std::shared_ptr<const assets::Cooked> cooked = assets::Find(id, &state);
+    if (cooked && UploadAsset(b, t, *cooked)) {
+        ++b.cooked_uploads;
+        return true;
+    }
+    if (state == assets::State::Unknown) {
+        if (image.empty()) {
+            Timed timed(Section::GpuSync);
+            gs::TheGs().DecodeImage(c.tex0, c.clamp, texa, mips, mips.count, &image);
+            ++b.asset_decodes;
+        }
+        assets::Cook(id, std::move(image), tw, height);
+        // Cooked at once (PS2HOST_ASSET_SYNC): drawn so already.
+        const std::shared_ptr<const assets::Cooked> now = assets::Find(id, &state);
+        if (now && UploadAsset(b, t, *now)) {
+            ++b.cooked_uploads;
+            return true;
+        }
+    }
+    t.cook_waiting = state == assets::State::Loading || state == assets::State::Cooking ||
+                     state == assets::State::Unknown;
+    return false;
+}
+
+/* What the asset cache does for a texture decoded from the CPU's memory:
+   nothing for a content new or seen only lately (a movie's frames go through
+   one place in turn: left alone) - it is decoded on the GPU as before, and
+   if it stays in use a second CachedTexture makes it known then. A content
+   known already, or coming back after a second, is made known now (true:
+   its cooked image is drawn, nothing to decode). */
+bool UseAsset(Bridge& b, Cached& t, const gs::Context& c, u64 texa, u32 tw, u32 th, const gs::MipLevels& mips,
+              u64 key, u64 content, u32 clut_rows) {
+    Decoded(b, t);
+    t.asset = 0;
+    t.asset_ready = false;
+    if (!assets::Enabled() || (clut_rows & ~b.clut_cpu)) return false;
+    if (u64(tw) * th < assets::Settings().min_texels) return false;
+    const u64 known = key * 0x9E3779B97F4A7C15ull ^ content;
+    if (!b.asset_ids.count(known)) {
+        Bridge::Seen& seen = b.asset_seen[known];
+        if (!seen.times++) seen.first = b.frame;
+        if (seen.times < 6 || b.frame < seen.first + 60) {
+            if (b.asset_seen.size() >= (1u << 17)) b.asset_seen.clear();
+            // Made known if it is still drawn, unchanged, a second from now.
+            t.asset_ready = true;
+            t.asset_from = b.frame;
+            return false;
+        }
+    }
+    return KnowAsset(b, t, c, texa, tw, th, mips, known);
+}
+
+/* A texture whose cooked image was awaited: swapped in if it is there now. */
+void AwaitAsset(Bridge& b, Cached& t) {
+    assets::State state = assets::State::Unknown;
+    const std::shared_ptr<const assets::Cooked> cooked = assets::Find(t.asset, &state);
+    if (cooked) {
+        if (UploadAsset(b, t, *cooked)) ++b.cooked_swaps;
+        else t.cook_waiting = false;
+    } else if (state == assets::State::Rejected) {
+        t.cook_waiting = false;
+    }
+}
+
 u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
     const u32 tbp = Bits(c.tex0, 0, 14), tbw = Bits(c.tex0, 14, 6), psm = Bits(c.tex0, 20, 6);
     // What decides the decoded texels: where and how it is stored (TBP0, TBW,
@@ -1283,6 +1438,8 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         if (mips.count > 1) texels += texels / 3;
         t.bytes = 64 << 10;
         while (t.bytes < texels) t.bytes <<= 1;
+        t.rgba_bytes = t.bytes;
+        t.texels = tw * th;
         b.texture_bytes += t.bytes;
     } else {
         b.texture_lru.splice(b.texture_lru.begin(), b.texture_lru, t.lru);
@@ -1306,6 +1463,15 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         if (pack || t.replaced) t.valid = t.decoded = false;
     }
     if (t.valid && t.pack_pending && pack) Replace(b, t);       // its file read since
+    if (t.valid && t.cook_waiting) AwaitAsset(b, t);            // cooked or read since
+    if (t.valid && t.asset_ready && b.frame >= t.asset_from + 60) {
+        // Unchanged since it was decoded from the CPU's memory a second ago
+        // (valid: nothing wrote or drew over its blocks): the CPU's copy is
+        // still what it was decoded from.
+        t.asset_ready = false;
+        if (!(clut_rows & ~b.clut_cpu))
+            KnowAsset(b, t, c, texa, tw, th, mips, key * 0x9E3779B97F4A7C15ull ^ t.content);
+    }
     // Its replacement gone from the GPU (not drawn for a while): again.
     if (t.replaced && !b.renderer->HasReplacement(t.replacement)) t.valid = t.decoded = false;
     // Decoded on the GPU, from its copy of local memory and its CLUT, the
@@ -1379,6 +1545,8 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         Timed timed(Section::GpuSync);
         const TimelineStep step("sync: a texture decoded on the GPU");
         gpu_holds_now = true;
+        Decoded(b, t);
+        t.asset_ready = false;
         gpu_decode();
         t.replaced = t.pack_pending = false;
         t.valid = true;
@@ -1408,7 +1576,12 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
             if (pack || dump_dir)
                 t.pack_name = texture_pack::NameOf(gs::TheGs().memory, c.tex0, c.clamp, texa,
                                                    gs::TheGs().Clut().data());
-            if (!pack || !Replace(b, t)) gpu_decode();
+            if (pack && Replace(b, t)) {
+                Decoded(b, t);
+                t.asset_ready = false;
+            } else if (!UseAsset(b, t, c, texa, tw, th, mips, key, content, clut_rows)) {
+                gpu_decode();
+            }
             static std::set<std::string> dumped;
             std::vector<u32> pixels;
             u32 w = 0, h = 0;
@@ -2073,6 +2246,44 @@ void OpenTexturePack() {
                      texture_pack::Enabled() ? "on" : "off");
 }
 
+/* The asset cache (asset_cache.h): textures cooked once, kept between runs.
+   By default on a tablet, to ASTC (a quarter of the memory and of the GPU's
+   reading); off on a PC, where the GPU reads RGBA as fast. PS2HOST_ASSETS
+   (or PC SETTINGS' texture_cooking): off, astc, bc7 or rgba8 (no loss: a
+   test of the path); PS2HOST_ASSET_SIMULATE=1 draws a format the GPU lacks
+   decoded back (to see what it looks like); PS2HOST_ASSET_SYNC=1 cooks on
+   the GS thread (a scripted run's pictures the same each time);
+   PS2HOST_ASSET_EFFORT the encoder's effort (10). Scripted runs (the
+   virtual clock) leave it off unless PS2HOST_ASSETS asks. */
+void OpenAssetCache(ps2gpu::GsRenderer& renderer) {
+    const char* env = std::getenv("PS2HOST_ASSETS");
+    std::string wanted = env ? env : "";
+    if (wanted.empty()) {
+        if (VirtualClock()) return;
+        wanted = Setting("texture_cooking", platform::kMobile ? "astc" : "off");
+    }
+    codec::Format format = codec::kRgba8;
+    if (wanted == "0" || wanted == "off" || !codec::Parse(wanted, &format)) return;
+    assets::Options options;
+    options.directory = platform::CacheDirectory() / "assets";
+    options.format = format;
+    options.simulate = std::getenv("PS2HOST_ASSET_SIMULATE") && *std::getenv("PS2HOST_ASSET_SIMULATE") == '1';
+    options.synchronous = std::getenv("PS2HOST_ASSET_SYNC") && *std::getenv("PS2HOST_ASSET_SYNC") == '1';
+    if (const char* effort = std::getenv("PS2HOST_ASSET_EFFORT")) options.effort = std::atoi(effort);
+    if (platform::kMobile) {
+        options.disk_budget = 768ull << 20;
+        options.memory_budget = 96ull << 20;
+    } else {
+        options.disk_budget = 2000ull << 20;
+        options.memory_budget = 256ull << 20;
+    }
+    if (!renderer.CookedFormat(format) && !options.simulate) {
+        std::fprintf(stderr, "[assets] the GPU cannot draw %s textures: no cooking\n", codec::Name(format));
+        return;
+    }
+    assets::Open(options);
+}
+
 bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     static Bridge bridge;
     // On the window's device when there is a window: one Vulkan device for both.
@@ -2082,11 +2293,14 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
         if (!bridge.gpu) return false;
         device = bridge.gpu.get();
     }
+    // What the renderer keeps between runs (its pipeline cache): the asset cache's.
+    ps2gpu::SetCacheDirectory((platform::CacheDirectory() / "gpu").u8string());
     bridge.renderer = ps2gpu::CreateGsRenderer(*device, error);
     if (!bridge.renderer) return false;
     g_bridge = &bridge;
     OpenTexturePack();
     bridge.primary = mode == GpuMode::Primary;
+    if (bridge.primary) OpenAssetCache(*bridge.renderer);
     // The CPU's waits for the GPU, on the profiler's timeline, by why.
     ps2gpu::SetGpuWaitObserver([](const char* why, std::uint64_t from_ns, std::uint64_t to_ns) {
         timeline::Span(why, from_ns, to_ns);
@@ -2267,6 +2481,12 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
             if (s.renderer->GpuCaughtUp() && frame > 0) g_gpu_frame_done.store(frame - 1, std::memory_order_release);
             s.renderer->Kick();
         }
+        // The pipeline cache to disk now and then (a tablet's app can be
+        // ended without warning): nothing written while nothing is new.
+        if (frame % 600 == 0) {
+            s.renderer->SaveCaches();
+            assets::Save();
+        }
         if (frame % 100 == 0)
             std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads (%llu made from a twin), %llu decodes, %zu images, %zu textures (%llu MB, %llu evicted)\n",
                          static_cast<unsigned long long>(frame), static_cast<unsigned long long>(s.serial),
@@ -2324,6 +2544,48 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                 {
                     const std::string passes = ps2gpu::GpuPassReport();
                     if (!passes.empty()) std::fprintf(stderr, "[perf]   %s\n", passes.c_str());
+                }
+                // What the run keeps between runs: the pipelines built ahead,
+                // the textures cooked and used cooked.
+                std::fprintf(stderr, "[perf]   %s\n", ps2gpu::PipelineCacheReport().c_str());
+                if (assets::Enabled()) {
+                    static u64 last_decodes = 0, last_uploads = 0, last_swaps = 0;
+                    // The texture cache now: how much of it is drawn cooked, and
+                    // why the rest is not (MB as RGBA): too small, decoded from
+                    // the GPU's memory (drawn by it) or replaced, judged not
+                    // close enough, awaited, not (yet) known.
+                    u64 cooked = 0, cooked_bytes = 0, rgba_bytes = 0, why[5] = {};
+                    for (const auto& [key, t] : s.textures) {
+                        rgba_bytes += t.rgba_bytes;
+                        if (t.cooked) {
+                            ++cooked;
+                            cooked_bytes += t.rgba_bytes;
+                        } else if (t.texels < assets::Settings().min_texels) {
+                            why[0] += t.rgba_bytes;
+                        } else if (!t.decoded || t.replaced) {
+                            why[1] += t.rgba_bytes;
+                        } else if (t.cook_waiting) {
+                            why[3] += t.rgba_bytes;
+                        } else if (t.asset) {
+                            why[2] += t.rgba_bytes;
+                        } else {
+                            why[4] += t.rgba_bytes;
+                        }
+                    }
+                    std::fprintf(stderr, "[perf]   %s; textures: %llu decoded on the CPU to be known, %llu drawn "
+                                 "cooked at once, %llu swapped to cooked; %llu of %zu in the cache cooked (%llu of "
+                                 "%llu MB as RGBA; not: %llu small, %llu from the GPU, %llu not close enough, %llu "
+                                 "awaited, %llu not known)\n",
+                                 assets::Report().c_str(), (unsigned long long)(s.asset_decodes - last_decodes),
+                                 (unsigned long long)(s.cooked_uploads - last_uploads),
+                                 (unsigned long long)(s.cooked_swaps - last_swaps), (unsigned long long)cooked,
+                                 s.textures.size(), (unsigned long long)(cooked_bytes >> 20),
+                                 (unsigned long long)(rgba_bytes >> 20), (unsigned long long)(why[0] >> 20),
+                                 (unsigned long long)(why[1] >> 20), (unsigned long long)(why[2] >> 20),
+                                 (unsigned long long)(why[3] >> 20), (unsigned long long)(why[4] >> 20));
+                    last_decodes = s.asset_decodes;
+                    last_uploads = s.cooked_uploads;
+                    last_swaps = s.cooked_swaps;
                 }
                 std::fputs(WriteBackReport(s, frames).c_str(), stderr);
                 std::fflush(stderr);

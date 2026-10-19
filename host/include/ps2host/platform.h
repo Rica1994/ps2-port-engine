@@ -68,6 +68,11 @@ std::filesystem::path ExecutableDirectory();
    Beside the executable on a PC; the app's Documents folder on iOS/iPadOS
    (shown in the Files app), its internal storage on Android. */
 std::filesystem::path UserDirectory();
+/* Where the port keeps what it derives and can make again (the asset cache:
+   cooked textures, pipelines): the app's Library/Caches/ps2port on iOS/iPadOS
+   (the system may clear it; the player never sees it), "cache" beside the
+   executable elsewhere. PS2HOST_CACHE_DIR names another. Made if missing. */
+std::filesystem::path CacheDirectory();
 
 /* A message to the player, in a box (there is no terminal to read). */
 void ShowMessage(const std::string& title, const std::string& text, bool error);
