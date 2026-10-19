@@ -32,6 +32,8 @@
 #include "ps2host/vu.h"
 #include "ps2host/vu_core.h"
 #include "ps2rt/generated.h"
+#include "ps2rt/fp_mode.h"
+#include "ps2rt/lifted.h"
 
 #if PS2HOST_VULKAN
 #include "ps2gpu/gs_renderer.h"
@@ -968,6 +970,55 @@ void VifRunsMicroprogramsOnAVu() {
     Check(kicked.size() == 2 && (kicked[0] & 0x7FFF) == 1, "XGKICK sends the tag and its data");
 }
 
+// VU0 macro mode's FMAC instructions (lifted::Cop2) give what RunFmac gives
+// in the VU's float mode (fp_mode.h): on arm64 Cop2 works them without
+// switching FPCR (vu_rtz.h), so this compares two ways there (one elsewhere).
+void VuMacroWithoutModeIsTheMode() {
+    auto context = std::make_unique<lifted::Context>(), mode = std::make_unique<lifted::Context>();
+    u32 seed = 1019, wrong = 0, runs = 0;
+    auto next = [&] { return seed = seed * 1664525u + 1013904223u; };
+    auto value = [&]() -> u32 {
+        const u32 r = next(), sign = r & 0x80000000u;
+        switch ((r >> 8) % 9) {
+            case 0: return sign;
+            case 1: return sign | (r & 0x007FFFFFu);
+            case 2: return sign | 0x7F800000u | ((r >> 4) & 1);
+            case 3: return sign | 0x7F000000u | (next() & 0x007FFFFFu);
+            case 4: return sign | 0x00800000u | (next() & 0x00FFFFFFu);
+            case 5: return sign | 0x3F800000u | (next() & 0x007FFFFFu);
+            case 6: return sign | (((next() % 40) + 100) << 23) | (next() & 0x007FFFFFu);
+            case 7: return sign | (((next() % 8) + 1) << 23) | (next() & 0x007FFFFFu);
+            default: return next();
+        }
+    };
+    while (runs < 300000) {
+        const u32 word = 0x4A000000u | (next() & 0x01FFFFFFu);     // COP2, CO: an operation
+        lifted::FmacOp f;
+        if (!lifted::DecodeFmac(word, &f)) continue;
+        for (auto& v : context->vf) for (u32& lane : v) lane = value();
+        for (u32& lane : context->vacc) lane = value();
+        context->vc[21] = value();                                          // I
+        context->vc[22] = value();                                          // Q
+        if ((next() & 7) == 0) {                                            // cancellation
+            for (int lane = 0; lane < 4; ++lane) context->vf[f.ft][lane] = context->vf[f.fs][lane] ^ 0x80000000u;
+        }
+        context->vf[0][0] = context->vf[0][1] = context->vf[0][2] = 0;
+        context->vf[0][3] = 0x3F800000u;
+        *mode = *context;
+        lifted::Cop2(*context, word);
+        {
+            lifted::VuFloatMode vu;
+            lifted::RunFmac(*mode, f);
+        }
+        ++runs;
+        if (std::memcmp(context->vf, mode->vf, sizeof context->vf) != 0 ||
+            std::memcmp(context->vacc, mode->vacc, sizeof context->vacc) != 0) {
+            if (wrong++ < 5) std::printf("  macro FMAC %08X differs from the mode's\n", unsigned(word));
+        }
+    }
+    Check(wrong == 0, "VU0 macro FMACs without the FPU mode switch: the mode's numbers");
+}
+
 // The VU's visible timing: the flags reach FMAND four cycles after the FMAC
 // operation, Q seven after DIV (WAITQ waits for it), and an upper beside a LOI
 // reads the I from before - as Burnout 3's microcode depends on.
@@ -1878,6 +1929,7 @@ int main() {
     VifRunsMicroprogramsOnAVu();
     MemoryCardKeepsSaves();
     VuLanesAreTheModel();
+    VuMacroWithoutModeIsTheMode();
     VuCompiledIsTheInterpreter();
     VuFastIsTheExactButFlags();
     VuTimingIsVisible();

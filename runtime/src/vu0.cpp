@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include "ps2rt/fp_mode.h"
+#include "ps2rt/vu_rtz.h"
 
 namespace lifted {
 
@@ -210,7 +211,56 @@ struct MacroRounding {
     VuFloatMode mode{!kMacroNearest};
 };
 
+#if PS2RT_VU_RTZ
+/* An FMAC instruction on arm64 without the FPCR switch (vu_rtz.h): the same
+   numbers, half the time - Apple's cores take ~22 ns for the two writes. */
+template <int Op>
+void RunFmacRtz(Context& c, const FmacOp& f) {
+    const uint32x4_t a = vld1q_u32(c.vf[f.fs]);
+    uint32x4_t b;
+    if (f.operand == 6) b = vld1q_u32(c.vf[f.ft]);
+    else b = vdupq_n_u32(f.operand < 4 ? c.vf[f.ft][f.operand] : f.operand == 4 ? c.vc[kRegQ] : c.vc[kRegI]);
+    uint32x4_t r;
+    if constexpr (Op == kMax_ || Op == kMini) {
+        u32 out[4];
+        Lanes<Op>(c, f, out);                       // no arithmetic: no mode to set
+        r = vld1q_u32(out);
+    } else {
+        constexpr int kRtz = Op == kAdd ? rtz::kAdd : Op == kSub ? rtz::kSub : Op == kMul ? rtz::kMul
+                           : Op == kMadd ? rtz::kMadd : rtz::kMsub;
+        r = rtz::Lanes<kRtz>(a, b, vld1q_u32(c.vacc));
+    }
+    u32* to = f.to_acc ? c.vacc : f.fd ? c.vf[f.fd] : nullptr;
+    if (!to) return;
+    u32 out[4];
+    vst1q_u32(out, r);
+    for (int lane = 0; lane < 4; ++lane)
+        if (f.dest & (8u >> lane)) to[lane] = out[lane];
+}
+
+void RunFmacWithoutMode(Context& c, const FmacOp& f) {
+    switch (f.op) {
+        case kAdd: RunFmacRtz<kAdd>(c, f); break;
+        case kSub: RunFmacRtz<kSub>(c, f); break;
+        case kMul: RunFmacRtz<kMul>(c, f); break;
+        case kMadd: RunFmacRtz<kMadd>(c, f); break;
+        case kMsub: RunFmacRtz<kMsub>(c, f); break;
+        case kMax_: RunFmacRtz<kMax_>(c, f); break;
+        default: RunFmacRtz<kMini>(c, f); break;
+    }
+}
+#endif
+
 void Cop2(Context& c, u32 word) {
+#if PS2RT_VU_RTZ
+    if (!kMacroNearest) {
+        FmacOp fmac;
+        if (DecodeFmac(word, &fmac)) {
+            RunFmacWithoutMode(c, fmac);
+            return;
+        }
+    }
+#endif
     MacroRounding rounding;
     const u32 fd = (word >> 6) & 0x1F, fs = (word >> 11) & 0x1F, ft = (word >> 16) & 0x1F;
     const u32 dest = (word >> 21) & 0xF;
