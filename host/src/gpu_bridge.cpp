@@ -326,6 +326,7 @@ struct Bridge {
     };
     std::unordered_map<u64, Seen> asset_seen;
     u64 asset_decodes = 0, cooked_uploads = 0, cooked_swaps = 0;
+    u64 texture_draws = 0, cooked_draws = 0;    // textured batches' lookups, and of them drawn cooked
     // The CLUT, in rows of 16 entries (bit r for row r): which the GS model
     // holds as loaded (a load from blocks the CPU has), which the GPU's copy
     // holds (loaded from GPU memory, where the GPU drew them, or sent over).
@@ -1314,6 +1315,30 @@ void Decoded(Bridge& b, Cached& t) {
     }
 }
 
+/* What a texture's image is made from, wherever the game put it: its texels
+   and CLUT as a texture pack names them (texture_pack::NameOf: the blocks
+   it covers, hashed - cheap, and the same at another address), CLAMP, and
+   each mipmap level's the same way. The race streams its textures through
+   a few places of GS memory: by address, the same texture coming back
+   somewhere else looked new every time. */
+u64 SourceKey(const gs::Context& c, u64 texa, const gs::MipLevels& mips) {
+    const gs::Gs& g = gs::TheGs();
+    u64 h = c.clamp * 0xC2B2AE3D27D4EB4Full ^ mips.count;
+    for (u32 n = 0; n < mips.count; ++n) {
+        u64 tex0 = c.tex0;
+        if (n) {
+            const u32 lw = std::max(0, int(Bits(c.tex0, 26, 4)) - int(n)), lh = std::max(0, int(Bits(c.tex0, 30, 4)) - int(n));
+            tex0 = (tex0 & ~0x3FFFFFFFFull) | mips.tbp[n] | u64(std::max(1u, mips.tbw[n])) << 14 |
+                   u64(Bits(c.tex0, 20, 6)) << 20 | u64(lw) << 26 | u64(lh) << 30;
+        }
+        const texture_pack::Name name = texture_pack::NameOf(g.memory, tex0, c.clamp, texa, g.Clut().data());
+        if (!name.bits) return 0;                   // a format a pack has no name for: not known by content
+        h = (h ^ name.texture) * 0x9E3779B97F4A7C15ull;
+        h = (h ^ name.clut ^ (u64(name.bits) << 32 | name.region_w << 16 | name.region_h)) * 0xBF58476D1CE4E5B9ull;
+    }
+    return h ? h : 1;
+}
+
 /* A texture's content made known to the asset cache: its id (the image
    decoded on the CPU, hashed - remembered by the cache's key and the blocks'
    hash, `known`), then its cooked image drawn if there is one ready (true),
@@ -1376,7 +1401,9 @@ bool UseAsset(Bridge& b, Cached& t, const gs::Context& c, u64 texa, u32 tw, u32 
     t.asset_ready = false;
     if (!assets::Enabled() || (clut_rows & ~b.clut_cpu)) return false;
     if (u64(tw) * th < assets::Settings().min_texels) return false;
-    const u64 known = key * 0x9E3779B97F4A7C15ull ^ content;
+    (void)key, (void)content;
+    const u64 known = SourceKey(c, texa, mips);
+    if (!known) return false;
     if (!b.asset_ids.count(known)) {
         Bridge::Seen& seen = b.asset_seen[known];
         if (!seen.times++) seen.first = b.frame;
@@ -1470,7 +1497,7 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         // still what it was decoded from.
         t.asset_ready = false;
         if (!(clut_rows & ~b.clut_cpu))
-            KnowAsset(b, t, c, texa, tw, th, mips, key * 0x9E3779B97F4A7C15ull ^ t.content);
+            if (const u64 known = SourceKey(c, texa, mips)) KnowAsset(b, t, c, texa, tw, th, mips, known);
     }
     // Its replacement gone from the GPU (not drawn for a while): again.
     if (t.replaced && !b.renderer->HasReplacement(t.replacement)) t.valid = t.decoded = false;
@@ -1598,6 +1625,8 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th) {
         t.decoded = true;
     }
     const u64 renderer_key = t.renderer_key;
+    ++b.texture_draws;
+    if (t.cooked) ++b.cooked_draws;
     // Keep the cache bounded: the least recently used go (4,096: a race keeps
     // over 2,048 about, and each one evicted came back decoded again) - and
     // on a tablet by their memory too (PS2HOST_TEXTURE_MB, 320 MB): an A12
@@ -2549,7 +2578,7 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                 // the textures cooked and used cooked.
                 std::fprintf(stderr, "[perf]   %s\n", ps2gpu::PipelineCacheReport().c_str());
                 if (assets::Enabled()) {
-                    static u64 last_decodes = 0, last_uploads = 0, last_swaps = 0;
+                    static u64 last_decodes = 0, last_uploads = 0, last_swaps = 0, last_draws = 0, last_cooked = 0;
                     // The texture cache now: how much of it is drawn cooked, and
                     // why the rest is not (MB as RGBA): too small, decoded from
                     // the GPU's memory (drawn by it) or replaced, judged not
@@ -2573,12 +2602,17 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                         }
                     }
                     std::fprintf(stderr, "[perf]   %s; textures: %llu decoded on the CPU to be known, %llu drawn "
-                                 "cooked at once, %llu swapped to cooked; %llu of %zu in the cache cooked (%llu of "
+                                 "cooked at once, %llu swapped to cooked; %.0f%% of the batches' textures drawn "
+                                 "cooked; %llu of %zu in the cache cooked (%llu of "
                                  "%llu MB as RGBA; not: %llu small, %llu from the GPU, %llu not close enough, %llu "
                                  "awaited, %llu not known)\n",
                                  assets::Report().c_str(), (unsigned long long)(s.asset_decodes - last_decodes),
                                  (unsigned long long)(s.cooked_uploads - last_uploads),
-                                 (unsigned long long)(s.cooked_swaps - last_swaps), (unsigned long long)cooked,
+                                 (unsigned long long)(s.cooked_swaps - last_swaps),
+                                 s.texture_draws > last_draws ? 100.0 * double(s.cooked_draws - last_cooked) /
+                                                                    double(s.texture_draws - last_draws)
+                                                              : 0.0,
+                                 (unsigned long long)cooked,
                                  s.textures.size(), (unsigned long long)(cooked_bytes >> 20),
                                  (unsigned long long)(rgba_bytes >> 20), (unsigned long long)(why[0] >> 20),
                                  (unsigned long long)(why[1] >> 20), (unsigned long long)(why[2] >> 20),
@@ -2586,6 +2620,8 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                     last_decodes = s.asset_decodes;
                     last_uploads = s.cooked_uploads;
                     last_swaps = s.cooked_swaps;
+                    last_draws = s.texture_draws;
+                    last_cooked = s.cooked_draws;
                 }
                 std::fputs(WriteBackReport(s, frames).c_str(), stderr);
                 std::fflush(stderr);

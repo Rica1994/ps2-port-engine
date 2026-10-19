@@ -30,8 +30,10 @@ The id is a hash (XXH3) of the image as the GPU renderer decodes it, which the
 GS model makes on the CPU for it (`Gs::DecodeImage`: the software GS's own
 texel reads; the host tests check it against the GPU's decode for every
 format and for mipmap levels). That decode happens once per content per run:
-the bridge remembers the id by the texture cache's key and its blocks' hash,
-which it computes anyway to see whether a texture changed.
+the bridge remembers the id by what the image is made from wherever it is
+(`SourceKey`: the texels and CLUT hashed as a texture pack names them, which
+is cheap, and CLAMP) - the race streams its textures through a few places of
+GS memory, so by address the same texture looked new every time.
 
 **What is worth knowing.** Only the textures a game keeps using are made
 known, so that neither a movie nor anything else seen once costs a CPU
@@ -58,7 +60,12 @@ the renderer scales it back as it reads: `gs.frag`'s `Cooked`): opaque and
 none at the ends of the range, where ASTC and BC7 are exact. Even so, about
 a third of a race's textures pass the judgement (their alpha is mostly
 smooth ramps, which 8 bits a texel cannot keep within 8): the rest are drawn
-decoded, as before.
+decoded, as before. Measured on Burnout 3's scripted race (lavapipe, ASTC
+simulated): a third of the texture cache's bytes cooked (216 of 635 MB as
+RGBA), 17% of the race's textured batches drawn cooked (83% in the menus);
+the worst of 29 pictures 42.9 dB from the uncooked build, no difference to
+be seen. With `rgba8` 92% of the batches are drawn from the cache and every
+picture is byte-identical.
 
 **The store** (`asset_cache.cpp`). One file a format in the cache folder
 (`platform::CacheDirectory()/assets`: the app's Library/Caches on iOS,
