@@ -332,6 +332,7 @@ struct Bridge {
     };
     std::unordered_map<u64, Seen> asset_seen;
     u64 asset_decodes = 0, cooked_uploads = 0, cooked_swaps = 0;
+    u64 unseen_draws = 0;               // SetDisplayCopyUnseen's draws left undrawn
     u64 texture_draws = 0, cooked_draws = 0;    // textured batches' lookups, and of them drawn cooked
     // The CLUT, in rows of 16 entries (bit r for row r): which the GS model
     // holds as loaded (a load from blocks the CPU has), which the GPU's copy
@@ -379,6 +380,8 @@ u64 GpuBusyMicroseconds() { return ps2gpu::GpuBusyNanoseconds() / 1000; }
 bool g_present_at_blank_end = false;
 bool g_present_waits = false;
 u64 g_present_frame = 0;
+// SetDisplayCopyUnseen: a frame not shown leaves its display copy undrawn.
+bool g_display_copy_unseen = false;
 void PresentWaiting();
 
 namespace {
@@ -1782,6 +1785,15 @@ Owned* Containing(Bridge& b, u32 fbp, u32 fbw, u32 psm, u32* offset) {
     return best;
 }
 
+// Whether the frame waiting to be shown will not be (PresentWaiting's test):
+// its race picture left out while frames are being left out.
+bool UnseenFrame() {
+    const long long now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const bool drawn_only = now_ns - g_left_out_at.load(std::memory_order_relaxed) < 1000000000LL;
+    return drawn_only && FrameLeftOut(g_present_frame);
+}
+
 void OnDraw(const gs::Gs::DrawCall& call) {
     // Timed only past the fast path below: two clock reads a primitive were
     // a twentieth of the GS thread.
@@ -1794,6 +1806,13 @@ void OnDraw(const gs::Gs::DrawCall& call) {
     if (g_present_waits) {
         u32 fbp = 0, fbw = 0, psm = 0;
         if (!gs::TheGs().Displayed(&fbp, &fbw, &psm) || Bits(c.frame, 0, 9) != fbp) PresentWaiting();
+        else if (g_display_copy_unseen && s.primary && UnseenFrame()) {
+            // Into the shown buffer before a frame that will not be shown
+            // (its race picture left out): its copy of the frame, never seen
+            // and fully redrawn by the next one's (SetDisplayCopyUnseen).
+            ++s.unseen_draws;
+            return;
+        }
     }
     // The frame and scissor as the registers have them; the draw's whole
     // state (a large struct) is made past the fast path below, which reuses
@@ -2565,6 +2584,12 @@ void PresentWaiting() {
 
 void SetPresentAtBlankEnd(bool on) { g_present_at_blank_end = on; }
 
+void SetDisplayCopyUnseen(bool on) {
+    // PS2HOST_UNSEEN_COPY=0: drawn all the same (an A/B).
+    const char* v = std::getenv("PS2HOST_UNSEEN_COPY");
+    g_display_copy_unseen = on && !(v && *v == '0');
+}
+
 void GpuCaptureBegin(u64 frame, const std::string& passes_dir) {
     if (!g_bridge) return;
     g_bridge->dump_passes = passes_dir;
@@ -2654,12 +2679,13 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
         // ended without warning): nothing written while nothing is new.
         if (frame % 600 == 0) assets::Save();
         if (frame % 100 == 0)
-            std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads (%llu made from a twin), %llu decodes, %zu images, %zu textures (%llu MB, %llu evicted)\n",
+            std::fprintf(stderr, "[gpu] frame %llu: %llu draws, %llu write-backs, %llu reloads (%llu made from a twin), %llu decodes, %zu images, %zu textures (%llu MB, %llu evicted), %llu unseen draws left out\n",
                          static_cast<unsigned long long>(frame), static_cast<unsigned long long>(s.serial),
                          static_cast<unsigned long long>(s.write_backs), static_cast<unsigned long long>(s.reloads),
                          static_cast<unsigned long long>(s.converts),
                          static_cast<unsigned long long>(s.decodes), s.owned.size(), s.textures.size(),
-                         static_cast<unsigned long long>(s.texture_bytes >> 20), static_cast<unsigned long long>(s.evictions));
+                         static_cast<unsigned long long>(s.texture_bytes >> 20), static_cast<unsigned long long>(s.evictions),
+                         static_cast<unsigned long long>(s.unseen_draws));
         // PS2HOST_PERF=1: a tablet's report on any machine.
         static const bool perf_report = platform::kMobile || std::getenv("PS2HOST_PERF") != nullptr;
         if (perf_report) {

@@ -73,6 +73,10 @@ layout(constant_id = 0) const uint kFeatures = 0xFFFFFFFFu;
 const uint kTextured = 1u, kReplaced = 2u, kMip = 4u, kLinear = 8u, kExpand = 16u, kFine = 32u, kSnap = 64u,
            kFog = 128u, kAlphaTest = 256u, kPabe = 512u, kLogic = 1024u, kSixteen = 2048u;
 bool Has(uint feature) { return (kFeatures & feature) != 0u; }
+// PS2GPU_PROBE (gs_renderer.cpp's MakePipeline): 1 the vertices' colour alone,
+// 2 the nearest texel without the GS's addressing - a measurement of what
+// this shader's work costs; 0 (always but then) the shader as it is.
+layout(constant_id = 1) const uint kProbe = 0u;
 const float kEdge = 1.0 / 16384.0;       // Sample's nudge past a texel's edge
 
 float Ta0() { return float(p.texa & 255u); }
@@ -315,6 +319,13 @@ layout(location = 0, index = 1) out vec4 factor;
 #endif
 
 void main() {
+    if (kProbe == 1u) {
+        colour = shade;
+#ifndef SINGLE_OUTPUT
+        factor = vec4(shade.a * 255.0 / 128.0);
+#endif
+        return;
+    }
     vec4 v = round(shade * 255.0);
     vec4 c = v;
     if (Has(kTextured) && p.textured != 0u) {
@@ -341,6 +352,8 @@ void main() {
             const vec2 r = coordinate.xy / coordinate.z * vec2(TextureSize()) * k;
             const vec2 dx = dFdx(r), dy = dFdy(r);
             t = ReplacedSample(uv * k, sqrt(max(dot(dx, dx), dot(dy, dy))));
+        } else if (kProbe == 2u) {
+            t = floor(texelFetch(texture_image, clamp(ivec2(uv), ivec2(0), ImageSize() - 1), 0) * 255.0 + 0.5);
         } else {
             t = Sample(uv);
         }

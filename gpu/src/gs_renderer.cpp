@@ -2538,9 +2538,19 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = key & kShaderBlend ? frag_blend_ : frag_;
     stages[1].pName = "main";
-    const std::uint32_t features = ~(key >> kFeatureShift);     // all of them for a key without
-    const VkSpecializationMapEntry feature_entry{0, 0, sizeof features};
-    VkSpecializationInfo specialisation{1, &feature_entry, sizeof features, &features};
+    // PS2GPU_PROBE (a measurement, not a way to play: the picture changes):
+    // 1 the shader's colour the vertices' alone, 2 textures read at the
+    // nearest texel without the GS's addressing - what the shader's work
+    // costs a GPU, from its timestamps (gs.frag's kProbe).
+    static const std::uint32_t probe = [] {
+        const char* v = std::getenv("PS2GPU_PROBE");
+        const std::uint32_t n = v ? std::uint32_t(std::atoi(v)) : 0u;
+        if (n) std::fprintf(stderr, "[gpu] PS2GPU_PROBE=%u: the shader cut down to measure it (the picture is wrong)\n", n);
+        return n;
+    }();
+    const std::uint32_t values[2] = {~(key >> kFeatureShift), probe};     // all features for a key without
+    const VkSpecializationMapEntry feature_entries[2] = {{0, 0, 4}, {1, 4, 4}};
+    VkSpecializationInfo specialisation{2, feature_entries, sizeof values, values};
     stages[1].pSpecializationInfo = &specialisation;
     VkVertexInputBindingDescription binding{0, sizeof(PackedVertex), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attributes[6] = {

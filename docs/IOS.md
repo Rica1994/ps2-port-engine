@@ -151,6 +151,16 @@ the GPU (its timestamps): one in three for ~43 ms, one in two under ~29 ms;
 the log's `[frame skip]` line every ten seconds says which and the cost
 (`PS2HOST_FRAMESKIP_MODE=lag` for the lag alone, as before). `--skip-cycle=0xT:0xA,0xB,...` (and `--skip-seconds=N`) in a script
 line measures what each drawing function costs (`host/src/host.cpp`).
+A frame left out is not shown, so Burnout 3's copy of the last picture into
+its display buffer at that frame's start is not drawn either
+(`SetDisplayCopyUnseen`; the `[gpu] frame` line counts the draws left out;
+`PS2HOST_UNSEEN_COPY=0` draws them).
+
+`PS2GPU_PROBE=1` (or `2`) in the scheme measures the GS shader rather than
+playing: `1` draws every pixel in its vertices' colour alone, `2` reads
+textures at the nearest texel without the GS's addressing and filter. The
+picture is wrong; the `[frame skip]` line's GPU time per picture, against a
+run without it, is what the shader's work costs the iPad's GPU.
 
 ### What the app keeps between runs
 

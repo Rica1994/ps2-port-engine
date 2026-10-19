@@ -350,6 +350,12 @@ u64 LastFrame();
    nobody drew that frame. (Not longer: a film shown by image transfers
    alone draws nothing.) */
 void NoteDrawLeftOut();
+/* A port whose frames start with a whole copy of the last picture into the
+   shown buffer, replacing it (Burnout 3's 640x448 copy into its 16-bit
+   display buffer): while frames are left out, a frame that will not be
+   shown leaves that copy undrawn - nobody sees it, and the next frame
+   shown copies the whole picture again. PS2HOST_UNSEEN_COPY=0: drawn. */
+void SetDisplayCopyUnseen(bool on);
 /* A tablet's reports (report.cpp): the run's log (sent as `run_name`.log)
    and the VU programs it records (`folder`/vu_programs_new.txt), sent over
    the local network to PS2HOST_REPORT's or the build's PS2_REPORT_URL's
