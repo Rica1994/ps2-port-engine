@@ -603,6 +603,7 @@ private:
        there starts a batch of its own, with a new copy (Burnout 3's speed
        blur: layers each drawn over the last, as one batch read all from the
        picture before them - a fainter blur). */
+    bool batch_ranged_ = false;     /* a vertex of the batch kept to a sprite's or a quad's texels (range) */
     bool drawn_any_ = false;
     int drawn_x0_ = 0, drawn_y0_ = 0, drawn_x1_ = 0, drawn_y1_ = 0;     /* pixels, inclusive */
     /* The batch's sprites (DrawTriangles: those meeting another edge to edge
@@ -3706,6 +3707,7 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             last_flat_valid_ = true;
         }
     }
+    if (range[0] != -1e9f || range[1] != -1e9f || range[2] != 1e9f || range[3] != 1e9f) batch_ranged_ = true;
     PackedVertex* out = pending_.Grow(count / 3 * 3);
     for (std::size_t i = 0; i + 2 < count; i += 3) {
         for (int k = 0; k < 3; ++k, ++out) {
@@ -3786,6 +3788,8 @@ void VulkanGsRenderer::FlatQuadRange(FlatQuad& q, const GsDrawState& state) {
 
 void VulkanGsRenderer::Flush() {
     drawn_any_ = false;
+    const bool ranged = batch_ranged_;
+    batch_ranged_ = false;
     sprites_.clear();
     quads_.clear();
     last_flat_valid_ = false;
@@ -3949,7 +3953,10 @@ void VulkanGsRenderer::Flush() {
     params.blend_ops = std::uint32_t(state_.a) | std::uint32_t(state_.b) << 2 | std::uint32_t(state_.c) << 4 |
                        std::uint32_t(state_.d) << 6;
     if (!state_.blend) params.blend_ops = 0;    // (A - B) * C + D as Cs - Cs + Cs: the source as it is
-    if (state_.textured && t->scale > 1) params.blend_ops |= (t->scale & 0xFFu) << 8;
+    // (Only a batch with a sprite's or a quad's range: the rest reach
+    // everywhere, and gs.frag's Snap - its clamps for every pixel - is left
+    // out of their pipeline.)
+    if (state_.textured && t->scale > 1 && ranged) params.blend_ops |= (t->scale & 0xFFu) << 8;
     if (Is16Bit(state_.psm)) params.blend_ops |= 1u << 16;    // gs.frag: colour cut to five bits a channel
     const std::uint32_t count = std::uint32_t(pending_.size());
     static int complaints = 0;
