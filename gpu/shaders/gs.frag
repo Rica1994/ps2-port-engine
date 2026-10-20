@@ -445,9 +445,13 @@ void main() {
     vec3 op_d = ((ops >> 6) & 3u) == 0u ? c.rgb : ((ops >> 6) & 3u) == 1u ? dst.rgb : vec3(0.0);
     c.rgb = clamp(floor((op_a - op_b) * op_c / 128.0) + op_d, 0.0, 255.0);
 #endif
-    // A 16-bit target keeps the top five bits of each colour byte.
-    if (Has(kSixteen) && ((p.blend_ops >> 16) & 1u) != 0u) c.rgb = floor(c.rgb / 8.0) * 8.0;
+    // A 16-bit target keeps the top five bits of each colour byte, alpha's
+    // top bit: the rest written as 0, as stored (gs_renderer.cpp's KeptBits).
+    const bool sixteen = Has(kSixteen) && ((p.blend_ops >> 16) & 1u) != 0u;
+    if (sixteen) c.rgb = floor(c.rgb / 8.0) * 8.0;
     colour = c / 255.0;
+    // (Alpha as stored, not as the blend's factor below: As itself.)
+    if (sixteen) colour.a = c.a >= 128.0 ? 128.0 / 255.0 : 0.0;
     // A partly masked channel: the target ANDed with what FBMSK keeps, then
     // ORed with the rest of the source's bits (the pipelines' logic ops).
     if (Has(kLogic)) {

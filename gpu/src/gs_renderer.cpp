@@ -299,6 +299,15 @@ constexpr std::uint32_t kMaxScale = 8;      // 4 the resolution's, twice that su
    it does not store. (Read as a 16-bit pixel's bits, Burnout 3's FBMSK
    0x3FFF wrote alpha's top two bits alone, not its byte: its depth into the
    picture's alpha - the haze, the sun's halo - came out wrong.) */
+/* KeptBits' 16-bit targets drawn whole; PS2GPU_SIXTEEN_WHOLE=0: merged as before. */
+bool SixteenWhole() {
+    static const bool on = [] {
+        const char* v = std::getenv("PS2GPU_SIXTEEN_WHOLE");
+        return !(v && *v == '0');
+    }();
+    return on;
+}
+
 /* A target sampled through the CLUT (GsDrawState::tex_format): PSMT8H 4,
    PSMT4HL 5, PSMT4HH 6 (CSA in bits 24-28). */
 bool ThroughClut(std::uint32_t tex_format) {
@@ -307,7 +316,14 @@ bool ThroughClut(std::uint32_t tex_format) {
 }
 
 std::uint32_t KeptBits(std::uint32_t fbmsk, std::uint32_t psm) {
-    if (psm == 0x02 || psm == 0x0A || psm == 0x32 || psm == 0x3A) return fbmsk | ~0x80F8F8F8u;
+    // A 16-bit target that FBMSK masks none of the stored bits of: nothing
+    // kept - gs.frag (kSixteen) writes the bits not stored as 0, as they are
+    // (alpha's low seven too): drawn whole, not merged with the target (the
+    // AND and OR passes - or, without logic ops, a copy of the target and the
+    // merge in the shader: Burnout 3's picture copied into its display buffer
+    // every picture, at 2x a 1280 x 896 copy and a shader reading it).
+    if (psm == 0x02 || psm == 0x0A || psm == 0x32 || psm == 0x3A)
+        return (fbmsk & 0x80F8F8F8u) == 0 && SixteenWhole() ? 0u : fbmsk | ~0x80F8F8F8u;
     if (psm == 0x01 || psm == 0x31) return fbmsk | 0xFF000000u;
     return fbmsk;
 }
@@ -476,6 +492,7 @@ public:
         return targets_.count(Key{fbp, fbw, psm}) != 0;
     }
     void DrawTriangles(const GsDrawState& state, const GsVertex* vertices, std::size_t count) override;
+    void DrawTrianglesAs(const GsDrawState& state, const GsVertex* vertices, std::size_t count);
     void Flush() override;
     void Kick() override {
         Flush();
@@ -3489,7 +3506,52 @@ void VulkanGsRenderer::UploadDepth(std::uint32_t zbp, std::uint32_t width, std::
     });
 }
 
+/* A blend that gives the source exactly: (Cs - Cd) * C >> 7 + Cd, or
+   Cs * C >> 7, with C 0x80 - FIX 0x80, or the source alpha where it is 0x80
+   for every pixel (the vertices' 0x80 and, textured, a texel alpha of TEXA's
+   0x80 for a 24-bit texture read with AEM off). Burnout 3 copies its picture
+   into its 16-bit display buffer that way, as twenty strips "blended over
+   the last" with As 0x80 - a blend in the shader (kBlend16: the result cut to
+   five bits) with a copy of the display buffer first, every picture, 1280 x
+   896 pixels of each at 2x; drawn without the blend it is the same. */
+static bool BlendGivesSource(const GsDrawState& s, const GsVertex* v, std::size_t count, bool as_decoded) {
+    if (!s.blend) return false;
+    const bool form = (s.a == BlendColour::Source && s.b == BlendColour::Dest && s.d == BlendColour::Dest) ||
+                      (s.a == BlendColour::Source && s.b == BlendColour::Zero && s.d == BlendColour::Zero);
+    if (!form) return false;
+    if (s.c == BlendAlpha::Fix) return s.fix == 0x80;
+    if (s.c != BlendAlpha::Source) return false;
+    for (std::size_t i = 0; i < count; ++i)
+        if (v[i].a != 0x80) return false;
+    if (!s.textured || !s.tcc) return true;                         // As: the vertices'
+    if (s.tfx == TextureFunction::Highlight) return false;          // As: At + Av
+    // At 0x80 everywhere: a 24-bit texture (or target read as one) with
+    // TEXA's TA0 0x80, AEM off - as decoded from memory too, when neither
+    // cooked (block-compressed: its alpha near, not exact) nor replaced (the
+    // caller's `as_decoded`).
+    return (s.texture_target || as_decoded) && (s.tex_format & 0xFFu) == 1u && s.ta0 == 0x80 && !s.aem;
+}
+
 void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v, std::size_t count) {
+    static const bool simplify = [] {
+        const char* e = std::getenv("PS2GPU_BLEND_SOURCE");
+        return !(e && *e == '0');
+    }();
+    bool as_decoded = false;
+    if (state.textured && !state.texture_target && state.blend) {
+        auto found = textures_.find(state.texture);
+        as_decoded = found != textures_.end() && !found->second.cooked && !found->second.replacement &&
+                     !found->second.replaced;
+    }
+    if (simplify && BlendGivesSource(state, v, count, as_decoded)) {
+        GsDrawState plain = state;
+        plain.blend = false;
+        return DrawTrianglesAs(plain, v, count);
+    }
+    DrawTrianglesAs(state, v, count);
+}
+
+void VulkanGsRenderer::DrawTrianglesAs(const GsDrawState& state, const GsVertex* v, std::size_t count) {
     if (!SameBatch(state, state_)) Flush();
     // A primitive sampling the target it draws into, where the batch has
     // drawn already: the batch so far first (the next takes a new copy).
