@@ -187,7 +187,13 @@ GPU's: a bilinear texel whose four texels lie side by side in the image is
 one filtered read at the GS's weights rather than four reads (or a gather)
 and three mixes in the shader - at 2x a tablet shades four times the pixels.
 Only the rounding differs (a level here and there); `PS2GPU_HW_FILTER=0`
-for the shader's own mix, `2` rounded to the nearest.
+for the shader's own mix, `2` rounded to the nearest. The conversions make
+each GS pixel's addresses once and its 2x2 pixels in a loop. And Burnout 3's
+copy of its picture into its 16-bit display buffer is a plain draw: a blend
+whose factor is 0x80 everywhere gives the source exactly
+(`PS2GPU_BLEND_SOURCE=0` to blend), and a 16-bit target FBMSK masks nothing
+of is drawn whole rather than merged (`PS2GPU_SIXTEEN_WHOLE=0`) - before,
+each picture took a copy of the display buffer and blended in the shader.
 
 **The trial** (`[trial]` lines, every five seconds): the texture filter is
 on in one interval and off in the next, all run long, and the log sums the
