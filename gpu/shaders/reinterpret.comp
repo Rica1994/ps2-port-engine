@@ -31,7 +31,13 @@ layout(push_constant) uniform Params {
     uint cols, rows;    // its pixels made: [0, cols) x [0, rows)
     uint src_bp, src_bw, src_psm;
     uint src_width, src_height;
+    uint scale;         // both images' pixels to a GS pixel, each way (drawn larger alike)
 } p;
+
+// Where in its GS pixel the pixel made lies (main): a source drawn larger
+// gives the pixel at the same place in its GS pixel - as memory would carry
+// the GS pixel's bytes, each of its pixels the same way.
+ivec2 sub = ivec2(0);
 
 #include "gs_address.glsl"
 
@@ -70,7 +76,7 @@ bool SourcePixel(uint a, out ivec2 at) {
         y = py * 32u + (i / 8u) * 8u + j / 8u;
     }
     if (x >= p.src_width || y >= p.src_height) return false;
-    at = ivec2(x, y);
+    at = ivec2(x, y) * int(max(p.scale, 1u)) + sub;
     return true;
 }
 
@@ -99,8 +105,11 @@ bool Half(uint a, out uint h) {
 }
 
 void main() {
-    const uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
-    if (x >= p.cols || y >= p.rows) return;
+    const uint k = max(p.scale, 1u);
+    const uvec2 pixel = gl_GlobalInvocationID.xy;
+    if (pixel.x >= p.cols * k || pixel.y >= p.rows * k) return;
+    sub = ivec2(pixel % k);
+    const uint x = pixel.x / k, y = pixel.y / k;
     const uint a = Address(x, y);
     uint v;
     if (Is16()) {
@@ -112,5 +121,5 @@ void main() {
         if (!Half(a, lo) || !Half(a + 2u, hi)) return;
         v = lo | (hi << 16);
     }
-    imageStore(made, ivec2(x, y), unpackUnorm4x8(v));
+    imageStore(made, ivec2(pixel), unpackUnorm4x8(v));
 }

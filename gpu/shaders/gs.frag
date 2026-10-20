@@ -50,7 +50,8 @@ layout(push_constant) uniform Params {
     uint fge;           // fog
     uint fogcol;        // FOGCOL, R G B in bytes 0-2
     uint pabe;          // which pixels this pass draws: 0 all, 1 As >= 0x80, 2 As < 0x80
-    uint bilinear;      // bit 0: the four texels around, else the nearest; bits 1 and on: Mip
+    uint bilinear;      // bit 0: the four texels around, else the nearest; bits 1 and on: Mip; 12: not
+                        // the GPU's filter (kHardwareFilter's trial)
     uint wms, wmt;      // CLAMP: 0 REPEAT, 1 CLAMP, 2 REGION_CLAMP, 3 REGION_REPEAT
     uint minu, maxu, minv, maxv;
     uint tw, th;        // TEX0's size (0: the image's own)
@@ -78,6 +79,15 @@ bool Has(uint feature) { return (kFeatures & feature) != 0u; }
 // 2 the nearest texel without the GS's addressing - a measurement of what
 // this shader's work costs; 0 (always but then) the shader as it is.
 layout(constant_id = 1) const uint kProbe = 0u;
+// The texture filter's own mix (gs_renderer.cpp's hardware_filter_; a tablet's
+// by default): a bilinear sample whose four texels lie side by side in the
+// image is one filtered read at the point the GS mixes them at - the same
+// four texels, the same weights in sixteenths - rather than four reads (or a
+// gather) and three mixes here. Only the rounding differs: the GS truncates
+// after each mix, the filter rounds once (a level here and there). For RGBA
+// texels as they are (a texture from memory, a 32-bit target): not for those
+// expanded first (TEXA, the CLUT).
+layout(constant_id = 2) const uint kHardwareFilter = 0u;
 const float kEdge = 1.0 / 16384.0;       // Sample's nudge past a texel's edge
 
 float Ta0() { return float(p.texa & 255u); }
@@ -219,6 +229,20 @@ vec4 Sample(vec2 uv, int n, bool linear) {
     const ivec2 i0 = xy >> 4;
     const vec4 f = vec4(xy & 15, 0, 0);
     const ivec4 at = Neighbours(i0, n);
+    // (bilinear's bit 12: the filter's trial off - the GS's mix, as without.)
+    if (kHardwareFilter != 0u && (p.tex_format & 0xFFu) == 0u && (p.bilinear & 0x1000u) == 0u &&
+        at.y == at.x + 1 && at.w == at.z + 1) {
+        // The point that gives the GS's weights: f sixteenths past (x0, y0)'s
+        // centre. 1: rounded as near the GS's three truncated mixes as one
+        // value can be - a whole value kept (a texel's own, or texels alike),
+        // else 0.35 down (of random texels and weights, 78% the GS's value,
+        // the rest one off either way, no bias); 2: rounded to the nearest.
+        const vec2 point = (vec2(at.xz) + 0.5 + f.xy / 16.0) / vec2(ImageSize());
+        const vec4 t = textureLod(texture_image, point, 0.0) * 255.0;
+        if (kHardwareFilter == 2u) return Cooked(floor(t + 0.5));
+        const vec4 whole = floor(t + 1.0 / 64.0);
+        return Cooked(mix(floor(t - 0.35), whole, lessThan(t - whole, vec4(1.0 / 64.0))));
+    }
     vec4 c00, c10, c01, c11;
     if (Words() && at.y == at.x + 1 && at.w == at.z + 1) {
         // Side by side in the image (almost always - not where a wrap or a

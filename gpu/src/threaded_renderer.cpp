@@ -235,8 +235,9 @@ public:
         auto colour = [](std::uint32_t f) { return f == 0x00 || f == 0x02 || f == 0x0A || f == 0x30 || f == 0x32 || f == 0x3A; };
         const auto made = targets_.find(TargetKey(fbp, fbw, psm)), from = targets_.find(TargetKey(src_fbp, src_fbw, src_psm));
         const std::uint32_t done = converts_ && colour(psm) && colour(src_psm) && made != targets_.end() &&
-                                   from != targets_.end() && made != from && ScaleOf(made->second.w) == 1 &&
-                                   ScaleOf(from->second.w) == 1 ? 1 : 0;
+                                   from != targets_.end() && made != from &&
+                                   ScaleOf(made->second.w) == ScaleOf(from->second.w) &&
+                                   (ScaleOf(made->second.w) == 1 || ConvertScaled()) ? 1 : 0;
         const std::uint32_t a[8] = {fbp, fbw, psm, rows, src_fbp, src_fbw, src_psm, done};
         Op(kConvertImage, sizeof a);
         Put(a, sizeof a);
@@ -248,21 +249,23 @@ public:
                           std::uint32_t zpsm) override {
         const auto made = targets_.find(TargetKey(fbp, fbw, psm));
         const std::uint32_t done = converts_depth_ && (zpsm == 0x30 || zpsm == 0x31) && made != targets_.end() &&
-                                   depths_.count(DepthKey(zbp, width, height)) && ScaleOf(made->second.w) == 1 &&
-                                   ScaleOf(width) == 1 ? 1 : 0;
+                                   depths_.count(DepthKey(zbp, width, height)) &&
+                                   ScaleOf(made->second.w) == ScaleOf(width) &&
+                                   (ScaleOf(width) == 1 || ConvertScaled()) ? 1 : 0;
         const std::uint32_t a[10] = {fbp, fbw, psm, rows, zbp, width, height, zfbw, zpsm, done};
         Op(kConvertFromDepth, sizeof a);
         Put(a, sizeof a);
         End();
         return done != 0;
     }
-    // Predicted as ConvertFromDepth: the target and the depth buffer made, at the PS2's resolution.
+    // Predicted as ConvertFromDepth: the target and the depth buffer made, drawn alike (one scale).
     bool DepthIntoView(const DepthIntoViewParams& params) override {
         const auto made = targets_.find(TargetKey(params.bp / 32, params.bw, 0x00));
         const std::uint32_t done = depth_into_view_ && (params.zpsm == 0x30 || params.zpsm == 0x31) &&
                                    params.cols && params.rows && made != targets_.end() &&
                                    depths_.count(DepthKey(params.zbp / 32, params.zwidth, params.zheight)) &&
-                                   ScaleOf(made->second.w) == 1 && ScaleOf(params.zwidth) == 1 ? 1 : 0;
+                                   ScaleOf(made->second.w) == ScaleOf(params.zwidth) &&
+                                   (ScaleOf(params.zwidth) == 1 || ConvertScaled()) ? 1 : 0;
         Op(kDepthIntoView, sizeof params + 4);
         Put(&params, sizeof params);
         Put(&done, 4);
@@ -361,6 +364,14 @@ private:
     // A target's or depth buffer's scale (VulkanGsRenderer::ScaleOf): its
     // width at the PS2's resolution, or the renderer's.
     std::uint32_t ScaleOf(std::uint32_t width) const { return width <= 320 || width >= 1024 ? 1u : scale_; }
+    // As VulkanGsRenderer's: conversions on the GPU when drawn larger too.
+    static bool ConvertScaled() {
+        static const bool on = [] {
+            const char* v = std::getenv("PS2GPU_CONVERT_SCALED");
+            return !(v && *v == '0');
+        }();
+        return on;
+    }
     // The images the queue has made by its end, as VulkanGsRenderer makes
     // them: a target by (FBP, FBW, PSM) at the size first asked for, a depth
     // buffer by (ZBP, width, height); all dropped by a new scale.

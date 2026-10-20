@@ -295,6 +295,7 @@ struct Bridge {
     u64 next_texture = 1;
     u64 evictions = 0;              // textures put out of the cache for room
     u64 serial = 0;                 // counts GPU draws, so a texture knows if one went over it
+    u64 pictures = 0, serial_at_kick = 0;   // frames that drew (TrialReport)
     // Bumped when an image starts holding drawing memory lacks, or reaches
     // further: until then, an image Use has checked against the others needs
     // no second look (tens of thousands of draws a frame go to one target).
@@ -1854,7 +1855,7 @@ bool DepthIntoView(Bridge& s, const gs::Gs::DrawCall& call, const ps2gpu::GsVert
     const u32 psm = Bits(c.frame, 24, 6), tpsm = Bits(c.tex0, 20, 6);
     if (!on || (psm != gs::PSMCT16 && psm != gs::PSMCT16S) || (tpsm != gs::PSMZ16 && tpsm != gs::PSMZ16S)) return false;
     if ((call.prim & 7) != 6 || n != 6 || !((call.prim >> 4) & 1) || ((call.prim >> 5) & 1) || s.Dumping()) return false;
-    if (!s.renderer->DrawsDepthIntoView() || s.renderer->Scale() != 1 || (c.fba & 1)) return false;
+    if (!s.renderer->DrawsDepthIntoView() || (c.fba & 1)) return false;
     // Decal, the texel's alpha; nearest, no mipmaps (MMAG, MMIN 0, MXL 0).
     if (Bits(c.tex0, 35, 2) != 1 || !Bits(c.tex0, 34, 1) || Bits(c.tex1, 5, 4) != 0 || Bits(c.tex1, 2, 3) != 0)
         return false;
@@ -2827,6 +2828,36 @@ u64 GpuFrameDone() { return g_gpu_frame_done.load(std::memory_order_acquire); }
 u64 GpuBusyNs() { return g_bridge ? ps2gpu::GpuBusyNanoseconds() : 0; }
 bool GpuProfilingNow() { return g_bridge && ps2gpu::GpuProfiling() && platform::kMobile; }
 
+/* The renderer's trial (ps2gpu::TrialName), every report: the interval just
+   ended counted for the way it had - its GPU time a picture, where it drew
+   enough to measure (a race's pictures, not a menu's: 5 ms a picture or
+   more) and was not profiled (timestamps add to it) - and the other way
+   for the next. The sums so far each way, and the first's change. */
+void TrialReport(Bridge& s, u64 gpu_ns, bool profiled) {
+    const char* name = ps2gpu::TrialName();
+    if (!*name) return;
+    static u64 last_ns = 0, last_pictures = 0;
+    static double sum_ms[2] = {}, count[2] = {};
+    const u64 pictures = s.pictures - last_pictures;
+    const double ms = pictures ? double(gpu_ns - last_ns) / 1e6 / double(pictures) : 0.0;
+    const bool on = ps2gpu::TrialOn();
+    const bool counted = !profiled && pictures >= 20 && ms >= 5.0;
+    if (counted) {
+        sum_ms[on] += ms;
+        count[on] += 1;
+    }
+    char change[64] = "";
+    if (count[0] && count[1])
+        std::snprintf(change, sizeof change, "; on %+.1f%%", 100.0 * (sum_ms[1] / count[1]) / (sum_ms[0] / count[0]) - 100.0);
+    std::fprintf(stderr, "[trial] %s %s this interval: %.2f ms a picture (%llu pictures)%s; so far on %.2f ms (%.0f intervals), off %.2f ms (%.0f)%s\n",
+                 name, on ? "on" : "off", ms, static_cast<unsigned long long>(pictures),
+                 counted ? "" : ", not counted", count[1] ? sum_ms[1] / count[1] : 0.0, count[1],
+                 count[0] ? sum_ms[0] / count[0] : 0.0, count[0], change);
+    last_ns = gpu_ns;
+    last_pictures = s.pictures;
+    ps2gpu::SetTrialOn(!on);
+}
+
 void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
     if (!g_bridge) return;
     Bridge& s = *g_bridge;
@@ -2841,6 +2872,9 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
             // the frames' before it (asked, not waited for) - GpuFrameDone.
             if (s.renderer->GpuCaughtUp() && frame > 0) g_gpu_frame_done.store(frame - 1, std::memory_order_release);
             s.renderer->Kick();
+            // A picture (a frame that drew): the trial's count.
+            if (s.serial != s.serial_at_kick) ++s.pictures;
+            s.serial_at_kick = s.serial;
         }
         // The pipeline cache to disk now and then (a tablet's app can be
         // ended without warning): nothing written while nothing is new.
@@ -2962,7 +2996,9 @@ void GpuShadowFrame(u64 frame, const std::string& dump_dir) {
                 // (each timestamp a Metal pass's end).
                 static const bool sampled = platform::kMobile && !std::getenv("PS2HOST_GPU_PROFILE");
                 static unsigned reports = 0;
+                const bool was_profiled = ps2gpu::GpuProfiling() && sampled;
                 if (sampled) ps2gpu::SetGpuProfiling(++reports % 12 == 11);
+                TrialReport(s, gpu_ns, sampled ? was_profiled : std::getenv("PS2HOST_GPU_PROFILE") != nullptr);
             }
         } else if (frame % 300 == 0 && std::getenv("PS2HOST_GPU_PROFILE"))
             std::fprintf(stderr, "[gpu] frame %llu: %s\n", static_cast<unsigned long long>(frame),

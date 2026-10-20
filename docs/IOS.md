@@ -177,6 +177,27 @@ arm64 - a fifth of the EE thread on the A12 - and rounds toward zero by
 correcting the nearest result instead (`runtime/include/ps2rt/vu_rtz.h`,
 the same bits: VuMacroWithoutModeIsTheMode).
 
+Since 20 Oct, for 2x (PC SETTINGS > resolution): the conversions between an
+image and its twin over the same memory, a depth buffer's Z16 view and the
+depth haze run on the GPU at any internal resolution (they went through
+memory when drawn larger: at 2x the race's frame twice a picture, four
+times the pixels each way, its finer detail lost where the haze went;
+`PS2GPU_CONVERT_SCALED=0` for that way). And the texture filter is the
+GPU's: a bilinear texel whose four texels lie side by side in the image is
+one filtered read at the GS's weights rather than four reads (or a gather)
+and three mixes in the shader - at 2x a tablet shades four times the pixels.
+Only the rounding differs (a level here and there); `PS2GPU_HW_FILTER=0`
+for the shader's own mix, `2` rounded to the nearest.
+
+**The trial** (`[trial]` lines, every five seconds): the texture filter is
+on in one interval and off in the next, all run long, and the log sums the
+GPU's time a picture each way over the intervals that drew a race (5 ms a
+picture or more, not the profiled ones) - `so far on X ms (n intervals),
+off Y ms (m); on -Z%` is the GPU filter's gain measured on the iPad itself,
+from an ordinary race. `PS2GPU_TRIAL=0` in the scheme stops it (the filter
+then stays on). Since the frame skip follows the GPU's cost, it may change
+its step between intervals while the trial runs.
+
 `PS2GPU_PROBE=1` (or `2`) in the scheme measures the GS shader rather than
 playing: `1` draws every pixel in its vertices' colour alone, `2` reads
 textures at the nearest texel without the GS's addressing and filter. The

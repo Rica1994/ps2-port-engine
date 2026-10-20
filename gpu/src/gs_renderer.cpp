@@ -197,6 +197,9 @@ std::uint64_t g_barriers = 0, g_transitions = 0, g_dispatches = 0, g_draws = 0, 
    is a Metal pipeline compiled on the thread that asks, tens of
    milliseconds; a race's new blend and test combinations come in bursts. */
 std::uint64_t g_pipelines = 0, g_pipeline_ns = 0;
+/* The trial (TrialName): which way, and whether it is on now. */
+std::atomic<const char*> g_trial_name{""};
+std::atomic<bool> g_trial_on{true};
 
 /* Why the open rendering pass ended (RendererCounters): on a tile-based GPU
    (an iPad's) each end stores the target and its depth buffer to memory and
@@ -862,6 +865,25 @@ private:
        any GPU: the pictures differ from the copy path's (renderer_tests,
        the scripted runs). */
     bool emulate_tbdr_ = false;
+    /* gs.frag's kHardwareFilter: bilinear texels mixed by the GPU's filter
+       (1 truncated as the GS truncates, 2 rounded; 0 the shader's own mix,
+       exact). With MoltenVK by default: at 2x a tablet's GPU shades four
+       times the pixels, and each textured one read four texels (a gather,
+       or four reads of a compressed texture) and mixed them itself.
+       PS2GPU_HW_FILTER=0/1/2. Its sampler then filters (TextureSampler):
+       texelFetch ignores that, so every other read is as before. */
+    std::uint32_t hardware_filter_ = 0;
+    /* Images converted on the GPU (ConvertImage, ConvertFromDepth,
+       DepthIntoView) when drawn larger too, each pixel from its place in its
+       GS pixel; PS2GPU_CONVERT_SCALED=0: those through memory, as before. */
+    static bool ConvertScaled() {
+        static const bool on = [] {
+            const char* v = std::getenv("PS2GPU_CONVERT_SCALED");
+            return !(v && *v == '0');
+        }();
+        return on;
+    }
+    int TextureSampler() const { return hardware_filter_ ? 7 : 3; }
     bool InPlaceReads() const { return g_.local_read || emulate_tbdr_; }
     std::map<std::pair<std::uint32_t, std::uint32_t>, Image> snapshots_;   // (emulation) by size
     bool pass_drawn_any_ = false;
@@ -1503,6 +1525,17 @@ bool VulkanGsRenderer::Init(std::string* error) {
         emulate_tbdr_ = emulate[0] && emulate[0] != '0' && !g_.local_read;
     if (emulate_tbdr_) std::fprintf(stderr, "[gpu] local read emulated as a tile-based GPU reads (a copy at each pass)\n");
     if (const char* defer = std::getenv("PS2GPU_DEFER_PASSES")) defer_passes_ = defer[0] != '0';
+    hardware_filter_ = g_.portability ? 1u : 0u;
+    if (const char* filter = std::getenv("PS2GPU_HW_FILTER")) hardware_filter_ = std::uint32_t(std::atoi(filter)) % 3u;
+    // The texture filter on trial (the GS's mix in the intervals it is off)
+    // with MoltenVK, or PS2GPU_TRIAL=filter; PS2GPU_TRIAL=0 none.
+    {
+        const char* trial = std::getenv("PS2GPU_TRIAL");
+        const bool filter_trial = trial ? std::strcmp(trial, "filter") == 0 : g_.portability;
+        if (filter_trial && hardware_filter_) g_trial_name = "texture filter";
+    }
+    std::fprintf(stderr, "[gpu] texture filtering: %s\n",
+                 hardware_filter_ ? "the GPU's (bilinear texels side by side)" : "the GS's, in the shader");
     // Reordered passes (ParkedPass): with MoltenVK by default; they need the
     // passes deferred, and not local read.
     reorder_ = g_.portability;
@@ -1692,7 +1725,7 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         ri.pCode = spirv_reinterpret_comp;
         vkCreateShaderModule(g_.device, &ri, nullptr, &reinterpret_);
         const VkDescriptorSetLayout both[2] = {image_set_layout_, image_set_layout_};
-        const VkPushConstantRange reinterpret_push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 10 * sizeof(std::uint32_t)};
+        const VkPushConstantRange reinterpret_push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 11 * sizeof(std::uint32_t)};   // ReinterpretParams
         VkPipelineLayoutCreateInfo rl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         rl.setLayoutCount = 2;
         rl.pSetLayouts = both;
@@ -1733,7 +1766,7 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         ri.pCode = spirv_reinterpret_depth_comp;
         vkCreateShaderModule(g_.device, &ri, nullptr, &reinterpret_depth_);
         const VkDescriptorSetLayout sets[3] = {depth_set_layout_, image_set_layout_, swizzle_set_layout_};
-        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 10 * sizeof(std::uint32_t)};
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 11 * sizeof(std::uint32_t)};   // ReinterpretParams
         VkPipelineLayoutCreateInfo rl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         rl.setLayoutCount = 3;
         rl.pSetLayouts = sets;
@@ -1755,7 +1788,8 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
         hi.codeSize = sizeof spirv_haze_comp;
         hi.pCode = spirv_haze_comp;
         vkCreateShaderModule(g_.device, &hi, nullptr, &haze_);
-        const VkPushConstantRange haze_push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DepthIntoViewParams)};
+        const VkPushConstantRange haze_push{VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                            std::uint32_t(sizeof(DepthIntoViewParams) + 4)};     // (+ the scale)
         rl.pPushConstantRanges = &haze_push;
         vkCreatePipelineLayout(g_.device, &rl, nullptr, &haze_layout_);
         rp.stage.module = haze_;
@@ -2193,6 +2227,7 @@ bool VulkanGsRenderer::TargetToMemory(std::uint32_t fbp, std::uint32_t fbw, std:
 /* reinterpret.comp's push constants. */
 struct ReinterpretParams {
     std::uint32_t bp, bw, psm, cols, rows, src_bp, src_bw, src_psm, src_width, src_height;
+    std::uint32_t scale;        // both images' (reinterpret.comp: each pixel from the same place in its GS pixel)
 };
 
 bool VulkanGsRenderer::ConvertImage(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::uint32_t rows,
@@ -2205,7 +2240,12 @@ bool VulkanGsRenderer::ConvertImage(std::uint32_t fbp, std::uint32_t fbw, std::u
     if (made == targets_.end() || from == targets_.end() || made == from) return false;
     Image& d = made->second;
     Image& t = from->second;
-    if (d.scale != 1 || t.scale != 1) return false;     // (a square a GS pixel: through memory, as before)
+    // Drawn larger alike: each pixel from its place in the source's GS pixel
+    // (memory would keep only one of them: the picture's finer detail gone
+    // wherever it went through a view - at 2x, the race's frame twice a
+    // picture, and its write-backs and reloads four times the pixels).
+    // PS2GPU_CONVERT_SCALED=0: through memory, as before, when drawn larger.
+    if (d.scale != t.scale || (d.scale != 1 && !ConvertScaled())) return false;
     Flush();
     Work(kWorkConvert, {&t, &d}, {&d});
     WorkLabel("convert: C %X/%u/%02X from C %X/%u/%02X", unsigned(fbp), unsigned(fbw), unsigned(psm),
@@ -2220,12 +2260,12 @@ bool VulkanGsRenderer::ConvertImage(std::uint32_t fbp, std::uint32_t fbw, std::u
         const VkDescriptorSet sets[2] = {StorageSet(t), StorageSet(d)};
         const std::uint32_t made_rows = std::min(rows, d.height);
         const ReinterpretParams params{fbp * 32, fbw, psm, d.width, made_rows, src_fbp * 32, src_fbw, src_psm,
-                                       t.width, t.height};
+                                       t.width, t.height, d.scale};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, reinterpret_pipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, reinterpret_layout_, 0, 2, sets, 0, nullptr);
         vkCmdPushConstants(cmd, reinterpret_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
         ++g_dispatches;
-        vkCmdDispatch(cmd, (d.width + 7) / 8, (made_rows + 7) / 8, 1);
+        vkCmdDispatch(cmd, (d.width * d.scale + 7) / 8, (made_rows * d.scale + 7) / 8, 1);
         g_.Mark(cmd, kProfSwizzle);
         MemoryBarrier(cmd);
     });
@@ -2241,7 +2281,7 @@ bool VulkanGsRenderer::ConvertFromDepth(std::uint32_t fbp, std::uint32_t fbw, st
     if (made == targets_.end() || from == depths_.end()) return false;
     Image& d = made->second;
     Image& z = from->second;
-    if (d.scale != 1 || z.scale != 1) return false;
+    if (d.scale != z.scale || (d.scale != 1 && !ConvertScaled())) return false;
     Flush();
     Work(kWorkConvert, {&z, &d}, {&d});
     WorkLabel("convert: C %X/%u/%02X from Z %X/%u/%02X", unsigned(fbp), unsigned(fbw), unsigned(psm), unsigned(zbp),
@@ -2257,13 +2297,13 @@ bool VulkanGsRenderer::ConvertFromDepth(std::uint32_t fbp, std::uint32_t fbw, st
         const VkDescriptorSet sets[3] = {DepthSampledSet(z), StorageSet(d), swizzle_set_};
         const std::uint32_t made_rows = std::min(rows, d.height);
         const ReinterpretParams params{fbp * 32, fbw, psm, d.width, made_rows, zbp * 32, zfbw, zpsm,
-                                       z.width, z.height};
+                                       z.width, z.height, d.scale};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, reinterpret_depth_pipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, reinterpret_depth_layout_, 0, 3, sets, 0,
                                 nullptr);
         vkCmdPushConstants(cmd, reinterpret_depth_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
         ++g_dispatches;
-        vkCmdDispatch(cmd, (d.width + 7) / 8, (made_rows + 7) / 8, 1);
+        vkCmdDispatch(cmd, (d.width * d.scale + 7) / 8, (made_rows * d.scale + 7) / 8, 1);
         g_.Mark(cmd, kProfSwizzle);
         MemoryBarrier(cmd);
     });
@@ -2277,8 +2317,12 @@ bool VulkanGsRenderer::DepthIntoView(const DepthIntoViewParams& params) {
     if (made == targets_.end() || from == depths_.end()) return false;
     Image& d = made->second;
     Image& z = from->second;
-    if (d.scale != 1 || z.scale != 1) return false;
-    DepthIntoViewParams within = params;       // (inside the image: the rest is no pixel of it)
+    if (d.scale != z.scale || (d.scale != 1 && !ConvertScaled())) return false;
+    struct {
+        DepthIntoViewParams p;
+        std::uint32_t scale;                    // haze.comp's: both drawn larger alike
+    } push{params, d.scale};
+    DepthIntoViewParams& within = push.p;       // (inside the image: the rest is no pixel of it)
     within.cols = params.x0 < d.width ? std::min(params.cols, d.width - params.x0) : 0;
     within.rows = params.y0 < d.height ? std::min(params.rows, d.height - params.y0) : 0;
     Flush();
@@ -2296,9 +2340,10 @@ bool VulkanGsRenderer::DepthIntoView(const DepthIntoViewParams& params) {
         const VkDescriptorSet sets[3] = {DepthSampledSet(z), StorageSet(d), swizzle_set_};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, haze_pipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, haze_layout_, 0, 3, sets, 0, nullptr);
-        vkCmdPushConstants(cmd, haze_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof within, &within);
+        vkCmdPushConstants(cmd, haze_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
         ++g_dispatches;
-        if (within.cols && within.rows) vkCmdDispatch(cmd, (within.cols + 7) / 8, (within.rows + 7) / 8, 1);
+        if (within.cols && within.rows)
+            vkCmdDispatch(cmd, (within.cols * d.scale + 7) / 8, (within.rows * d.scale + 7) / 8, 1);
         g_.Mark(cmd, kProfSwizzle);
         MemoryBarrier(cmd);
     });
@@ -2650,9 +2695,9 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
         if (n) std::fprintf(stderr, "[gpu] PS2GPU_PROBE=%u: the shader cut down to measure it (the picture is wrong)\n", n);
         return n;
     }();
-    const std::uint32_t values[2] = {~(key >> kFeatureShift), probe};     // all features for a key without
-    const VkSpecializationMapEntry feature_entries[2] = {{0, 0, 4}, {1, 4, 4}};
-    VkSpecializationInfo specialisation{2, feature_entries, sizeof values, values};
+    const std::uint32_t values[3] = {~(key >> kFeatureShift), probe, hardware_filter_};     // all features for a key without
+    const VkSpecializationMapEntry feature_entries[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+    VkSpecializationInfo specialisation{3, feature_entries, sizeof values, values};
     stages[1].pSpecializationInfo = &specialisation;
     VkVertexInputBindingDescription binding{0, sizeof(PackedVertex), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription attributes[6] = {
@@ -2791,7 +2836,7 @@ VkDescriptorSet VulkanGsRenderer::SampledSet(Image& image) {
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &set_layout_;
     if (vkAllocateDescriptorSets(g_.device, &ai, &image.sampled) != VK_SUCCESS) return VK_NULL_HANDLE;
-    WriteTextureSet(image.sampled, samplers_[3], image);
+    WriteTextureSet(image.sampled, samplers_[TextureSampler()], image);
     return image.sampled;
 }
 
@@ -3781,8 +3826,10 @@ void VulkanGsRenderer::Flush() {
             }
         }
     }
-    // The shader addresses and filters texels itself (texelFetch), as the GS does.
-    const int sampler = 3;
+    // The shader addresses and filters texels itself (texelFetch), as the GS
+    // does - or, with hardware_filter_, has the sampler filter four it found
+    // side by side.
+    const int sampler = TextureSampler();
     VkDescriptorSet set = SetFor(*texture, sampler);
     // Render to texture: the target itself, or a copy when it is also drawn into.
     Image* source = nullptr;
@@ -3883,6 +3930,8 @@ void VulkanGsRenderer::Flush() {
     params.fix_factor = state_.c == BlendAlpha::Fix;
     params.fix = state_.fix;
     params.bilinear = std::uint32_t(state_.bilinear) | (source ? 0u : state_.mip);   // gs.frag's Mip
+    // The texture filter's trial, in an interval it is off: the GS's mix.
+    if (hardware_filter_ && !g_trial_on.load(std::memory_order_relaxed) && *g_trial_name.load()) params.bilinear |= 0x1000u;
     params.wms = state_.wms;
     params.wmt = state_.wmt;
     params.minu = state_.minu;
@@ -4519,6 +4568,9 @@ std::uint64_t GpuMemoryInUse() {
 }
 
 void SetGpuProfiling(bool on) { g_profiling = on; }
+const char* TrialName() { return g_trial_name.load(); }
+void SetTrialOn(bool on) { g_trial_on = on; }
+bool TrialOn() { return g_trial_on.load(); }
 bool GpuProfiling() { return g_profiling.load(); }
 
 std::vector<std::string> g_pass_names;

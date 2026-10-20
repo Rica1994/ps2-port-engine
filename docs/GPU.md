@@ -195,6 +195,17 @@ proved itself in PCSX2's hardware renderers, made smaller:
      depth buffer into a Z16 one, the sprites drawn, and the frame made back
      (`PS2HOST_DEPTH_INTO_VIEW=0`; checked against that way by
      DepthIntoViewDrawn, and by the scripted race's pictures);
+   * *drawn larger, converted alike* (since 20 Oct): the conversions above -
+     an image from its twin over the same memory, a view from a depth
+     buffer, depth into a 16-bit view - work at any internal resolution
+     when both images are drawn at the same one. Each pixel takes its bytes
+     from the pixel at the same place in the source's GS pixel, as memory
+     carries the GS pixel's bytes. Before, an image drawn larger went
+     through memory: at 2x the race's frame twice a picture and its depth
+     haze, four times the pixels each way, and the frame's finer detail
+     replaced by one pixel of each square wherever the haze went
+     (`PS2GPU_CONVERT_SCALED=0` for that way; Converted and
+     DepthIntoViewDrawn run at 2x too);
    * *FBMSK exactly*: the mask is taken in the target's own format (a 16-bit
      target's five bits a channel are the top of the image's bytes), and a
      channel masked only in part is drawn in two passes with logic ops - AND

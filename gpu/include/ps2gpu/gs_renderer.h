@@ -419,6 +419,14 @@ std::string GpuPassReport();
    a profile pool was made: PS2HOST_GPU_PROFILE, or a tablet's default). */
 void SetGpuProfiling(bool on);
 bool GpuProfiling();
+/* A trial on the device itself (PS2GPU_TRIAL; a tablet's default): one of
+   the renderer's ways, on or off from the next batch on, so that the
+   bridge's report can switch it interval by interval and sum the GPU's time
+   a picture each way - a measurement on the GPU that matters, from an
+   ordinary game. Its name ("" for none: the way stays on). */
+const char* TrialName();
+void SetTrialOn(bool on);
+bool TrialOn();
 
 }  // namespace ps2gpu
 
