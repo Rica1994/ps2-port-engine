@@ -760,6 +760,31 @@ void Converted(ps2gpu::GsRenderer& renderer) {
                           unsigned(src));
             Check(made && !got.empty() && got == want, what);
         }
+    // Across widths: a 64-wide view of a 128-wide image's pages, and back.
+    for (std::uint32_t psm_from : {0x00u, 0x30u})
+        for (std::uint32_t psm_to : {0x00u, 0x30u})
+            for (int way = 0; way < 2; ++way) {
+                fbp += 4;
+                const std::uint32_t from_bw = way ? 1 : 2, to_bw = way ? 2 : 1;
+                std::vector<std::uint8_t> a(blocks * 256), b(blocks * 256);
+                random_bytes(a);
+                random_bytes(b);
+                std::uint32_t w = 0, h = 0;
+                renderer.MemoryWrite(fbp * 32, fbp * 32 + blocks, a.data());
+                renderer.TargetFromMemory(fbp, from_bw, psm_from, from_bw * 64, 128 / from_bw);
+                renderer.MemoryWrite(fbp * 32, fbp * 32 + blocks, b.data());
+                renderer.TargetFromMemory(fbp, to_bw, psm_to, to_bw * 64, 128 / to_bw);
+                const bool made = renderer.ConvertImage(fbp, to_bw, psm_to, 128 / to_bw, fbp, from_bw, psm_from);
+                std::vector<std::uint32_t> got, want;
+                renderer.ReadTarget(fbp, to_bw, psm_to, &got, &w, &h);
+                renderer.TargetToMemory(fbp, from_bw, psm_from, from_bw * 64, 128 / from_bw, 0);
+                renderer.TargetFromMemory(fbp, to_bw, psm_to, to_bw * 64, 128 / to_bw);
+                renderer.ReadTarget(fbp, to_bw, psm_to, &want, &w, &h);
+                char what[112];
+                std::snprintf(what, sizeof what, "an image %02X FBW %u made from one %02X FBW %u as through memory",
+                              unsigned(psm_to), unsigned(to_bw), unsigned(psm_from), unsigned(from_bw));
+                Check(made && !got.empty() && got == want, what);
+            }
     for (std::uint32_t zpsm : {0x31u, 0x30u})
         for (std::uint32_t view : {0x32u, 0x3Au, 0x02u, 0x00u}) {
             fbp += 4;

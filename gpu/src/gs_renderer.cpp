@@ -477,6 +477,7 @@ public:
     void Kick() override {
         Flush();
         g_.Flush();
+        if (Tracing()) std::fprintf(stderr, "[pass] ---- the renderer's frame %llu ends\n", (unsigned long long)frame_);
         ++frame_;
         EvictReplacements();
         SavePipelineCache();
@@ -815,7 +816,11 @@ private:
     /* PS2GPU_PASS_TRACE=N: each pass of the N-th frame (Kick) on stderr -
        what it drew into, how many batches, and what ended it. */
     long long trace_frame_ = -1;
-    bool Tracing() const { return trace_frame_ >= 0 && std::uint64_t(trace_frame_) == frame_; }
+    long long trace_frames_ = 1;    // PS2GPU_PASS_TRACE=N or N+K: K frames from the renderer's N-th
+    bool Tracing() const {
+        return trace_frame_ >= 0 && frame_ >= std::uint64_t(trace_frame_) &&
+               frame_ < std::uint64_t(trace_frame_ + trace_frames_);
+    }
     std::uint32_t pass_batches_ = 0;
     char pass_label_[96] = {};
     /* The work's debug label (Work; WorkLabel: what it is about). */
@@ -1477,7 +1482,10 @@ bool VulkanGsRenderer::Init(std::string* error) {
     Fill(blank_, &white);
     g_.end_pass = [this](VkCommandBuffer cmd, bool submit) { EndPass(cmd, submit ? kBreakSubmit : kBreakWork); };
     g_.before_record = [this] { FlushWrites(); };
-    if (const char* trace = std::getenv("PS2GPU_PASS_TRACE")) trace_frame_ = std::atoll(trace);
+    if (const char* trace = std::getenv("PS2GPU_PASS_TRACE")) {
+        trace_frame_ = std::atoll(trace);
+        if (const char* plus = std::strchr(trace, '+')) trace_frames_ = std::max(1ll, std::atoll(plus + 1));
+    }
     // The ways for a tile-based GPU, by their variables (PS2GPU_TILE, all of
     // them) - the pictures are the same either way.
     tile_hints_ = defer_passes_ = TileWays(g_.portability);

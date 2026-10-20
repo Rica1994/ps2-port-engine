@@ -719,6 +719,9 @@ bool ConvertFromTwin(Bridge& b, Owned& o, bool for_draw) {
     Owned& t = *twin;
     const bool from_depth = t.depth;
     const bool transfer = for_draw && t.gpu_newer;
+    // Taking over the twin's drawing: all of it must lie in `o`'s pages
+    // (what lay past them would be left newer in neither image).
+    if (transfer && (t.dirty_begin < o.begin || t.dirty_end > o.end || (t.dirty_pages & ~used).any())) return false;
     if (from_depth && for_draw) return false;           // (drawn into: through memory, as before)
     if (!for_draw && o.gpu_newer) return false;         // (its own drawing could go back over the twin's)
     // (`o` newer than memory itself is no matter: the twin, up to date, has
