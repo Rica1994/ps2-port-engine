@@ -205,7 +205,12 @@ private:
     void InputHalfBegun(Core& c);
     static u32 CoreOf(u32 entry) { return entry & 1; }
     static u32 VoiceOf(u32 entry) { return ((entry >> 1) & 0x1F) % 24; }
-    void CheckIrq(u32 core_hint, u32 from, u32 to, const std::function<void(u32)>& irq);
+    // Inline: ~19 a sample (each capture write, each PCM read), and IRQA is
+    // armed on neither core nearly all the time.
+    void CheckIrq(u32 core_hint, u32 from, u32 to, const std::function<void(u32)>& irq) {
+        if (cores_[0].irq_enabled || cores_[1].irq_enabled) CheckIrqArmed(core_hint, from, to, irq);
+    }
+    void CheckIrqArmed(u32 core_hint, u32 from, u32 to, const std::function<void(u32)>& irq);
     void Start(Voice& v);
     void Decode(Voice& v);
     void NextBlock(Core& c, u32 index, const std::function<void(u32)>& irq);

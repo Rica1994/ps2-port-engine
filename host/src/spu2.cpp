@@ -463,10 +463,13 @@ void Spu2::Reverb(Core& c, s32 in_left, s32 in_right) {
     rout = Mul(rout, r[kVApf2]) + ReverbRead(c, delayed(kMRApf2, apf2));
     c.reverb_out_left = Clamp16(lout);
     c.reverb_out_right = Clamp16(rout);
-    c.reverb_position = (c.reverb_position + 2) % size;
+    // (x % size without the division: the position stays inside the area
+    // but where ESA/EEA moved under it.)
+    const u32 next = c.reverb_position + 2;
+    c.reverb_position = next < size ? next : next - size < size ? next - size : next % size;
 }
 
-void Spu2::CheckIrq(u32 core_hint, u32 from, u32 to, const std::function<void(u32)>& irq) {
+void Spu2::CheckIrqArmed(u32 core_hint, u32 from, u32 to, const std::function<void(u32)>& irq) {
     // IRQA is shared memory: either core with interrupts on sees it.
     (void)core_hint;
     for (u32 core = 0; core < 2; ++core) {
