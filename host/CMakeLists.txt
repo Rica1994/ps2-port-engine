@@ -372,7 +372,7 @@ function(ps2_ios_app target title version game_dir)
         XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${PS2_IOS_TEAM}"
         XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
         XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "Apple Development"
-        XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "2"            # iPad
+        XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2"          # iPhone and iPad
         XCODE_ATTRIBUTE_IPHONEOS_DEPLOYMENT_TARGET "${CMAKE_OSX_DEPLOYMENT_TARGET}"
         XCODE_ATTRIBUTE_LD_RUNPATH_SEARCH_PATHS "@executable_path/Frameworks"
         # Optimised in every configuration: Xcode runs Debug by default, and

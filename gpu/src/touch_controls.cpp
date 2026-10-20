@@ -30,23 +30,32 @@ constexpr float kHitScale = 1.35f;      // a button takes a finger a little outs
 
 /* Sizes in the screen's shorter side (u), so they are the same under a thumb
    on any screen. */
+std::atomic<float> TouchControls::inset_left_{0.0f};
+std::atomic<float> TouchControls::inset_right_{0.0f};
+
+void TouchControls::SetSafeInsets(float left, float right) {
+    inset_left_.store(std::clamp(left, 0.0f, 0.25f));
+    inset_right_.store(std::clamp(right, 0.0f, 0.25f));
+}
+
 std::vector<TouchControls::Place> TouchControls::Layout(float w, float h) {
     const float u = std::min(w, h);
-    const float cx = w - 0.23f * u, cy = h - 0.25f * u, d = 0.11f * u, r = 0.064f * u;
+    const float l = inset_left_.load() * w, rt = inset_right_.load() * w;     // in from a notch
+    const float cx = w - rt - 0.23f * u, cy = h - 0.25f * u, d = 0.11f * u, r = 0.064f * u;
     return {
-        {kStickBase, 0.21f * u, h - 0.23f * u, 0.13f * u},
+        {kStickBase, l + 0.21f * u, h - 0.23f * u, 0.13f * u},
         {kTriangle, cx, cy - d, r},
         {kCircle, cx + d, cy, r},
         {kCross, cx, cy + d, r},
         {kSquare, cx - d, cy, r},
-        {kR1, w - 0.12f * u, h - 0.55f * u, 0.058f * u},
-        {kL1, 0.12f * u, h - 0.55f * u, 0.058f * u},
+        {kR1, w - rt - 0.12f * u, h - 0.55f * u, 0.058f * u},
+        {kL1, l + 0.12f * u, h - 0.55f * u, 0.058f * u},
         {kStart, 0.5f * w, 0.065f * u, 0.045f * u},
     };
 }
 
 bool TouchControls::InStickZone(float x, float y, float w, float h) {
-    return x < 0.40f * w && y > 0.45f * h;
+    return x > inset_left_.load() * w && x < 0.40f * w && y > 0.45f * h;
 }
 
 int TouchControls::ButtonAt(float x, float y, float w, float h) const {

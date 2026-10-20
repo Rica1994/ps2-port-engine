@@ -1,6 +1,7 @@
-# A port on an iPad
+# A port on an iPad (or an iPhone)
 
-The same port, built for iPadOS: the game's translated code and the engine's
+The same port, built for iPadOS and iOS (one app for both: pick the device as
+Xcode's run destination): the game's translated code and the engine's
 host compiled for arm64, the GS drawn with Vulkan through **MoltenVK** (Vulkan
 on Metal, carried inside the app), SDL3 for the window, the controller and the
 sound. Nothing is emulated and nothing is compiled at run time, so Apple's rule
@@ -14,7 +15,9 @@ What it takes:
   developer account ($99 a year) makes it a year.
 * The iPad in **Developer Mode** (Settings > Privacy & Security > Developer
   Mode; it appears after the iPad was first connected to Xcode), iPadOS 15 or
-  later.
+  later. An iPhone the same way. On an iPhone's wider screen the picture
+  stays 4:3 with bars at the sides; the on-screen controls sit in the bars,
+  clear of the notch.
 * Optionally a **game controller** paired with the iPad (DualShock 4,
   DualSense, Xbox, MFi). Without one the game plays with on-screen controls
   (below).

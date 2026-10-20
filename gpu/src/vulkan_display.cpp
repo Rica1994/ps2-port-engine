@@ -131,6 +131,13 @@ public:
             pixel_w_.store(w);
             pixel_h_.store(h);
         }
+        // The safe area at the sides (a phone's notch in landscape, on the
+        // side it is turned to; none on an iPad): the touch controls keep
+        // out of it. In the window's points, as parts of its width.
+        int ww = 0, wh = 0;
+        SDL_Rect safe{};
+        if (window_ && SDL_GetWindowSize(window_, &ww, &wh) && ww > 0 && SDL_GetWindowSafeArea(window_, &safe))
+            TouchControls::SetSafeInsets(float(safe.x) / float(ww), float(ww - safe.x - safe.w) / float(ww));
     }
     std::atomic<float> aspect_{4.0f / 3.0f};
     std::uint32_t PixelHeight() const override {
@@ -476,7 +483,8 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     if (const char* moltenvk = MoltenVkPath()) SDL_Vulkan_LoadLibrary(moltenvk);
     SDL_WindowFlags window_flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE;
 #if defined(__ANDROID__) || (defined(__APPLE__) && defined(PS2GPU_IOS))
-    // A tablet's one window: the whole screen, landscape, under the notch too.
+    // A phone's or tablet's one window: the whole screen, landscape, under
+    // the notch too (the touch controls keep out of it: NotePixelSize).
     // The screen's points, not its pixels: the game's 640x448 picture gains
     // nothing from a 2160x1620 drawable (an iPad 8's), and every present
     // clears, scales and overlays four times the pixels - with frame skipping
@@ -2035,7 +2043,7 @@ bool VulkanDisplay::Pump() {
             stale_ = true;                      // the swapchain made again for the window as it is now
             std::fprintf(stderr, "[window] in front again\n");
         }
-        if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
+        if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED || e.type == SDL_EVENT_WINDOW_SAFE_AREA_CHANGED) {
             NotePixelSize();
             stale_ = true;
         }

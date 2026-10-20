@@ -20,6 +20,7 @@
 #ifndef PS2GPU_TOUCH_CONTROLS_H
 #define PS2GPU_TOUCH_CONTROLS_H
 
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <vector>
@@ -49,6 +50,10 @@ public:
        order): true if any finger is on a control. */
     bool Merge(std::uint16_t* buttons, std::uint8_t sticks[4]) const;
     std::vector<Shape> Shapes(float width, float height) const;
+    /* The screen's safe area at the sides, as parts of its width (a phone's
+       notch in landscape; 0 on an iPad): the controls at each side move in
+       past it. Set on the window's thread whenever it changes. */
+    static void SetSafeInsets(float left, float right);
 
 private:
     struct Place { Kind kind; float x, y, r; };
@@ -66,6 +71,7 @@ private:
     std::vector<Finger> fingers_;
     bool visible_ = false;
     float width_ = 0, height_ = 0;
+    static std::atomic<float> inset_left_, inset_right_;
 };
 
 }  // namespace ps2gpu
