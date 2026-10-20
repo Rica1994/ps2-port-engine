@@ -2266,7 +2266,7 @@ bool VulkanGsRenderer::ConvertImage(std::uint32_t fbp, std::uint32_t fbw, std::u
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, reinterpret_layout_, 0, 2, sets, 0, nullptr);
         vkCmdPushConstants(cmd, reinterpret_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
         ++g_dispatches;
-        vkCmdDispatch(cmd, (d.width * d.scale + 7) / 8, (made_rows * d.scale + 7) / 8, 1);
+        vkCmdDispatch(cmd, (d.width + 7) / 8, (made_rows + 7) / 8, 1);   // (a GS pixel each: its k x k)
         g_.Mark(cmd, kProfSwizzle);
         MemoryBarrier(cmd);
     });
@@ -2304,7 +2304,7 @@ bool VulkanGsRenderer::ConvertFromDepth(std::uint32_t fbp, std::uint32_t fbw, st
                                 nullptr);
         vkCmdPushConstants(cmd, reinterpret_depth_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, &params);
         ++g_dispatches;
-        vkCmdDispatch(cmd, (d.width * d.scale + 7) / 8, (made_rows * d.scale + 7) / 8, 1);
+        vkCmdDispatch(cmd, (d.width + 7) / 8, (made_rows + 7) / 8, 1);   // (a GS pixel each: its k x k)
         g_.Mark(cmd, kProfSwizzle);
         MemoryBarrier(cmd);
     });
@@ -2343,8 +2343,8 @@ bool VulkanGsRenderer::DepthIntoView(const DepthIntoViewParams& params) {
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, haze_layout_, 0, 3, sets, 0, nullptr);
         vkCmdPushConstants(cmd, haze_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
         ++g_dispatches;
-        if (within.cols && within.rows)
-            vkCmdDispatch(cmd, (within.cols * d.scale + 7) / 8, (within.rows * d.scale + 7) / 8, 1);
+        if (within.cols && within.rows)       // (a GS pixel each: its k x k)
+            vkCmdDispatch(cmd, (within.cols + 7) / 8, (within.rows + 7) / 8, 1);
         g_.Mark(cmd, kProfSwizzle);
         MemoryBarrier(cmd);
     });

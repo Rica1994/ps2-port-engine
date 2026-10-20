@@ -41,7 +41,6 @@ layout(push_constant) uniform Params {
 } p;
 
 const uint PSMCT16S = 0x0Au, PSMZ24 = 0x31u, PSMZ16S = 0x3Au;
-ivec2 sub = ivec2(0);       // where in its GS pixel the pixel made lies (main)
 const uint kMask = (4u << 20) - 1u;
 
 const uint kBlock16Inv[32] = uint[](0, 4, 1, 5, 8, 12, 9, 13, 2, 6, 3, 7, 10, 14, 11, 15, 16, 20, 17, 21, 24, 28, 25, 29, 18, 22, 19, 23, 26, 30, 27, 31);
@@ -83,8 +82,12 @@ bool ViewPixel(uint a, out uvec2 at) {
     return true;
 }
 
-// The 16 bits at byte address `a` (even), from the depth buffer; false outside it.
-bool DepthHalf(uint a, out uint h) {
+// Where the 16 bits at byte address `a` (even) lie in the depth buffer: its
+// pixel (a GS pixel), the half's shift, a Z24 word's top byte (memory's);
+// false outside it. Found once for a GS pixel, read for each of its pixels.
+struct Source { ivec2 at; uint shift, top; };
+bool DepthHalfAt(uint a, out Source src) {
+    src = Source(ivec2(0), 0u, 0u);
     const uint page = a / 8192u, base = p.zbp / 32u;
     if (page < base) return false;
     const uint bw = max(p.zbw, 1u);
@@ -93,10 +96,9 @@ bool DepthHalf(uint a, out uint h) {
     const uint j = kColumn32Inv[(a % 256u) / 4u];
     const uint x = px * 64u + (i % 8u) * 8u + j % 8u, y = py * 32u + (i / 8u) * 8u + j / 8u;
     if (x >= p.zwidth || y >= p.zheight) return false;
-    // (Drawn larger: the depth buffer's pixel where this one lies in its GS pixel.)
-    uint v = uint(clamp(texelFetch(depth, ivec2(x, y) * int(p.scale) + sub, 0).r * 4294967296.0, 0.0, 4294967040.0));
-    if (p.zpsm == PSMZ24) v = (mem[(a & kMask) >> 2] & 0xFF000000u) | (v & 0xFFFFFFu);
-    h = (v >> ((a & 2u) * 8u)) & 0xFFFFu;
+    src.at = ivec2(x, y);
+    src.shift = (a & 2u) * 8u;
+    src.top = p.zpsm == PSMZ24 ? mem[(a & kMask) >> 2] & 0xFF000000u : 0u;
     return true;
 }
 
@@ -104,32 +106,49 @@ uint Coordinate(int c, uint size, bool repeat) {
     return repeat ? uint(c) & (size - 1u) : uint(clamp(c, 0, int(size) - 1));
 }
 
-// The half at byte address `a`, as the sprites leave it (`old` where they do not draw).
-uint Half(uint a, uint old) {
+// The half at byte address `a`, as the sprites leave it: where its texel's
+// 16 bits lie in the depth buffer (false where the sprites do not draw).
+bool HalfAt(uint a, out Source src) {
     uvec2 v;
-    if (!ViewPixel(a, v) || v.x < p.vx0 || v.x >= p.vx1 || v.y < p.vy0 || v.y >= p.vy1) return old;
+    src = Source(ivec2(0), 0u, 0u);
+    if (!ViewPixel(a, v) || v.x < p.vx0 || v.x >= p.vx1 || v.y < p.vy0 || v.y >= p.vy1) return false;
     const uint s = Coordinate(int(v.x) + p.du, p.tw, (p.wrap & 1u) != 0u);
     const uint t = Coordinate(int(v.y) + p.dv, p.th, (p.wrap & 2u) != 0u);
-    uint h;
-    if (!DepthHalf(AddressZ16(p.tbp, p.tbw, p.tpsm == PSMZ16S, s, t), h)) return old;
+    return DepthHalfAt(AddressZ16(p.tbp, p.tbw, p.tpsm == PSMZ16S, s, t), src);
+}
+
+// ...and its value for the pixel at `sub` in the GS pixel (`old`: the half there now).
+uint Half(Source src, ivec2 sub, uint old) {
+    // (Drawn larger: the depth buffer's pixel at the same place in its GS pixel.)
+    uint v = uint(clamp(texelFetch(depth, src.at * int(max(p.scale, 1u)) + sub, 0).r * 4294967296.0, 0.0,
+                        4294967040.0));
+    if (p.zpsm == PSMZ24) v = src.top | (v & 0xFFFFFFu);
+    const uint h = (v >> src.shift) & 0xFFFFu;
     const uint alpha = (h & 0x8000u) != 0u ? p.ta1 : ((p.aem != 0u && (h & 0x7FFFu) == 0u) ? 0u : p.ta0);
     const uint made = (h & 0x7FFFu) | (alpha >= 0x80u ? 0x8000u : 0u);
     return (old & p.keep) | (made & ~p.keep & 0xFFFFu);
 }
 
 void main() {
-    // A target drawn larger (scale k): each of its pixels, the GS pixel it
-    // lies in and where in it - the depth buffer's pixel there gives its Z,
-    // as the strips drawn larger read their Z16 view (made from the depth
-    // buffer pixel for pixel).
-    const uint k = max(p.scale, 1u);
-    if (gl_GlobalInvocationID.x >= p.cols * k || gl_GlobalInvocationID.y >= p.rows * k) return;
-    const uvec2 pixel = uvec2(p.x0, p.y0) * k + gl_GlobalInvocationID.xy;
-    sub = ivec2(pixel % k);
-    const uint x = pixel.x / k, y = pixel.y / k;
+    // A GS pixel of the target: where its two halves' texels lie, found once,
+    // then each of its pixels (drawn larger, scale k: k x k of them) made -
+    // the depth buffer's pixel at the same place gives its Z, as the strips
+    // drawn larger read their Z16 view (made from the depth buffer pixel for
+    // pixel).
+    if (gl_GlobalInvocationID.x >= p.cols || gl_GlobalInvocationID.y >= p.rows) return;
+    const uint x = p.x0 + gl_GlobalInvocationID.x, y = p.y0 + gl_GlobalInvocationID.y;
     const uint a = Address32(p.bp, p.bw, x, y);
-    const uint old = packUnorm4x8(imageLoad(target, ivec2(pixel)));
-    const uint lo = Half(a, old & 0xFFFFu), hi = Half(a + 2u, old >> 16);
-    const uint made = lo | (hi << 16);
-    if (made != old) imageStore(target, ivec2(pixel), unpackUnorm4x8(made));
+    Source lo_src, hi_src;
+    const bool lo_in = HalfAt(a, lo_src), hi_in = HalfAt(a + 2u, hi_src);
+    if (!lo_in && !hi_in) return;
+    const int k = int(max(p.scale, 1u));
+    for (int dy = 0; dy < k; ++dy)
+        for (int dx = 0; dx < k; ++dx) {
+            const ivec2 sub = ivec2(dx, dy), pixel = ivec2(x, y) * k + sub;
+            const uint old = packUnorm4x8(imageLoad(target, pixel));
+            const uint lo = lo_in ? Half(lo_src, sub, old & 0xFFFFu) : old & 0xFFFFu;
+            const uint hi = hi_in ? Half(hi_src, sub, old >> 16) : old >> 16;
+            const uint made = lo | (hi << 16);
+            if (made != old) imageStore(target, pixel, unpackUnorm4x8(made));
+        }
 }

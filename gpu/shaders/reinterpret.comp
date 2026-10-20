@@ -34,10 +34,6 @@ layout(push_constant) uniform Params {
     uint scale;         // both images' pixels to a GS pixel, each way (drawn larger alike)
 } p;
 
-// Where in its GS pixel the pixel made lies (main): a source drawn larger
-// gives the pixel at the same place in its GS pixel - as memory would carry
-// the GS pixel's bytes, each of its pixels the same way.
-ivec2 sub = ivec2(0);
 
 #include "gs_address.glsl"
 
@@ -76,7 +72,7 @@ bool SourcePixel(uint a, out ivec2 at) {
         y = py * 32u + (i / 8u) * 8u + j / 8u;
     }
     if (x >= p.src_width || y >= p.src_height) return false;
-    at = ivec2(x, y) * int(max(p.scale, 1u)) + sub;
+    at = ivec2(x, y);           // (a GS pixel: Half reads each of its pixels drawn larger)
     return true;
 }
 
@@ -89,10 +85,13 @@ uint From16(uint c) {
            ((c & 0x8000u) != 0u ? 0x80000000u : 0u);
 }
 
-// The 16 bits at byte address `a` (even), from the source.
-bool Half(uint a, out uint h) {
-    ivec2 at;
-    if (!SourcePixel(a, at)) return false;
+// The 16 bits at byte address `a` (even), from the source pixel `at` holds
+// them in (SourcePixel), at `sub` in it when drawn larger - the pixel at the
+// same place in the GS pixel, as memory would carry the GS pixel's bytes
+// for each of its pixels.
+uint Half(uint a, ivec2 at, ivec2 sub) {
+    uint h;
+    at = at * int(max(p.scale, 1u)) + sub;
 #ifdef DEPTH_SOURCE
     uint v = uint(clamp(texelFetch(source, at, 0).r * 4294967296.0, 0.0, 4294967040.0));
     if (p.src_psm == PSMZ24) v = (mem[(a & kMask) >> 2] & 0xFF000000u) | (v & 0xFFFFFFu);
@@ -101,25 +100,23 @@ bool Half(uint a, out uint h) {
     const uint v = packUnorm4x8(imageLoad(source, at));
     h = Is16Psm(p.src_psm) ? To16(v) : (v >> ((a & 2u) * 8u)) & 0xFFFFu;
 #endif
-    return true;
+    return h;
 }
 
 void main() {
-    const uint k = max(p.scale, 1u);
-    const uvec2 pixel = gl_GlobalInvocationID.xy;
-    if (pixel.x >= p.cols * k || pixel.y >= p.rows * k) return;
-    sub = ivec2(pixel % k);
-    const uint x = pixel.x / k, y = pixel.y / k;
+    // A GS pixel of the image made: where its bytes lie in the source, found
+    // once, then each of its pixels (k x k drawn larger) made.
+    const uint x = gl_GlobalInvocationID.x, y = gl_GlobalInvocationID.y;
+    if (x >= p.cols || y >= p.rows) return;
     const uint a = Address(x, y);
-    uint v;
-    if (Is16()) {
-        uint h;
-        if (!Half(a, h)) return;
-        v = From16(h);
-    } else {
-        uint lo, hi;
-        if (!Half(a, lo) || !Half(a + 2u, hi)) return;
-        v = lo | (hi << 16);
-    }
-    imageStore(made, ivec2(pixel), unpackUnorm4x8(v));
+    ivec2 lo_at, hi_at;
+    if (!SourcePixel(a, lo_at)) return;
+    if (!Is16() && !SourcePixel(a + 2u, hi_at)) return;
+    const int k = int(max(p.scale, 1u));
+    for (int dy = 0; dy < k; ++dy)
+        for (int dx = 0; dx < k; ++dx) {
+            const ivec2 sub = ivec2(dx, dy);
+            const uint v = Is16() ? From16(Half(a, lo_at, sub)) : Half(a, lo_at, sub) | (Half(a + 2u, hi_at, sub) << 16);
+            imageStore(made, ivec2(x, y) * k + sub, unpackUnorm4x8(v));
+        }
 }
